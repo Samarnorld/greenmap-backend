@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: greenmap-backend
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        value: /etc/secrets/google-credentials.json
+    secrets:
+      - source: google-credentials.json
+        path: /etc/secrets/google-credentials.json
