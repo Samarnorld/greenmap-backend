@@ -41,61 +41,76 @@ function startServer() {
     });
   }
 
-  app.get('/ndvi', (req, res) => {
-    const ndvi = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-      .filterBounds(wards)
-      .filterDate('2024-01-01', '2025-05-25')
-      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
-      .median()
-      .normalizedDifference(['B8', 'B4'])
-      .rename('NDVI');
+ app.get('/ndvi', (req, res) => {
+  const endDate = ee.Date(Date.now());
+  const startDate = endDate.advance(-120, 'day');
 
-    serveTile(ndvi, {
-      min: 0,
-      max: 0.8,
-      palette: ['red', 'yellow', 'green']
-    }, res);
-  });
+  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(wards)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+    .select(['B4', 'B8']);
 
-  app.get('/lst', (req, res) => {
-    const lst = ee.ImageCollection('MODIS/061/MOD11A1')
-      .filterBounds(wards)
-      .filterDate('2024-01-01', '2025-05-25')
-      .select('LST_Day_1km')
-      .mean()
-      .multiply(0.02)
-      .subtract(273.15)
-      .rename('LST_C');
+  const ndvi = ee.Algorithms.If(
+    s2.size().gt(0),
+    s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
+    ee.Image().rename('NDVI')
+  );
 
-    serveTile(lst, {
-      min: 25,
-      max: 45,
-      palette: ['blue', 'yellow', 'red']
-    }, res);
-  });
+  serveTile(ee.Image(ndvi), {
+    min: 0,
+    max: 0.8,
+    palette: ['red', 'yellow', 'green']
+  }, res);
+});
+app.get('/lst', (req, res) => {
+  const endDate = ee.Date(Date.now());
+  const startDate = endDate.advance(-120, 'day');
 
-  app.get('/ndvi-mask', (req, res) => {
-    const ndvi = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-      .filterBounds(wards)
-      .filterDate('2024-01-01', '2025-05-25')
-      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
-      .median()
-      .normalizedDifference(['B8', 'B4'])
-      .rename('NDVI');
+  const lst = ee.ImageCollection('MODIS/061/MOD11A1')
+    .filterBounds(wards)
+    .filterDate(startDate, endDate)
+    .select('LST_Day_1km')
+    .mean()
+    .multiply(0.02)
+    .subtract(273.15)
+    .rename('LST_C');
 
-    const mask = ndvi.updateMask(ndvi.gt(0.3));
+  serveTile(lst, {
+    min: 25,
+    max: 45,
+    palette: ['blue', 'yellow', 'red']
+  }, res);
+});
 
-    serveTile(mask, {
-      min: 0.3,
-      max: 0.8,
-      palette: ['yellow', 'green']
-    }, res);
-  });
 
+ app.get('/ndvi-mask', (req, res) => {
+  const endDate = ee.Date(Date.now());
+  const startDate = endDate.advance(-120, 'day');
+
+  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(wards)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+    .select(['B4', 'B8']);
+
+  const ndvi = ee.Algorithms.If(
+    s2.size().gt(0),
+    s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
+    ee.Image().rename('NDVI')
+  );
+
+  const mask = ee.Image(ndvi).updateMask(ee.Image(ndvi).gt(0.3));
+
+  serveTile(mask, {
+    min: 0.3,
+    max: 0.8,
+    palette: ['yellow', 'green']
+  }, res);
+});
   app.get('/', (req, res) => {
     res.send('🌍 GreenMap EE backend is running');
   });
-
   app.listen(PORT, () => {
     console.log(`🚀 Backend running at http://localhost:${PORT}`);
   });
