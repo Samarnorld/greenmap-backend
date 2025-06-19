@@ -10,13 +10,22 @@ const PORT = 3000;
 
 app.use(cors());
 
-// ✅ Path to your service account key
-const keyPath = path.join(__dirname, 'greenmap-backend-8b0f0969ddc6.json');
-const privateKey = JSON.parse(fs.readFileSync(keyPath));
+// ✅ Write service account key from env variable
+const SERVICE_ACCOUNT_PATH = path.join(__dirname, 'service-account.json');
 
-// ✅ Authenticate using the private key method
+if (!process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
+  console.error('❌ Missing GOOGLE_APPLICATION_CREDENTIALS_JSON env variable.');
+  process.exit(1);
+}
+
+fs.writeFileSync(SERVICE_ACCOUNT_PATH, process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
+console.log('🔐 Service account key written to file');
+
+// ✅ Authenticate using the written key
+const serviceKey = JSON.parse(fs.readFileSync(SERVICE_ACCOUNT_PATH));
+
 ee.data.authenticateViaPrivateKey(
-  privateKey,
+  serviceKey,
   () => {
     ee.initialize(null, null, () => {
       console.log('✅ Earth Engine initialized successfully');
@@ -27,6 +36,7 @@ ee.data.authenticateViaPrivateKey(
     console.error('❌ EE authentication failed:', err);
   }
 );
+
 
 // ✅ Server logic (starts after EE init)
 function startServer() {
