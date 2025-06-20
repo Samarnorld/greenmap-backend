@@ -42,8 +42,9 @@ function startServer() {
   }
 
  app.get('/ndvi', (req, res) => {
-  const endDate = ee.Date(Date.now());
-  const startDate = endDate.advance(-120, 'day');
+  const inputDate = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
+const endDate = inputDate;
+const startDate = endDate.advance(-120, 'day');
 
   const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
     .filterBounds(wards)
@@ -64,8 +65,9 @@ function startServer() {
   }, res);
 });
 app.get('/lst', (req, res) => {
-  const endDate = ee.Date(Date.now());
-  const startDate = endDate.advance(-120, 'day');
+  const inputDate = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
+const endDate = inputDate;
+const startDate = endDate.advance(-120, 'day');
 
   const lst = ee.ImageCollection('MODIS/061/MOD11A1')
     .filterBounds(wards)
@@ -85,8 +87,9 @@ app.get('/lst', (req, res) => {
 
 
  app.get('/ndvi-mask', (req, res) => {
-  const endDate = ee.Date(Date.now());
-  const startDate = endDate.advance(-120, 'day');
+  const inputDate = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
+const endDate = inputDate;
+const startDate = endDate.advance(-120, 'day');
 
   const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
     .filterBounds(wards)
@@ -108,6 +111,51 @@ app.get('/lst', (req, res) => {
     palette: ['yellow', 'green']
   }, res);
 });
+app.get('/ndvi-anomaly', async (req, res) => {
+  const currentDate = req.query.current ? ee.Date(req.query.current) : ee.Date(Date.now());
+  const pastDate = req.query.past ? ee.Date(req.query.past) : ee.Date(Date.now()).advance(-1, 'year');
+
+  function getNDVI(date) {
+    const start = date.advance(-120, 'day');
+    const end = date;
+    const year = date.get('year');
+
+    const sentinel = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      .filterBounds(wards)
+      .filterDate(start, end)
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+      .select(['B4', 'B8']);
+
+    const landsat = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+      .filterBounds(wards)
+      .filterDate(start, end)
+      .filter(ee.Filter.lt('CLOUD_COVER', 10))
+      .select(['SR_B4', 'SR_B5'])
+      .map(img => img.multiply(0.0000275).add(-0.2).copyProperties(img, img.propertyNames())); // scale SR bands
+
+    const useSentinel = year.gte(2015);
+
+    const ndvi = ee.Algorithms.If(
+      useSentinel,
+      sentinel.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
+      landsat.median().normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI')
+    );
+
+    return ee.Image(ndvi);
+  }
+
+  const currentNDVI = getNDVI(currentDate);
+  const pastNDVI = getNDVI(pastDate);
+  const anomaly = ee.Image(currentNDVI).subtract(ee.Image(pastNDVI)).rename('NDVI_Anomaly');
+
+  serveTile(anomaly, {
+    min: -0.4,
+    max: 0.4,
+    palette: ['#d7191c', '#ffffbf', '#1a9641'] // red: loss, yellow: no change, green: gain
+  }, res);
+});
+
+
   app.get('/', (req, res) => {
     res.send('🌍 GreenMap EE backend is running');
   });
