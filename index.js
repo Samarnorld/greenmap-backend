@@ -155,6 +155,66 @@ app.get('/ndvi-anomaly', async (req, res) => {
   }, res);
 });
 
+app.get('/wards', async (req, res) => {
+  try {
+    const now = ee.Date(Date.now());
+    const oneYearAgo = now.advance(-1, 'year');
+    const startNDVI = now.advance(-120, 'day');
+    const startRain = now.advance(-30, 'day');
+    const startRainPast = oneYearAgo.advance(-30, 'day');
+
+    // NDVI
+    const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      .filterBounds(wards)
+      .filterDate(startNDVI, now)
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+      .select(['B4', 'B8']);
+    const ndvi = s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI');
+
+    // LST
+    const lst = ee.ImageCollection('MODIS/061/MOD11A1')
+      .filterBounds(wards)
+      .filterDate(startNDVI, now)
+      .select('LST_Day_1km')
+      .mean()
+      .multiply(0.02)
+      .subtract(273.15)
+      .rename('LST_C');
+
+    // Rainfall
+    const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+      .filterBounds(wards)
+      .select('precipitation');
+    const rainfallCurrent = chirps.filterDate(startRain, now).sum().rename('Rainfall_Current');
+    const rainfallPast = chirps.filterDate(startRainPast, oneYearAgo).sum().rename('Rainfall_Past');
+    const rainfallAnomaly = rainfallCurrent.subtract(rainfallPast).rename('Rainfall_Anomaly');
+
+    // Combine features
+    const combined = ndvi.addBands(lst).addBands(rainfallCurrent).addBands(rainfallAnomaly);
+
+    const results = combined.reduceRegions({
+      collection: wards,
+      reducer: ee.Reducer.mean(),
+      scale: 500,
+    }).map(f => f.set({
+      ndvi: f.get('NDVI'),
+      lst: f.get('LST_C'),
+      rain_mm: f.get('Rainfall_Current'),
+      anomaly_mm: f.get('Rainfall_Anomaly')
+    }));
+
+    results.getInfo((data, err) => {
+      if (err) {
+        console.error('❌ Wards API error:', err);
+        return res.status(500).json({ error: 'Failed to compute ward stats', details: err });
+      }
+      res.json(data);
+    });
+  } catch (error) {
+    console.error('❌ Server error:', error);
+    res.status(500).json({ error: 'Server error', details: error });
+  }
+});
 
   app.get('/', (req, res) => {
     res.send('🌍 GreenMap EE backend is running');
