@@ -254,6 +254,71 @@ app.get('/wards', async (req, res) => {
     res.status(500).json({ error: 'Server error', details: error });
   }
 });
+app.get('/risk-zones', async (req, res) => {
+  try {
+    const now = ee.Date(Date.now()).advance(-10, 'day'); // buffer for recent data
+    const oneYearAgo = now.advance(-1, 'year');
+
+    const startNDVI = now.advance(-120, 'day');
+    const startRain = now.advance(-30, 'day');
+    const startRainPast = oneYearAgo.advance(-30, 'day');
+
+    // NDVI
+    const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      .filterBounds(wards)
+      .filterDate(startNDVI, now)
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+      .select(['B4', 'B8']);
+    const ndvi = s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI');
+
+    // Rainfall
+    const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+      .filterBounds(wards)
+      .select('precipitation');
+    const rainfallCurrent = chirps.filterDate(startRain, now).sum().rename('Rainfall_Current');
+    const rainfallPast = chirps.filterDate(startRainPast, oneYearAgo).sum().rename('Rainfall_Past');
+    const anomaly = rainfallCurrent.subtract(rainfallPast).rename('Rainfall_Anomaly');
+
+    const combined = ndvi.addBands(rainfallCurrent).addBands(anomaly);
+
+    const classified = combined.reduceRegions({
+      collection: wards,
+      reducer: ee.Reducer.mean(),
+      scale: 500
+    }).map(function (f) {
+      const ndvi = ee.Number(f.get('NDVI'));
+      const rainAnomaly = ee.Number(f.get('Rainfall_Anomaly'));
+
+      const risk = ee.Algorithms.If(
+        ndvi.lt(0.3).and(rainAnomaly.lt(-30)),
+        'HIGH',
+        ee.Algorithms.If(
+          ndvi.lt(0.4).or(rainAnomaly.lt(-15)),
+          'MODERATE',
+          'LOW'
+        )
+      );
+
+      return f.set({
+        risk: risk,
+        ndvi: ndvi,
+        anomaly_mm: rainAnomaly
+      });
+    });
+
+    classified.getInfo((data, err) => {
+      if (err) {
+        console.error('❌ Risk Zones error:', err);
+        return res.status(500).json({ error: 'Risk Zones failure', err });
+      }
+      res.json(data);
+    });
+
+  } catch (error) {
+    console.error('❌ Risk Zones server error:', error);
+    res.status(500).json({ error: 'Server error', details: error });
+  }
+});
 
   app.get('/', (req, res) => {
     res.send('🌍 GreenMap EE backend is running');
