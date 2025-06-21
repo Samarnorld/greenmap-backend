@@ -279,42 +279,46 @@ app.get('/risk-zones', async (req, res) => {
     const rainfallPast = chirps.filterDate(startRainPast, oneYearAgo).sum().rename('Rainfall_Past');
     const anomaly = rainfallCurrent.subtract(rainfallPast).rename('Rainfall_Anomaly');
 
+    // Combine layers
     const combined = ndvi.addBands(rainfallCurrent).addBands(anomaly);
 
-    const classified = combined.reduceRegions({
+    // Compute mean per ward
+    const reduced = combined.reduceRegions({
       collection: wards,
       reducer: ee.Reducer.mean(),
       scale: 500
+    });
 
-   .map(function (f) {
-  var ndvi = ee.Number(f.get('NDVI'));
-  var rainAnomaly = ee.Number(f.get('Rainfall_Anomaly'));
+    // Classify risk per feature
+    const classified = reduced.map(function (f) {
+      const ndvi = ee.Number(f.get('NDVI'));
+      const rainAnomaly = ee.Number(f.get('Rainfall_Anomaly'));
 
-  var hasNDVI = f.get('NDVI');
-  var hasAnomaly = f.get('Rainfall_Anomaly');
+      const hasNDVI = f.get('NDVI');
+      const hasAnomaly = f.get('Rainfall_Anomaly');
 
-  var isValid = ee.Algorithms.IsEqual(hasNDVI, null).not()
-    .and(ee.Algorithms.IsEqual(hasAnomaly, null).not());
+      const isValid = ee.Algorithms.IsEqual(hasNDVI, null).not()
+        .and(ee.Algorithms.IsEqual(hasAnomaly, null).not());
 
-  var risk = ee.Algorithms.If(isValid,
-    ee.Algorithms.If(
-      ndvi.lt(0.3).and(rainAnomaly.lt(-30)),
-      'HIGH',
-      ee.Algorithms.If(
-        ndvi.lt(0.4).or(rainAnomaly.lt(-15)),
-        'MODERATE',
-        'LOW'
-      )
-    ),
-    'UNKNOWN'
-  );
+      const risk = ee.Algorithms.If(isValid,
+        ee.Algorithms.If(
+          ndvi.lt(0.3).and(rainAnomaly.lt(-30)),
+          'HIGH',
+          ee.Algorithms.If(
+            ndvi.lt(0.4).or(rainAnomaly.lt(-15)),
+            'MODERATE',
+            'LOW'
+          )
+        ),
+        'UNKNOWN'
+      );
 
-  return f.set({
-    risk: risk,
-    ndvi: ndvi,
-    anomaly_mm: rainAnomaly
-});
-
+      return f.set({
+        risk: risk,
+        ndvi: ndvi,
+        anomaly_mm: rainAnomaly
+      });
+    });
 
     classified.getInfo((data, err) => {
       if (err) {
@@ -329,6 +333,7 @@ app.get('/risk-zones', async (req, res) => {
     res.status(500).json({ error: 'Server error', details: error });
   }
 });
+
 
   app.get('/', (req, res) => {
     res.send('🌍 GreenMap EE backend is running');
