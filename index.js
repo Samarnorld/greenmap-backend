@@ -313,7 +313,6 @@ app.get('/risk-zones', async (req, res) => {
     risk: risk,
     ndvi: ndvi,
     anomaly_mm: rainAnomaly
-  });
 });
 
 
