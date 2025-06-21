@@ -285,32 +285,34 @@ app.get('/risk-zones', async (req, res) => {
       collection: wards,
       reducer: ee.Reducer.mean(),
       scale: 500
+
     }).map(function (f) {
-      const ndvi = ee.Number(f.get('NDVI'));
-      const rainAnomaly = ee.Number(f.get('Rainfall_Anomaly'));
+  var ndvi = ee.Number(f.get('NDVI'));
+  var rainAnomaly = ee.Number(f.get('Rainfall_Anomaly'));
 
-      const isValid = ndvi.isFinite().and(rainAnomaly.isFinite());
+  // Ensure both are valid numbers
+  var isValid = ndvi.isFinite().and(rainAnomaly.isFinite());
 
-const risk = ee.Algorithms.If(isValid,
-  ee.Algorithms.If(
-    ndvi.lt(0.3).and(rainAnomaly.lt(-30)),
-    'HIGH',
+  // Fallback if invalid
+  var risk = ee.Algorithms.If(isValid,
     ee.Algorithms.If(
-      ndvi.lt(0.4).or(rainAnomaly.lt(-15)),
-      'MODERATE',
-      'LOW'
-    )
-  ),
-  'UNKNOWN'
-);
+      ndvi.lt(0.3).and(rainAnomaly.lt(-30)),
+      'HIGH',
+      ee.Algorithms.If(
+        ndvi.lt(0.4).or(rainAnomaly.lt(-15)),
+        'MODERATE',
+        'LOW'
+      )
+    ),
+    'UNKNOWN'
+  );
 
-
-      return f.set({
-        risk: risk,
-        ndvi: ndvi,
-        anomaly_mm: rainAnomaly
-      });
-    });
+  return f.set({
+    risk: risk,
+    ndvi: ndvi,
+    anomaly_mm: rainAnomaly
+  });
+});
 
     classified.getInfo((data, err) => {
       if (err) {
