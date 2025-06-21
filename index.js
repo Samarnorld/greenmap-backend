@@ -156,7 +156,8 @@ app.get('/ndvi-anomaly', async (req, res) => {
 });
 app.get('/rainfall', (req, res) => {
   const date = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
-  const startDate = date.advance(-90, 'day');
+  const range = parseInt(req.query.range) || 90;
+const startDate = date.advance(-range, 'day');
   const endDate = date;
 
   const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
@@ -176,8 +177,10 @@ app.get('/rainfall', (req, res) => {
 app.get('/rainfall-anomaly', (req, res) => {
   const date = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
   const past = date.advance(-1, 'year');
-  const startNow = date.advance(-90, 'day');
-  const startPast = past.advance(-90, 'day');
+  const range = parseInt(req.query.range) || 90;
+const startNow = date.advance(-range, 'day');
+const startPast = past.advance(-range, 'day');
+
 
   const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
     .filterBounds(wards)
@@ -200,8 +203,9 @@ app.get('/wards', async (req, res) => {
     const oneYearAgo = now.advance(-1, 'year');
 
     const startNDVI = now.advance(-120, 'day');
-    const startRain = now.advance(-30, 'day');
-    const startRainPast = oneYearAgo.advance(-30, 'day');
+    const rainRange = parseInt(req.query.range) || 30;
+const startRain = now.advance(-rainRange, 'day');
+const startRainPast = oneYearAgo.advance(-rainRange, 'day');
     const startNDVIPast = oneYearAgo.advance(-120, 'day');
 
     // ✅ NDVI Current & Past
