@@ -278,7 +278,7 @@ app.get('/trend', (req, res) => {
       ? wards.filter(ee.Filter.eq('NAME_3', wardName)).geometry()
       : wards.geometry();
 
-    const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    const s2base = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
       .filterBounds(geometry)
       .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
       .select(['B4', 'B8']);
@@ -291,31 +291,29 @@ app.get('/trend', (req, res) => {
       const monthStart = start.advance(i, 'month');
       const monthEnd = monthStart.advance(1, 'month');
 
-      const ndvi = s2
-        .filterDate(monthStart, monthEnd)
-        .median()
-        .normalizedDifference(['B8', 'B4'])
-        .rename('NDVI');
+      const s2 = s2base.filterDate(monthStart, monthEnd);
+      const rain = chirps.filterDate(monthStart, monthEnd).sum().rename('Rain');
 
-      const rain = chirps
-        .filterDate(monthStart, monthEnd)
-        .sum()
-        .rename('Rain');
+      // Safely compute NDVI only if image collection has data
+      const ndviImg = ee.Algorithms.If(
+        s2.size().gt(0),
+        s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
+        ee.Image.constant(null).rename('NDVI')
+      );
+
+      const combined = ee.Image(ndviImg).addBands(rain);
+
+      const stats = combined.reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry,
+        scale: 500,
+        maxPixels: 1e9
+      });
 
       return ee.Feature(null, {
         date: monthStart.format('YYYY-MM'),
-        NDVI: ndvi.reduceRegion({
-          reducer: ee.Reducer.mean(),
-          geometry: geometry,
-          scale: 500,
-          maxPixels: 1e9
-        }).get('NDVI'),
-        Rain: rain.reduceRegion({
-          reducer: ee.Reducer.mean(),
-          geometry: geometry,
-          scale: 500,
-          maxPixels: 1e9
-        }).get('Rain')
+        NDVI: stats.get('NDVI'),
+        Rain: stats.get('Rain')
       });
     });
 
@@ -336,10 +334,11 @@ app.get('/trend', (req, res) => {
       res.json(formatted);
     });
   } catch (err) {
-    console.error('❌ Unexpected trend error:', err);
-    res.status(500).json({ error: 'Unexpected server error', details: err.message || err });
+    console.error('❌ Trend route fatal error:', err);
+    res.status(500).json({ error: 'Server error', details: err.message || err });
   }
 });
+
 
   app.get('/', (req, res) => {
     res.send('🌍 GreenMap EE backend is running');
