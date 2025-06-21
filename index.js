@@ -268,6 +268,65 @@ const startRainPast = oneYearAgo.advance(-rainRange, 'day');
   }
 });
 
+// 🌿 NDVI + Rainfall trend (monthly) for Nairobi or specific ward
+app.get('/trend', async (req, res) => {
+  const start = ee.Date(Date.now()).advance(-1, 'year');
+  const end = ee.Date(Date.now());
+  const months = ee.List.sequence(0, 11);
+
+  const geometry = req.query.ward
+    ? wards.filter(ee.Filter.eq('NAME_3', req.query.ward)).geometry()
+    : wards.geometry();
+
+  // NDVI
+  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(geometry)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+    .select(['B4', 'B8']);
+
+  // Rainfall
+  const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+    .filterBounds(geometry)
+    .select('precipitation');
+
+  const monthResults = months.map(i => {
+    const monthStart = start.advance(i, 'month');
+    const monthEnd = monthStart.advance(1, 'month');
+
+    const ndvi = s2.filterDate(monthStart, monthEnd)
+      .median()
+      .normalizedDifference(['B8', 'B4'])
+      .rename('NDVI');
+
+    const rain = chirps.filterDate(monthStart, monthEnd)
+      .sum()
+      .rename('Rain');
+
+    const combined = ndvi.addBands(rain);
+
+    return combined.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: geometry,
+      scale: 500,
+      maxPixels: 1e9
+    }).set('date', monthStart.format('YYYY-MM'));
+  });
+
+  const result = ee.FeatureCollection(monthResults.map(m => ee.Feature(null, m)));
+
+  result.getInfo((data, err) => {
+    if (err) {
+      console.error('❌ Trend API error:', err);
+      return res.status(500).json({ error: 'Failed to compute trend', details: err });
+    }
+    const simplified = data.features.map(f => ({
+      date: f.properties.date,
+      ndvi: f.properties.NDVI ?? null,
+      rain: f.properties.Rain ?? null
+    }));
+    res.json(simplified);
+  });
+});
 
   app.get('/', (req, res) => {
     res.send('🌍 GreenMap EE backend is running');
