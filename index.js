@@ -268,33 +268,15 @@ const startRainPast = oneYearAgo.advance(-rainRange, 'day');
   }
 });
 
-// 🌿 NDVI + Rainfall trend (monthly) for Nairobi or a selected ward
-app.get('/trend', async (req, res) => {
-  const start = ee.Date(Date.now()).advance(-1, 'year');
-  const months = ee.List.sequence(0, 11);
-
-  let geometry;
-
+app.get('/trend', (req, res) => {
   try {
-    if (req.query.ward) {
-      const wardName = req.query.ward;
-      console.log("📍 Trend request for ward:", wardName);
+    const start = ee.Date(Date.now()).advance(-1, 'year');
+    const months = ee.List.sequence(0, 11);
+    const wardName = req.query.ward;
 
-      const filtered = wards.filter(ee.Filter.eq('NAME_3', wardName));
-      const count = filtered.size();
-
-      const countValue = await count.getInfo();
-
-      if (countValue === 0) {
-        console.warn("⚠️ No geometry found for ward:", wardName);
-        return res.json([]); // Return empty list if ward not found
-      }
-
-      geometry = filtered.geometry();
-    } else {
-      console.log("📍 Trend request for all Nairobi");
-      geometry = wards.geometry();
-    }
+    const geometry = wardName
+      ? wards.filter(ee.Filter.eq('NAME_3', wardName)).geometry()
+      : wards.geometry();
 
     const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
       .filterBounds(geometry)
@@ -305,49 +287,57 @@ app.get('/trend', async (req, res) => {
       .filterBounds(geometry)
       .select('precipitation');
 
-    const monthResults = months.map(i => {
+    const monthlyStats = months.map(i => {
       const monthStart = start.advance(i, 'month');
       const monthEnd = monthStart.advance(1, 'month');
 
-      const ndvi = s2.filterDate(monthStart, monthEnd)
+      const ndvi = s2
+        .filterDate(monthStart, monthEnd)
         .median()
         .normalizedDifference(['B8', 'B4'])
         .rename('NDVI');
 
-      const rain = chirps.filterDate(monthStart, monthEnd)
+      const rain = chirps
+        .filterDate(monthStart, monthEnd)
         .sum()
         .rename('Rain');
 
-      const combined = ndvi.addBands(rain);
-
-      return combined.reduceRegion({
-        reducer: ee.Reducer.mean(),
-        geometry,
-        scale: 500,
-        maxPixels: 1e9
-      }).set('date', monthStart.format('YYYY-MM'));
+      return ee.Feature(null, {
+        date: monthStart.format('YYYY-MM'),
+        NDVI: ndvi.reduceRegion({
+          reducer: ee.Reducer.mean(),
+          geometry: geometry,
+          scale: 500,
+          maxPixels: 1e9
+        }).get('NDVI'),
+        Rain: rain.reduceRegion({
+          reducer: ee.Reducer.mean(),
+          geometry: geometry,
+          scale: 500,
+          maxPixels: 1e9
+        }).get('Rain')
+      });
     });
 
-    const result = ee.FeatureCollection(monthResults.map(m => ee.Feature(null, m)));
+    const result = ee.FeatureCollection(monthlyStats);
 
     result.getInfo((data, err) => {
       if (err) {
         console.error('❌ Trend API error:', err);
-        return res.status(500).json({ error: 'Failed to compute trend', details: err });
+        return res.status(500).json({ error: 'Failed to compute trend', details: err.message || err });
       }
 
-      const simplified = data.features.map(f => ({
+      const formatted = data.features.map(f => ({
         date: f.properties.date,
         ndvi: f.properties.NDVI ?? null,
         rain: f.properties.Rain ?? null
       }));
 
-      res.json(simplified);
+      res.json(formatted);
     });
-
   } catch (err) {
-    console.error('❌ Trend endpoint exception:', err);
-    res.status(500).json({ error: 'Unexpected error in trend endpoint', details: err });
+    console.error('❌ Unexpected trend error:', err);
+    res.status(500).json({ error: 'Unexpected server error', details: err.message || err });
   }
 });
 
