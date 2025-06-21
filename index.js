@@ -286,14 +286,16 @@ app.get('/risk-zones', async (req, res) => {
       reducer: ee.Reducer.mean(),
       scale: 500
 
-    }).map(function (f) {
+   .map(function (f) {
   var ndvi = ee.Number(f.get('NDVI'));
   var rainAnomaly = ee.Number(f.get('Rainfall_Anomaly'));
 
-  // Ensure both are valid numbers
-  var isValid = ndvi.isFinite().and(rainAnomaly.isFinite());
+  var hasNDVI = f.get('NDVI');
+  var hasAnomaly = f.get('Rainfall_Anomaly');
 
-  // Fallback if invalid
+  var isValid = ee.Algorithms.IsEqual(hasNDVI, null).not()
+    .and(ee.Algorithms.IsEqual(hasAnomaly, null).not());
+
   var risk = ee.Algorithms.If(isValid,
     ee.Algorithms.If(
       ndvi.lt(0.3).and(rainAnomaly.lt(-30)),
@@ -313,6 +315,7 @@ app.get('/risk-zones', async (req, res) => {
     anomaly_mm: rainAnomaly
   });
 });
+
 
     classified.getInfo((data, err) => {
       if (err) {
