@@ -154,6 +154,45 @@ app.get('/ndvi-anomaly', async (req, res) => {
     palette: ['#d7191c', '#ffffbf', '#1a9641'] // red: loss, yellow: no change, green: gain
   }, res);
 });
+app.get('/rainfall', (req, res) => {
+  const date = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
+  const startDate = date.advance(-90, 'day');
+  const endDate = date;
+
+  const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+    .filterBounds(wards)
+    .filterDate(startDate, endDate)
+    .select('precipitation');
+
+  const totalRain = chirps.sum().rename('Rainfall_90d').clip(wards);
+
+  serveTile(totalRain, {
+    min: 0,
+    max: 300,
+    palette: ['#e0f3f8', '#abd9e9', '#74add1', '#4575b4', '#313695']
+  }, res);
+});
+
+app.get('/rainfall-anomaly', (req, res) => {
+  const date = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
+  const past = date.advance(-1, 'year');
+  const startNow = date.advance(-90, 'day');
+  const startPast = past.advance(-90, 'day');
+
+  const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+    .filterBounds(wards)
+    .select('precipitation');
+
+  const rainfallNow = chirps.filterDate(startNow, date).sum();
+  const rainfallPast = chirps.filterDate(startPast, past).sum();
+  const anomaly = rainfallNow.subtract(rainfallPast).rename('Rainfall_Anomaly').clip(wards);
+
+  serveTile(anomaly, {
+    min: -50,
+    max: 50,
+    palette: ['#d73027', '#fee08b', '#1a9850']
+  }, res);
+});
 
 app.get('/wards', async (req, res) => {
   try {
