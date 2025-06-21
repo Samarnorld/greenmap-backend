@@ -268,64 +268,87 @@ const startRainPast = oneYearAgo.advance(-rainRange, 'day');
   }
 });
 
-// 🌿 NDVI + Rainfall trend (monthly) for Nairobi or specific ward
+// 🌿 NDVI + Rainfall trend (monthly) for Nairobi or a selected ward
 app.get('/trend', async (req, res) => {
   const start = ee.Date(Date.now()).advance(-1, 'year');
-  const end = ee.Date(Date.now());
   const months = ee.List.sequence(0, 11);
 
-  const geometry = req.query.ward
-    ? wards.filter(ee.Filter.eq('NAME_3', req.query.ward)).geometry()
-    : wards.geometry();
+  let geometry;
 
-  // NDVI
-  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-    .filterBounds(geometry)
-    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
-    .select(['B4', 'B8']);
+  try {
+    if (req.query.ward) {
+      const wardName = req.query.ward;
+      console.log("📍 Trend request for ward:", wardName);
 
-  // Rainfall
-  const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
-    .filterBounds(geometry)
-    .select('precipitation');
+      const filtered = wards.filter(ee.Filter.eq('NAME_3', wardName));
+      const count = filtered.size();
 
-  const monthResults = months.map(i => {
-    const monthStart = start.advance(i, 'month');
-    const monthEnd = monthStart.advance(1, 'month');
+      const countValue = await count.getInfo();
 
-    const ndvi = s2.filterDate(monthStart, monthEnd)
-      .median()
-      .normalizedDifference(['B8', 'B4'])
-      .rename('NDVI');
+      if (countValue === 0) {
+        console.warn("⚠️ No geometry found for ward:", wardName);
+        return res.json([]); // Return empty list if ward not found
+      }
 
-    const rain = chirps.filterDate(monthStart, monthEnd)
-      .sum()
-      .rename('Rain');
-
-    const combined = ndvi.addBands(rain);
-
-    return combined.reduceRegion({
-      reducer: ee.Reducer.mean(),
-      geometry: geometry,
-      scale: 500,
-      maxPixels: 1e9
-    }).set('date', monthStart.format('YYYY-MM'));
-  });
-
-  const result = ee.FeatureCollection(monthResults.map(m => ee.Feature(null, m)));
-
-  result.getInfo((data, err) => {
-    if (err) {
-      console.error('❌ Trend API error:', err);
-      return res.status(500).json({ error: 'Failed to compute trend', details: err });
+      geometry = filtered.geometry();
+    } else {
+      console.log("📍 Trend request for all Nairobi");
+      geometry = wards.geometry();
     }
-    const simplified = data.features.map(f => ({
-      date: f.properties.date,
-      ndvi: f.properties.NDVI ?? null,
-      rain: f.properties.Rain ?? null
-    }));
-    res.json(simplified);
-  });
+
+    const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      .filterBounds(geometry)
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+      .select(['B4', 'B8']);
+
+    const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+      .filterBounds(geometry)
+      .select('precipitation');
+
+    const monthResults = months.map(i => {
+      const monthStart = start.advance(i, 'month');
+      const monthEnd = monthStart.advance(1, 'month');
+
+      const ndvi = s2.filterDate(monthStart, monthEnd)
+        .median()
+        .normalizedDifference(['B8', 'B4'])
+        .rename('NDVI');
+
+      const rain = chirps.filterDate(monthStart, monthEnd)
+        .sum()
+        .rename('Rain');
+
+      const combined = ndvi.addBands(rain);
+
+      return combined.reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry,
+        scale: 500,
+        maxPixels: 1e9
+      }).set('date', monthStart.format('YYYY-MM'));
+    });
+
+    const result = ee.FeatureCollection(monthResults.map(m => ee.Feature(null, m)));
+
+    result.getInfo((data, err) => {
+      if (err) {
+        console.error('❌ Trend API error:', err);
+        return res.status(500).json({ error: 'Failed to compute trend', details: err });
+      }
+
+      const simplified = data.features.map(f => ({
+        date: f.properties.date,
+        ndvi: f.properties.NDVI ?? null,
+        rain: f.properties.Rain ?? null
+      }));
+
+      res.json(simplified);
+    });
+
+  } catch (err) {
+    console.error('❌ Trend endpoint exception:', err);
+    res.status(500).json({ error: 'Unexpected error in trend endpoint', details: err });
+  }
 });
 
   app.get('/', (req, res) => {
