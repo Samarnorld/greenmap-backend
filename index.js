@@ -157,7 +157,7 @@ app.get('/ndvi-anomaly', async (req, res) => {
 
 app.get('/wards', async (req, res) => {
   try {
-    const now = ee.Date(Date.now());
+    const now = ee.Date(Date.now()).advance(-10, 'day'); // ✅ 10-day buffer
     const oneYearAgo = now.advance(-1, 'year');
     const startNDVI = now.advance(-120, 'day');
     const startRain = now.advance(-30, 'day');
