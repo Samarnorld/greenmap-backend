@@ -196,40 +196,46 @@ app.get('/rainfall-anomaly', (req, res) => {
 
 app.get('/wards', async (req, res) => {
   try {
-    const now = ee.Date(Date.now()).advance(-10, 'day'); // ✅ 10-day buffer
+    const now = ee.Date(Date.now()).advance(-10, 'day'); // buffer
     const oneYearAgo = now.advance(-1, 'year');
+
     const startNDVI = now.advance(-120, 'day');
     const startRain = now.advance(-30, 'day');
     const startRainPast = oneYearAgo.advance(-30, 'day');
+    const startNDVIPast = oneYearAgo.advance(-120, 'day');
 
-    // NDVI
-    const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-      .filterBounds(wards)
-      .filterDate(startNDVI, now)
+    // ✅ NDVI Current & Past
+    const s2_now = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      .filterBounds(wards).filterDate(startNDVI, now)
       .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
       .select(['B4', 'B8']);
-    const ndvi = s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI');
+    const ndvi_now = s2_now.median().normalizedDifference(['B8', 'B4']).rename('NDVI');
 
-    // LST
+    const s2_past = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      .filterBounds(wards).filterDate(startNDVIPast, oneYearAgo)
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+      .select(['B4', 'B8']);
+    const ndvi_past = s2_past.median().normalizedDifference(['B8', 'B4']).rename('NDVI_PAST');
+
+    // ✅ LST
     const lst = ee.ImageCollection('MODIS/061/MOD11A1')
-      .filterBounds(wards)
-      .filterDate(startNDVI, now)
+      .filterBounds(wards).filterDate(startNDVI, now)
       .select('LST_Day_1km')
-      .mean()
-      .multiply(0.02)
-      .subtract(273.15)
-      .rename('LST_C');
+      .mean().multiply(0.02).subtract(273.15).rename('LST_C');
 
-    // Rainfall
+    // ✅ Rainfall Current & Past
     const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
-      .filterBounds(wards)
-      .select('precipitation');
-    const rainfallCurrent = chirps.filterDate(startRain, now).sum().rename('Rainfall_Current');
-    const rainfallPast = chirps.filterDate(startRainPast, oneYearAgo).sum().rename('Rainfall_Past');
-    const rainfallAnomaly = rainfallCurrent.subtract(rainfallPast).rename('Rainfall_Anomaly');
+      .filterBounds(wards).select('precipitation');
+    const rain_now = chirps.filterDate(startRain, now).sum().rename('Rain_Current');
+    const rain_past = chirps.filterDate(startRainPast, oneYearAgo).sum().rename('Rain_Past');
+    const rain_anomaly = rain_now.subtract(rain_past).rename('Rain_Anomaly');
 
-    // Combine features
-    const combined = ndvi.addBands(lst).addBands(rainfallCurrent).addBands(rainfallAnomaly);
+    const combined = ndvi_now
+      .addBands(ndvi_past)
+      .addBands(lst)
+      .addBands(rain_now)
+      .addBands(rain_past)
+      .addBands(rain_anomaly);
 
     const results = combined.reduceRegions({
       collection: wards,
@@ -237,9 +243,11 @@ app.get('/wards', async (req, res) => {
       scale: 500,
     }).map(f => f.set({
       ndvi: f.get('NDVI'),
+      ndvi_past: f.get('NDVI_PAST'),
       lst: f.get('LST_C'),
-      rain_mm: f.get('Rainfall_Current'),
-      anomaly_mm: f.get('Rainfall_Anomaly')
+      rain_mm: f.get('Rain_Current'),
+      rain_past: f.get('Rain_Past'),
+      anomaly_mm: f.get('Rain_Anomaly')
     }));
 
     results.getInfo((data, err) => {
@@ -249,87 +257,9 @@ app.get('/wards', async (req, res) => {
       }
       res.json(data);
     });
+
   } catch (error) {
     console.error('❌ Server error:', error);
-    res.status(500).json({ error: 'Server error', details: error });
-  }
-});
-app.get('/risk-zones', async (req, res) => {
-  try {
-    const now = ee.Date(Date.now()).advance(-10, 'day'); // buffer for recent data
-    const oneYearAgo = now.advance(-1, 'year');
-
-    const startNDVI = now.advance(-120, 'day');
-    const startRain = now.advance(-30, 'day');
-    const startRainPast = oneYearAgo.advance(-30, 'day');
-
-    // NDVI
-    const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-      .filterBounds(wards)
-      .filterDate(startNDVI, now)
-      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
-      .select(['B4', 'B8']);
-    const ndvi = s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI');
-
-    // Rainfall
-    const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
-      .filterBounds(wards)
-      .select('precipitation');
-    const rainfallCurrent = chirps.filterDate(startRain, now).sum().rename('Rainfall_Current');
-    const rainfallPast = chirps.filterDate(startRainPast, oneYearAgo).sum().rename('Rainfall_Past');
-    const anomaly = rainfallCurrent.subtract(rainfallPast).rename('Rainfall_Anomaly');
-
-    // Combine layers
-    const combined = ndvi.addBands(rainfallCurrent).addBands(anomaly);
-
-    // Compute mean per ward
-    const reduced = combined.reduceRegions({
-      collection: wards,
-      reducer: ee.Reducer.mean(),
-      scale: 500
-    });
-
-    // Classify risk per feature
-    const classified = reduced.map(function (f) {
-      const ndvi = ee.Number(f.get('NDVI'));
-      const rainAnomaly = ee.Number(f.get('Rainfall_Anomaly'));
-
-      const hasNDVI = f.get('NDVI');
-      const hasAnomaly = f.get('Rainfall_Anomaly');
-
-      const isValid = ee.Algorithms.IsEqual(hasNDVI, null).not()
-        .and(ee.Algorithms.IsEqual(hasAnomaly, null).not());
-
-      const risk = ee.Algorithms.If(isValid,
-        ee.Algorithms.If(
-          ndvi.lt(0.3).and(rainAnomaly.lt(-30)),
-          'HIGH',
-          ee.Algorithms.If(
-            ndvi.lt(0.4).or(rainAnomaly.lt(-15)),
-            'MODERATE',
-            'LOW'
-          )
-        ),
-        'UNKNOWN'
-      );
-
-      return f.set({
-        risk: risk,
-        ndvi: ndvi,
-        anomaly_mm: rainAnomaly
-      });
-    });
-
-    classified.getInfo((data, err) => {
-      if (err) {
-        console.error('❌ Risk Zones error:', err);
-        return res.status(500).json({ error: 'Risk Zones failure', err });
-      }
-      res.json(data);
-    });
-
-  } catch (error) {
-    console.error('❌ Risk Zones server error:', error);
     res.status(500).json({ error: 'Server error', details: error });
   }
 });
