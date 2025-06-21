@@ -289,15 +289,21 @@ app.get('/risk-zones', async (req, res) => {
       const ndvi = ee.Number(f.get('NDVI'));
       const rainAnomaly = ee.Number(f.get('Rainfall_Anomaly'));
 
-      const risk = ee.Algorithms.If(
-        ndvi.lt(0.3).and(rainAnomaly.lt(-30)),
-        'HIGH',
-        ee.Algorithms.If(
-          ndvi.lt(0.4).or(rainAnomaly.lt(-15)),
-          'MODERATE',
-          'LOW'
-        )
-      );
+      const isValid = ndvi.isFinite().and(rainAnomaly.isFinite());
+
+const risk = ee.Algorithms.If(isValid,
+  ee.Algorithms.If(
+    ndvi.lt(0.3).and(rainAnomaly.lt(-30)),
+    'HIGH',
+    ee.Algorithms.If(
+      ndvi.lt(0.4).or(rainAnomaly.lt(-15)),
+      'MODERATE',
+      'LOW'
+    )
+  ),
+  'UNKNOWN'
+);
+
 
       return f.set({
         risk: risk,
