@@ -287,40 +287,37 @@ app.get('/trend', (req, res) => {
       .filterBounds(geometry)
       .select('precipitation');
 
-    const monthlyStats = months.map(i => {
+    const monthlyStats = ee.FeatureCollection(months.map(i => {
       const monthStart = start.advance(i, 'month');
       const monthEnd = monthStart.advance(1, 'month');
 
       const s2 = s2Base.filterDate(monthStart, monthEnd);
       const rain = chirps.filterDate(monthStart, monthEnd).sum().rename('Rain');
 
-      // Check if Sentinel-2 has images this month
       const ndvi = ee.Algorithms.If(
         s2.size().gt(0),
         s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
-        ee.Image.constant(null).rename('NDVI')
+        ee.Image(ee.Number(0)).updateMask(ee.Image(0)).rename('NDVI') // ✅ masked image
       );
 
       const combined = ee.Image(ndvi).addBands(rain);
 
-      return combined.reduceRegion({
+      const stats = combined.reduceRegion({
         reducer: ee.Reducer.mean(),
         geometry,
         scale: 500,
         maxPixels: 1e9
-      }).set('date', ee.Date(monthStart).format('YYYY-MM'));
+      });
 
-    });
+      return ee.Feature(null, stats.set('date', monthStart.format('YYYY-MM')));
+    }));
 
-    const result = ee.FeatureCollection(monthlyStats.map(m => ee.Feature(null, m)));
-
-    result.getInfo((data, err) => {
+    monthlyStats.getInfo((data, err) => {
       if (err) {
         console.error('❌ Trend API error:', err);
         return res.status(500).json({ error: 'Trend API error', details: err.message || err });
       }
 
-      // Defensive check
       if (!data || !Array.isArray(data.features)) {
         console.error('❌ Invalid trend data returned');
         return res.status(500).json({ error: 'Invalid data structure returned from Earth Engine' });
@@ -340,6 +337,7 @@ app.get('/trend', (req, res) => {
     res.status(500).json({ error: 'Trend route failed', details: err.message || err });
   }
 });
+
 
   app.get('/', (req, res) => {
     res.send('🌍 GreenMap EE backend is running');
