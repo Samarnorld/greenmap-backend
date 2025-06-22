@@ -352,12 +352,6 @@ app.get('/trend', (req, res) => {
   }
 });
 
-console.log("WARD SELECTED:", wardName);
-wards.filter(ee.Filter.eq('NAME_3', wardName)).size().getInfo((count) => {
-  console.log(`Matching features for "${wardName}":`, count);
-});
-
-
   app.get('/', (req, res) => {
     res.send('🌍 GreenMap EE backend is running');
   });
