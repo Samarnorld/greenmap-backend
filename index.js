@@ -308,7 +308,8 @@ app.get('/trend', (req, res) => {
         geometry,
         scale: 500,
         maxPixels: 1e9
-      }).set('date', monthStart.format('YYYY-MM'));
+      }).set('date', ee.Date(monthStart).format('YYYY-MM'));
+
     });
 
     const result = ee.FeatureCollection(monthlyStats.map(m => ee.Feature(null, m)));
