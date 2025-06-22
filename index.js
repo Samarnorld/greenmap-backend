@@ -274,10 +274,24 @@ app.get('/trend', (req, res) => {
     const months = ee.List.sequence(0, 11);
     const wardName = req.query.ward;
 
-    const geometry = wardName
+    // 🧽 Clean ward name
+    const normalizedWard = wardName ? wardName.trim().toLowerCase() : null;
+
+    // 🧠 Geometry logic
+    const geometry = normalizedWard
       ? wards.filter(ee.Filter.eq('NAME_3', wardName)).geometry()
       : wards.geometry();
 
+    // 🧪 Debug matching ward (visible in Render logs)
+    if (normalizedWard) {
+      wards.filter(ee.Filter.eq('NAME_3', wardName)).size().getInfo((count) => {
+        console.log(`✅ Matching features for "${wardName}":`, count);
+      });
+    } else {
+      console.log("📊 No ward selected — loading whole Nairobi.");
+    }
+
+    // 🛰 Satellite sources
     const s2Base = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
       .filterBounds(geometry)
       .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
@@ -297,7 +311,7 @@ app.get('/trend', (req, res) => {
       const ndvi = ee.Algorithms.If(
         s2.size().gt(0),
         s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
-        ee.Image(ee.Number(0)).updateMask(ee.Image(0)).rename('NDVI') // ✅ masked image
+        ee.Image(ee.Number(0)).updateMask(ee.Image(0)).rename('NDVI')
       );
 
       const combined = ee.Image(ndvi).addBands(rain);
@@ -337,6 +351,7 @@ app.get('/trend', (req, res) => {
     res.status(500).json({ error: 'Trend route failed', details: err.message || err });
   }
 });
+
 console.log("WARD SELECTED:", wardName);
 wards.filter(ee.Filter.eq('NAME_3', wardName)).size().getInfo((count) => {
   console.log(`Matching features for "${wardName}":`, count);
