@@ -337,6 +337,10 @@ app.get('/trend', (req, res) => {
     res.status(500).json({ error: 'Trend route failed', details: err.message || err });
   }
 });
+console.log("WARD SELECTED:", wardName);
+wards.filter(ee.Filter.eq('NAME_3', wardName)).size().getInfo((count) => {
+  console.log(`Matching features for "${wardName}":`, count);
+});
 
 
   app.get('/', (req, res) => {
