@@ -32,10 +32,11 @@ function startServer() {
   const wards = ee.FeatureCollection("projects/greenmap-backend/assets/nairobi_wards_filtered");
 
  function serveTile(image, visParams, res) {
-  const styled = image
-    .reproject({ crs: 'EPSG:4326', scale: 250 }) // ✅ speeds up visualization
-    .visualize(visParams)
-    .clip(wards);
+ const styled = image
+  .reproject({ crs: 'EPSG:4326', scale: 10 }) // 🟢 10m resolution (clearer, but slower)
+  .visualize(visParams)
+  .clip(wards);
+
 
   styled.getMap({}, (map, err) => {
     if (err || !map || !map.urlFormat) {
