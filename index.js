@@ -33,7 +33,6 @@ function startServer() {
 
  function serveTile(image, visParams, res) {
  const styled = image
-  .reproject({ crs: 'EPSG:4326', scale: 10 }) // 🟢 10m resolution (clearer, but slower)
   .visualize(visParams)
   .clip(wards);
 
