@@ -31,15 +31,20 @@ ee.data.authenticateViaPrivateKey(
 function startServer() {
   const wards = ee.FeatureCollection("projects/greenmap-backend/assets/nairobi_wards_filtered");
 
-  function serveTile(image, visParams, res) {
-    const styled = image.visualize(visParams).clip(wards);
-    styled.getMap({}, (map, err) => {
-      if (err || !map || !map.urlFormat) {
-        return res.status(500).json({ error: 'Failed to generate map tile.', err });
-      }
-      res.json({ urlFormat: map.urlFormat });
-    });
-  }
+ function serveTile(image, visParams, res) {
+  const styled = image
+    .reproject({ crs: 'EPSG:4326', scale: 250 }) // ✅ speeds up visualization
+    .visualize(visParams)
+    .clip(wards);
+
+  styled.getMap({}, (map, err) => {
+    if (err || !map || !map.urlFormat) {
+      return res.status(500).json({ error: 'Failed to generate map tile.', err });
+    }
+    res.setHeader('Cache-Control', 'public, max-age=3600'); // ✅ cache for 1 hour
+    res.json({ urlFormat: map.urlFormat });
+  });
+}
 
  app.get('/ndvi', (req, res) => {
   const inputDate = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
@@ -240,11 +245,10 @@ const startRainPast = oneYearAgo.advance(-rainRange, 'day');
       .addBands(rain_now)
       .addBands(rain_past)
       .addBands(rain_anomaly);
-
-    const results = combined.reduceRegions({
-      collection: wards,
-      reducer: ee.Reducer.mean(),
-      scale: 500,
+const results = combined.reduceRegions({
+  collection: wards,
+  reducer: ee.Reducer.mean(),
+  scale: 1000,
     }).map(f => f.set({
       ndvi: f.get('NDVI'),
       ndvi_past: f.get('NDVI_PAST'),
@@ -259,6 +263,8 @@ const startRainPast = oneYearAgo.advance(-rainRange, 'day');
         console.error('❌ Wards API error:', err);
         return res.status(500).json({ error: 'Failed to compute ward stats', details: err });
       }
+      res.setHeader('Cache-Control', 'public, max-age=900'); // ✅ cache for 15 mins
+
       res.json(data);
     });
 
