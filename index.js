@@ -10,16 +10,14 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 
-// ✅ Path to your service account key
 const privateKey = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
 
-// ✅ Authenticate using the private key method
 ee.data.authenticateViaPrivateKey(
   privateKey,
   () => {
     ee.initialize(null, null, () => {
       console.log('✅ Earth Engine initialized successfully');
-      startServer(); // start backend only after EE is ready
+      startServer(); 
     });
   },
   (err) => {
@@ -27,7 +25,6 @@ ee.data.authenticateViaPrivateKey(
   }
 );
 
-// ✅ Server logic (starts after EE init)
 function startServer() {
   const wards = ee.FeatureCollection("projects/greenmap-backend/assets/nairobi_wards_filtered");
 
@@ -41,7 +38,7 @@ function startServer() {
     if (err || !map || !map.urlFormat) {
       return res.status(500).json({ error: 'Failed to generate map tile.', err });
     }
-    res.setHeader('Cache-Control', 'public, max-age=3600'); // ✅ cache for 1 hour
+    res.setHeader('Cache-Control', 'public, max-age=3600');
     res.json({ urlFormat: map.urlFormat });
   });
 }
@@ -136,7 +133,7 @@ app.get('/ndvi-anomaly', async (req, res) => {
       .filterDate(start, end)
       .filter(ee.Filter.lt('CLOUD_COVER', 10))
       .select(['SR_B4', 'SR_B5'])
-      .map(img => img.multiply(0.0000275).add(-0.2).copyProperties(img, img.propertyNames())); // scale SR bands
+      .map(img => img.multiply(0.0000275).add(-0.2).copyProperties(img, img.propertyNames()));
 
     const useSentinel = year.gte(2015);
 
@@ -156,7 +153,7 @@ app.get('/ndvi-anomaly', async (req, res) => {
   serveTile(anomaly, {
     min: -0.4,
     max: 0.4,
-    palette: ['#d7191c', '#ffffbf', '#1a9641'] // red: loss, yellow: no change, green: gain
+    palette: ['#d7191c', '#ffffbf', '#1a9641']
   }, res);
 });
 app.get('/rainfall', (req, res) => {
@@ -204,7 +201,7 @@ const startPast = past.advance(-range, 'day');
 
 app.get('/wards', async (req, res) => {
   try {
-    const now = ee.Date(Date.now()).advance(-10, 'day'); // buffer
+    const now = ee.Date(Date.now()).advance(-10, 'day'); 
     const oneYearAgo = now.advance(-1, 'year');
 
     const startNDVI = now.advance(-120, 'day');
@@ -213,7 +210,6 @@ const startRain = now.advance(-rainRange, 'day');
 const startRainPast = oneYearAgo.advance(-rainRange, 'day');
     const startNDVIPast = oneYearAgo.advance(-120, 'day');
 
-    // ✅ NDVI Current & Past
     const s2_now = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
       .filterBounds(wards).filterDate(startNDVI, now)
       .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
@@ -226,13 +222,11 @@ const startRainPast = oneYearAgo.advance(-rainRange, 'day');
       .select(['B4', 'B8']);
     const ndvi_past = s2_past.median().normalizedDifference(['B8', 'B4']).rename('NDVI_PAST');
 
-    // ✅ LST
     const lst = ee.ImageCollection('MODIS/061/MOD11A1')
       .filterBounds(wards).filterDate(startNDVI, now)
       .select('LST_Day_1km')
       .mean().multiply(0.02).subtract(273.15).rename('LST_C');
 
-    // ✅ Rainfall Current & Past
     const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
       .filterBounds(wards).select('precipitation');
     const rain_now = chirps.filterDate(startRain, now).sum().rename('Rain_Current');
@@ -263,7 +257,7 @@ const results = combined.reduceRegions({
         console.error('❌ Wards API error:', err);
         return res.status(500).json({ error: 'Failed to compute ward stats', details: err });
       }
-      res.setHeader('Cache-Control', 'public, max-age=900'); // ✅ cache for 15 mins
+      res.setHeader('Cache-Control', 'public, max-age=900');
 
       res.json(data);
     });
@@ -280,15 +274,12 @@ app.get('/trend', (req, res) => {
     const months = ee.List.sequence(0, 11);
     const wardName = req.query.ward;
 
-    // 🧽 Clean ward name
     const normalizedWard = wardName ? wardName.trim().toLowerCase() : null;
 
-    // 🧠 Geometry logic
     const geometry = normalizedWard
       ? wards.filter(ee.Filter.eq('NAME_3', wardName)).geometry()
       : wards.geometry();
 
-    // 🧪 Debug matching ward (visible in Render logs)
     if (normalizedWard) {
       wards.filter(ee.Filter.eq('NAME_3', wardName)).size().getInfo((count) => {
         console.log(`✅ Matching features for "${wardName}":`, count);
