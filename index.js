@@ -28,16 +28,16 @@ ee.data.authenticateViaPrivateKey(
 function startServer() {
   const wards = ee.FeatureCollection("projects/greenmap-backend/assets/nairobi_wards_filtered");
 
- function serveTile(image, visParams, res) {
- const styled = image
-  .visualize(visParams)
-  .clip(wards);
-
+function serveTile(image, visParams, res) {
+  const styled = image.visualize(visParams).clip(wards);
 
   styled.getMap({}, (map, err) => {
     if (err || !map || !map.urlFormat) {
-      return res.status(500).json({ error: 'Failed to generate map tile.', err });
+      console.error("🛑 serveTile failed:", err || 'Missing urlFormat');
+      return res.status(500).json({ error: 'Tile rendering failed', details: err });
     }
+
+    console.log("✅ Tile URL generated:", map.urlFormat);
     res.setHeader('Cache-Control', 'public, max-age=3600');
     res.json({ urlFormat: map.urlFormat });
   });
@@ -149,6 +149,13 @@ app.get('/ndvi-anomaly', async (req, res) => {
   const currentNDVI = getNDVI(currentDate);
   const pastNDVI = getNDVI(pastDate);
   const anomaly = ee.Image(currentNDVI).subtract(ee.Image(pastNDVI)).rename('NDVI_Anomaly');
+anomaly.getInfo((imgInfo, err) => {
+  if (err) {
+    console.error("❌ Failed to compute NDVI anomaly image:", err);
+  } else {
+    console.log("✅ NDVI anomaly computed, proceeding to tile generation.");
+  }
+});
 
   serveTile(anomaly, {
     min: -0.4,
