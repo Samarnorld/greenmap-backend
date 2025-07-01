@@ -116,7 +116,6 @@ const startDate = endDate.advance(-120, 'day');
 app.get('/ndvi-anomaly', async (req, res) => {
   const currentDate = req.query.current ? ee.Date(req.query.current) : ee.Date(Date.now());
   const pastDate = req.query.past ? ee.Date(req.query.past) : ee.Date(Date.now()).advance(-1, 'year');
-
   function getNDVI(date) {
     const start = date.advance(-120, 'day');
     const end = date;
@@ -139,12 +138,21 @@ app.get('/ndvi-anomaly', async (req, res) => {
 
     const ndvi = ee.Algorithms.If(
       useSentinel,
-      sentinel.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
-      landsat.median().normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI')
+      ee.Algorithms.If(
+        sentinel.size().gt(0),
+        sentinel.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
+        ee.Image(0).rename('NDVI').updateMask(ee.Image(0)) // fully transparent if no image
+      ),
+      ee.Algorithms.If(
+        landsat.size().gt(0),
+        landsat.median().normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI'),
+        ee.Image(0).rename('NDVI').updateMask(ee.Image(0)) // fully transparent if no image
+      )
     );
 
     return ee.Image(ndvi);
   }
+
 
   const currentNDVI = getNDVI(currentDate);
   const pastNDVI = getNDVI(pastDate);
