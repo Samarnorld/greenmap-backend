@@ -201,7 +201,7 @@ const startPast = past.advance(-range, 'day');
 
 app.get('/wards', async (req, res) => {
   try {
-    const now = ee.Date(Date.now()).advance(-10, 'day'); 
+    const now = ee.Date(Date.now()).advance(-30, 'day'); 
     const oneYearAgo = now.advance(-1, 'year');
 
     const startNDVI = now.advance(-120, 'day');
