@@ -57,7 +57,7 @@ const startDate = endDate.advance(-120, 'day');
   const ndvi = ee.Algorithms.If(
     s2.size().gt(0),
     s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
-    ee.Image().rename('NDVI')
+    ee.Image.constant(0).rename('NDVI').clip(wards)
   );
 
   serveTile(ee.Image(ndvi), {
@@ -96,7 +96,7 @@ const startDate = endDate.advance(-120, 'day');
   const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
     .filterBounds(wards)
     .filterDate(startDate, endDate)
-    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
     .select(['B4', 'B8']);
 
   const ndvi = ee.Algorithms.If(
@@ -124,7 +124,7 @@ app.get('/ndvi-anomaly', async (req, res) => {
     const sentinel = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
       .filterBounds(wards)
       .filterDate(start, end)
-      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
       .select(['B4', 'B8']);
 
     const landsat = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
