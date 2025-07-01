@@ -57,7 +57,7 @@ const startDate = endDate.advance(-120, 'day');
   const ndvi = ee.Algorithms.If(
     s2.size().gt(0),
     s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
-    ee.Image.constant(0).rename('NDVI').clip(wards)
+   ee.Image.constant(0).rename('NDVI').updateMask(ee.Image(0)).clip(wards)
   );
 
   serveTile(ee.Image(ndvi), {
@@ -88,10 +88,10 @@ const startDate = endDate.advance(-120, 'day');
 });
 
 
- app.get('/ndvi-mask', (req, res) => {
+app.get('/ndvi-mask', (req, res) => {
   const inputDate = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
-const endDate = inputDate;
-const startDate = endDate.advance(-120, 'day');
+  const endDate = inputDate;
+  const startDate = endDate.advance(-120, 'day');
 
   const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
     .filterBounds(wards)
@@ -102,7 +102,7 @@ const startDate = endDate.advance(-120, 'day');
   const ndvi = ee.Algorithms.If(
     s2.size().gt(0),
     s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
-    ee.Image().rename('NDVI')
+    ee.Image.constant(0).rename('NDVI').updateMask(ee.Image(0)) // fully transparent fallback
   );
 
   const mask = ee.Image(ndvi).updateMask(ee.Image(ndvi).gt(0.3));
@@ -113,6 +113,7 @@ const startDate = endDate.advance(-120, 'day');
     palette: ['yellow', 'green']
   }, res);
 });
+
 app.get('/ndvi-anomaly', async (req, res) => {
   const currentDate = req.query.current ? ee.Date(req.query.current) : ee.Date(Date.now());
   const pastDate = req.query.past ? ee.Date(req.query.past) : ee.Date(Date.now()).advance(-1, 'year');
@@ -141,12 +142,14 @@ app.get('/ndvi-anomaly', async (req, res) => {
       ee.Algorithms.If(
         sentinel.size().gt(0),
         sentinel.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
-        ee.Image(0).rename('NDVI').updateMask(ee.Image(0)) // fully transparent if no image
+       ee.Image.constant(0).rename('NDVI').updateMask(ee.Image(0))
+
       ),
       ee.Algorithms.If(
         landsat.size().gt(0),
         landsat.median().normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI'),
-        ee.Image(0).rename('NDVI').updateMask(ee.Image(0)) // fully transparent if no image
+       ee.Image.constant(0).rename('NDVI').updateMask(ee.Image(0))
+
       )
     );
 
