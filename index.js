@@ -51,7 +51,7 @@ const startDate = endDate.advance(-120, 'day');
   const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
     .filterBounds(wards)
     .filterDate(startDate, endDate)
-    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
     .select(['B4', 'B8']);
 
   const ndvi = ee.Algorithms.If(
