@@ -1,8 +1,6 @@
-// index.js
 const express = require('express');
 const cors = require('cors');
 const ee = require('@google/earthengine');
-const path = require('path');
 const fs = require('fs');
 
 const app = express();
@@ -10,23 +8,23 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 
-const { GoogleAuth } = require('google-auth-library');
+// ✅ Use the secret file from Render
+const privateKeyPath = '/etc/secrets/ee-key.json';
+process.env.GOOGLE_APPLICATION_CREDENTIALS = privateKeyPath;
+const privateKey = JSON.parse(fs.readFileSync(privateKeyPath, 'utf8'));
 
-const auth = new GoogleAuth({
-  scopes: ['https://www.googleapis.com/auth/earthengine']
-});
-
-auth.getClient().then(client => {
-  ee.data.authenticateViaGoogle(client, () => {
+ee.data.authenticateViaPrivateKey(
+  privateKey,
+  () => {
     ee.initialize(null, null, () => {
-      console.log('✅ EE initialized using Workload Identity Federation');
-      startServer();
+      console.log('✅ Earth Engine authenticated via secret file');
+      startServer(); // <== make sure this exists below
     });
-  });
-}).catch(err => {
-  console.error('❌ WIF authentication failed:', err);
-});
-
+  },
+  (err) => {
+    console.error('❌ EE auth failed:', err);
+  }
+);
 
 function startServer() {
   const wards = ee.FeatureCollection("projects/greenmap-backend/assets/nairobi_wards_filtered");
