@@ -10,20 +10,23 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 
-const privateKey = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
+const { GoogleAuth } = require('google-auth-library');
 
-ee.data.authenticateViaPrivateKey(
-  privateKey,
-  () => {
+const auth = new GoogleAuth({
+  scopes: ['https://www.googleapis.com/auth/earthengine']
+});
+
+auth.getClient().then(client => {
+  ee.data.authenticateViaGoogle(client, () => {
     ee.initialize(null, null, () => {
-      console.log('✅ Earth Engine initialized successfully');
-      startServer(); 
+      console.log('✅ EE initialized using Workload Identity Federation');
+      startServer();
     });
-  },
-  (err) => {
-    console.error('❌ EE authentication failed:', err);
-  }
-);
+  });
+}).catch(err => {
+  console.error('❌ WIF authentication failed:', err);
+});
+
 
 function startServer() {
   const wards = ee.FeatureCollection("projects/greenmap-backend/assets/nairobi_wards_filtered");
