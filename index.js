@@ -383,9 +383,27 @@ app.get('/greencoverage', (req, res) => {
     ee.Image.constant(0).rename('NDVI').updateMask(ee.Image(0))
   );
 
-  const healthy = ee.Image(ndvi).gt(0.3).selfMask(); // healthy vegetation mask
+  const ndviImage = ee.Image(ndvi);
+  const greenMask = ndviImage.gt(0.3).selfMask(); // healthy vegetation
   const pixelArea = ee.Image.pixelArea();
-  const greenArea = healthy.multiply(pixelArea).rename('green_m2');
+  const greenArea = greenMask.multiply(pixelArea).rename('green_m2');
+
+  const overlapWithBuilt = (() => {
+    const swir = s2.median().select('B11');
+    const nir = s2.median().select('B8');
+    const red = s2.median().select('B4');
+    const ndbi = swir.subtract(nir).divide(swir.add(nir));
+    const ndvi_local = nir.subtract(red).divide(nir.add(red));
+    const builtMask = ndbi.gt(0).and(ndvi_local.lte(0.3)).selfMask();
+    return greenMask.and(builtMask).selfMask();
+  })();
+
+  const overlapArea = overlapWithBuilt.multiply(pixelArea).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: wards.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
 
   const totalGreen = greenArea.reduceRegion({
     reducer: ee.Reducer.sum(),
@@ -401,33 +419,67 @@ app.get('/greencoverage', (req, res) => {
     maxPixels: 1e13
   });
 
-  totalGreen.getInfo((greenRes, err1) => {
+  const greenPerWard = greenArea.reduceRegions({
+    collection: wards,
+    reducer: ee.Reducer.sum(),
+    scale: 10
+  }).map(f => {
+    const wardArea = f.geometry().area();
+    const green_m2 = ee.Number(f.get('sum'));
+    const green_pct = green_m2.divide(wardArea).multiply(100);
+    return f.set({
+      green_m2,
+      ward_area_m2: wardArea,
+      green_pct
+    });
+  });
+
+  greenPerWard.getInfo((wardStats, err1) => {
     if (err1) {
-      console.error('❌ Green area error:', err1);
-      return res.status(500).json({ error: 'Failed to compute green area', details: err1 });
+      console.error('❌ Ward green stats error:', err1);
+      return res.status(500).json({ error: 'Failed to compute green per ward', details: err1 });
     }
 
-    totalArea.getInfo((areaRes, err2) => {
+    totalGreen.getInfo((greenRes, err2) => {
       if (err2) {
-        console.error('❌ Total area error:', err2);
-        return res.status(500).json({ error: 'Failed to compute total area', details: err2 });
+        console.error('❌ Total green error:', err2);
+        return res.status(500).json({ error: 'Failed to compute total green', details: err2 });
       }
 
-      const green_m2 = greenRes['green_m2'];
-      const total_m2 = areaRes['area'];
-      const green_pct = (green_m2 / total_m2) * 100;
+      totalArea.getInfo((areaRes, err3) => {
+        if (err3) {
+          console.error('❌ Total area error:', err3);
+          return res.status(500).json({ error: 'Failed to compute total area', details: err3 });
+        }
 
-      res.setHeader('Cache-Control', 'public, max-age=1800');
-      res.json({
-        updated: new Date().toISOString(),
-        city_green_m2: green_m2,
-        city_total_m2: total_m2,
-        city_green_pct: green_pct
+        overlapArea.getInfo((overlapRes, err4) => {
+          const green_m2 = greenRes['green_m2'];
+          const total_m2 = areaRes['area'];
+          const green_pct = (green_m2 / total_m2) * 100;
+          const overlap_m2 = overlapRes['NDVI'] || overlapRes['constant'] || 0;
+
+          console.log(`✅ Green cover: ${(green_m2 / 1e6).toFixed(2)} km²`);
+          console.log(`⚠️ Overlapping green+built area: ${(overlap_m2 / 1e6).toFixed(2)} km²`);
+
+          res.setHeader('Cache-Control', 'public, max-age=1800');
+          res.json({
+            updated: new Date().toISOString(),
+            city_green_m2: green_m2,
+            city_total_m2: total_m2,
+            city_green_pct: green_pct,
+            city_green_built_overlap_m2: overlap_m2,
+            per_ward: (wardStats.features || []).map(w => ({
+              ward: w.properties.wards || w.properties.NAME_3 || 'Unknown',
+              green_m2: w.properties.green_m2,
+              ward_area_m2: w.properties.ward_area_m2,
+              green_pct: w.properties.green_pct
+            }))
+          });
+        });
       });
     });
   });
 });
-
 
 app.get('/wards', async (req, res) => {
   try {
