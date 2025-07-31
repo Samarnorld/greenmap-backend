@@ -487,6 +487,99 @@ console.log({
     });
   });
 });
+app.get('/treecanopy', (req, res) => {
+  console.log("🌳 /treecanopy called");
+
+  const now = ee.Date(Date.now());
+  const start = now.advance(-120, 'day');
+
+  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(wards)
+    .filterDate(start, now)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+    .select(['B4', 'B8']);
+
+  const fallback = ee.Image(0).rename('NDVI').updateMask(ee.Image(0));
+  const ndvi = ee.Algorithms.If(
+    s2.size().gt(0),
+    s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
+    fallback
+  );
+
+  const ndviImage = ee.Image(ndvi).clip(wards);
+  const treeMask = ndviImage.gt(0.6).selfMask(); // NDVI > 0.6
+
+  serveTile(treeMask, {
+    min: 0,
+    max: 1,
+    palette: ['#238b45']  // dark green
+  }, res);
+});
+app.get('/treecanopy-stats', (req, res) => {
+  console.log("📊 /treecanopy-stats called");
+
+  const now = ee.Date(Date.now());
+  const start = now.advance(-120, 'day');
+
+  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(wards)
+    .filterDate(start, now)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+    .select(['B4', 'B8']);
+
+  const fallback = ee.Image(0).rename('NDVI').updateMask(ee.Image(0));
+  const ndvi = ee.Algorithms.If(
+    s2.size().gt(0),
+    s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
+    fallback
+  );
+
+  const ndviImage = ee.Image(ndvi).clip(wards);
+  const treeMask = ndviImage.gt(0.6).selfMask();  // tree threshold
+
+  const pixelArea = ee.Image.pixelArea();
+  const treeArea = treeMask.multiply(pixelArea).rename('tree_m2');
+
+  const totalTree = treeArea.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: wards.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
+
+  const totalArea = pixelArea.clip(wards).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: wards.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
+
+  totalTree.getInfo((treeRes, err1) => {
+    if (err1) {
+      console.error('❌ Tree area error:', err1);
+      return res.status(500).json({ error: 'Failed to compute tree area', details: err1 });
+    }
+
+    totalArea.getInfo((areaRes, err2) => {
+      if (err2) {
+        console.error('❌ Total area error:', err2);
+        return res.status(500).json({ error: 'Failed to compute total area', details: err2 });
+      }
+
+      const tree_m2 = treeRes?.['tree_m2'] ?? 0;
+      const total_m2 = areaRes?.['area'] ?? 1;
+      const tree_pct = (tree_m2 / total_m2) * 100;
+
+      res.setHeader('Cache-Control', 'public, max-age=1800');
+      res.json({
+        updated: new Date().toISOString(),
+        city_tree_m2: tree_m2,
+        city_total_m2: total_m2,
+        city_tree_pct: tree_pct
+      });
+    });
+  });
+});
 
 app.get('/wards', async (req, res) => {
   try {
