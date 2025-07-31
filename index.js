@@ -344,6 +344,7 @@ app.get('/builtup-stats', (req, res) => {
     }))
   });
 });
+}); 
   });
 });
 app.get('/greencoverage', (req, res) => {
