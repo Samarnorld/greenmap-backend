@@ -453,13 +453,20 @@ app.get('/greencoverage', (req, res) => {
         }
 
         overlapArea.getInfo((overlapRes, err4) => {
-          const green_m2 = greenRes['green_m2'];
-          const total_m2 = areaRes['area'];
+          const green_m2 = greenRes?.['green_m2'] ?? 0;
+const total_m2 = areaRes?.['area'] ?? 1; // avoid divide-by-zero
           const green_pct = (green_m2 / total_m2) * 100;
-          const overlap_m2 = overlapRes['NDVI'] || overlapRes['constant'] || 0;
+         const overlap_m2 = overlapRes?.['NDVI'] ?? overlapRes?.['constant'] ?? 0;
+
 
           console.log(`✅ Green cover: ${(green_m2 / 1e6).toFixed(2)} km²`);
           console.log(`⚠️ Overlapping green+built area: ${(overlap_m2 / 1e6).toFixed(2)} km²`);
+console.log({
+  green_m2,
+  total_m2,
+  green_pct,
+  overlap_m2
+});
 
           res.setHeader('Cache-Control', 'public, max-age=1800');
           res.json({
