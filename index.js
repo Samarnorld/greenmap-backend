@@ -6,7 +6,6 @@ const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
 
 // ✅ Use the secret file from Render
 const privateKeyPath = '/etc/secrets/ee-key.json';
@@ -28,7 +27,7 @@ ee.data.authenticateViaPrivateKey(
 
 function startServer() {
   const wards = ee.FeatureCollection("projects/greenmap-backend/assets/nairobi_wards_filtered");
-
+app.use(cors());
 function serveTile(image, visParams, res) {
   const styled = image.visualize(visParams).clip(wards);
 
