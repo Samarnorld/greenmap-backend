@@ -322,17 +322,22 @@ const startRain = now.advance(-rainRange, 'day');
 const startRainPast = oneYearAgo.advance(-rainRange, 'day');
     const startNDVIPast = oneYearAgo.advance(-120, 'day');
 
-    const s2_now = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-      .filterBounds(wards).filterDate(startNDVI, now)
-      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
-      .select(['B4', 'B8']);
-    const ndvi_now = s2_now.median().normalizedDifference(['B8', 'B4']).rename('NDVI');
+    function getSafeNDVI(start, end) {
+  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(wards)
+    .filterDate(start, end)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+    .select(['B4', 'B8']);
 
-    const s2_past = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-      .filterBounds(wards).filterDate(startNDVIPast, oneYearAgo)
-      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
-      .select(['B4', 'B8']);
-    const ndvi_past = s2_past.median().normalizedDifference(['B8', 'B4']).rename('NDVI_PAST');
+  return ee.Algorithms.If(
+    s2.size().gt(0),
+    s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
+    ee.Image.constant(0).rename('NDVI').updateMask(ee.Image(0)) // transparent fallback
+  );
+}
+
+const ndvi_now = ee.Image(getSafeNDVI(startNDVI, now));
+const ndvi_past = ee.Image(getSafeNDVI(startNDVIPast, oneYearAgo)).rename('NDVI_PAST');
 
     const lst = ee.ImageCollection('MODIS/061/MOD11A1')
       .filterBounds(wards).filterDate(startNDVI, now)
