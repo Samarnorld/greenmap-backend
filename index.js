@@ -320,31 +320,30 @@ app.get('/builtup-stats', (req, res) => {
         return res.status(500).json({ error: 'Failed to compute total built-up area', details: err2 });
       }
 
-      totalArea.getInfo((areaRes, err3) => {
-        if (err3) {
-          console.error('❌ Total area error:', err3);
-          return res.status(500).json({ error: 'Failed to compute total Nairobi area', details: err3 });
-        }
+     totalArea.getInfo((areaRes, err3) => {
+  if (err3) {
+    console.error('❌ Total area error:', err3);
+    return res.status(500).json({ error: 'Failed to compute total Nairobi area', details: err3 });
+  }
 
-        const built_m2 = builtRes['built_m2'];
-        const total_m2 = areaRes['area'];
-        const built_pct = (built_m2 / total_m2) * 100;
+  const built_m2 = builtRes['built_m2'];
+  const total_m2 = areaRes['area'];
+  const built_pct = (built_m2 / total_m2) * 100;
 
-        res.setHeader('Cache-Control', 'public, max-age=3600');
-        res.json({
-          updated: new Date().toISOString(),
-          city_built_m2: built_m2,
-          city_total_m2: total_m2,
-          city_built_pct: built_pct,
-          per_ward: wardStats.map(w => ({
-            ward: w.properties.wards || w.properties.NAME_3 || 'Unknown',
-            built_m2: w.properties.built_m2,
-            ward_area_m2: w.properties.ward_area_m2,
-            built_pct: w.properties.built_pct
-          }))
-        });
-      });
-    });
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.json({
+    updated: new Date().toISOString(),
+    city_built_m2: built_m2,
+    city_total_m2: total_m2,
+    city_built_pct: built_pct,
+    per_ward: (wardStats.features || []).map(w => ({
+      ward: w.properties.wards || w.properties.NAME_3 || 'Unknown',
+      built_m2: w.properties.built_m2,
+      ward_area_m2: w.properties.ward_area_m2,
+      built_pct: w.properties.built_pct
+    }))
+  });
+});
   });
 });
 app.get('/greencoverage', (req, res) => {
