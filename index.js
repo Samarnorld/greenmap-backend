@@ -348,6 +348,68 @@ app.get('/builtup-stats', (req, res) => {
     });
   });
 });
+app.get('/greencoverage', (req, res) => {
+  console.log("🌱 /greencoverage called");
+
+  const now = ee.Date(Date.now());
+  const start = now.advance(-120, 'day');
+
+  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(wards)
+    .filterDate(start, now)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+    .select(['B4', 'B8']);
+
+  const ndvi = ee.Algorithms.If(
+    s2.size().gt(0),
+    s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
+    ee.Image.constant(0).rename('NDVI').updateMask(ee.Image(0))
+  );
+
+  const healthy = ee.Image(ndvi).gt(0.3).selfMask(); // healthy vegetation mask
+  const pixelArea = ee.Image.pixelArea();
+  const greenArea = healthy.multiply(pixelArea).rename('green_m2');
+
+  const totalGreen = greenArea.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: wards.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
+
+  const totalArea = pixelArea.clip(wards).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: wards.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
+
+  totalGreen.getInfo((greenRes, err1) => {
+    if (err1) {
+      console.error('❌ Green area error:', err1);
+      return res.status(500).json({ error: 'Failed to compute green area', details: err1 });
+    }
+
+    totalArea.getInfo((areaRes, err2) => {
+      if (err2) {
+        console.error('❌ Total area error:', err2);
+        return res.status(500).json({ error: 'Failed to compute total area', details: err2 });
+      }
+
+      const green_m2 = greenRes['green_m2'];
+      const total_m2 = areaRes['area'];
+      const green_pct = (green_m2 / total_m2) * 100;
+
+      res.setHeader('Cache-Control', 'public, max-age=1800');
+      res.json({
+        updated: new Date().toISOString(),
+        city_green_m2: green_m2,
+        city_total_m2: total_m2,
+        city_green_pct: green_pct
+      });
+    });
+  });
+});
 
 
 app.get('/wards', async (req, res) => {
