@@ -245,10 +245,11 @@ app.get('/builtup', (req, res) => {
   const builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
 
   serveTile(builtMask, {
-    min: 0,
-    max: 1,
-    palette: ['#999999'] // neutral gray
-  }, res);
+  min: 0,
+  max: 1,
+  palette: ['#fee5d9', '#fcae91', '#fb6a4a', '#de2d26', '#a50f15']  // 🔴 RED URBAN GRADIENT
+}, res);
+
 });
 app.get('/builtup-stats', (req, res) => {
   console.log("📊 /builtup-stats called");
