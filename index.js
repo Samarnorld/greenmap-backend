@@ -606,7 +606,7 @@ const startRainPast = oneYearAgo.advance(-rainRange, 'day');
   );
 }
 
-const ndvi_now = ee.Image(getSafeNDVI(startNDVI, now));
+const ndvi_now = ee.Image(getSafeNDVI(startNDVI, now)).rename('NDVI_NOW');
 const ndvi_past = ee.Image(getSafeNDVI(startNDVIPast, oneYearAgo)).rename('NDVI_PAST');
 
     const lst = ee.ImageCollection('MODIS/061/MOD11A1')
@@ -621,23 +621,25 @@ const ndvi_past = ee.Image(getSafeNDVI(startNDVIPast, oneYearAgo)).rename('NDVI_
     const rain_anomaly = rain_now.subtract(rain_past).rename('Rain_Anomaly');
 
     const combined = ndvi_now
-      .addBands(ndvi_past)
-      .addBands(lst)
-      .addBands(rain_now)
-      .addBands(rain_past)
-      .addBands(rain_anomaly);
+  .addBands(ndvi_past)
+  .addBands(lst)
+  .addBands(rain_now)
+  .addBands(rain_past)
+  .addBands(rain_anomaly);
+
 const results = combined.reduceRegions({
   collection: wards,
   reducer: ee.Reducer.mean(),
   scale: 1000,
     }).map(f => f.set({
-      ndvi: f.get('NDVI'),
-      ndvi_past: f.get('NDVI_PAST'),
-      lst: f.get('LST_C'),
-      rain_mm: f.get('Rain_Current'),
-      rain_past: f.get('Rain_Past'),
-      anomaly_mm: f.get('Rain_Anomaly')
-    }));
+  ndvi: f.get('NDVI_NOW'),
+  ndvi_past: f.get('NDVI_PAST'),
+  lst: f.get('LST_C'),
+  rain_mm: f.get('Rain_Current'),
+  rain_past: f.get('Rain_Past'),
+  anomaly_mm: f.get('Rain_Anomaly')
+}));
+
 
     results.getInfo((data, err) => {
       if (err) {
