@@ -218,20 +218,60 @@ const startPast = past.advance(-range, 'day');
   }, res);
 });
 app.get('/builtup', (req, res) => {
+  console.log("📡 /builtup endpoint hit");
+
   const currentDate = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
-  const pastDate = currentDate.advance(-1, 'year'); // 1-year trend window
+  const pastDate = currentDate.advance(-1, 'year');
 
   const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
     .filterBounds(wards)
     .filterDate(pastDate, currentDate)
-    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
-    .median()
-    .clip(wards);
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20));
 
-  // NDBI = (SWIR - NIR) / (SWIR + NIR)
-  const swir = s2.select('B11');
-  const nir = s2.select('B8');
-  const red = s2.select('B4');
+  const safeImage = ee.Algorithms.If(
+    s2.size().gt(0),
+    s2.median().clip(wards),
+    ee.Image(0).updateMask(ee.Image(0)).clip(wards) // fully transparent fallback
+  );
+
+  const image = ee.Image(safeImage);
+  const swir = image.select('B11');
+  const nir = image.select('B8');
+  const red = image.select('B4');
+
+  const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
+  const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+
+  const builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
+
+  serveTile(builtMask, {
+    min: 0,
+    max: 1,
+    palette: ['#999999'] // neutral gray
+  }, res);
+});
+app.get('/builtup-stats', (req, res) => {
+  console.log("📊 /builtup-stats called");
+
+  const currentDate = ee.Date(Date.now());
+  const pastDate = currentDate.advance(-1, 'year');
+
+  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(wards)
+    .filterDate(pastDate, currentDate)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20));
+
+  const safeImage = ee.Algorithms.If(
+    s2.size().gt(0),
+    s2.median().clip(wards),
+    ee.Image(0).updateMask(ee.Image(0)).clip(wards)
+  );
+
+  const image = ee.Image(safeImage);
+  const swir = image.select('B11');
+  const nir = image.select('B8');
+  const red = image.select('B4');
+
   const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
   const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
 
@@ -239,23 +279,21 @@ app.get('/builtup', (req, res) => {
   const pixelArea = ee.Image.pixelArea();
   const builtAreaImage = builtMask.multiply(pixelArea).rename('built_m2');
 
-  // 📍 Per-ward stats
   const builtPerWard = builtAreaImage.reduceRegions({
     collection: wards,
     reducer: ee.Reducer.sum(),
     scale: 10
-  }).map(function (f) {
+  }).map(f => {
     const wardArea = f.geometry().area();
     const built_m2 = ee.Number(f.get('sum'));
     const built_pct = built_m2.divide(wardArea).multiply(100);
     return f.set({
-      built_m2: built_m2,
+      built_m2,
       ward_area_m2: wardArea,
-      built_pct: built_pct
+      built_pct
     });
   });
 
-  // 🌍 Nairobi-wide totals
   const totalBuilt = builtAreaImage.reduceRegion({
     reducer: ee.Reducer.sum(),
     geometry: wards.geometry(),
@@ -270,7 +308,6 @@ app.get('/builtup', (req, res) => {
     maxPixels: 1e13
   });
 
-  // 🚀 Return results
   builtPerWard.getInfo((wardStats, err1) => {
     if (err1) {
       console.error('❌ Built-up ward stats error:', err1);
@@ -310,6 +347,7 @@ app.get('/builtup', (req, res) => {
     });
   });
 });
+
 
 app.get('/wards', async (req, res) => {
   try {
