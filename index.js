@@ -274,7 +274,7 @@ app.get('/builtup-stats', (req, res) => {
 
   const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
   const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
-
+ const pixelArea = ee.Image.pixelArea();
  const greenMask = ndvi.gt(0.3); // healthy vegetation
 const builtMask = ndbi.gt(0).and(ndvi.lte(0.3)).and(greenMask.not()).selfMask();
 const overlap = greenMask.and(builtMask).selfMask();
@@ -294,7 +294,7 @@ overlapArea.getInfo((overlapRes, err) => {
   }
 });
 
-  const pixelArea = ee.Image.pixelArea();
+ 
   const builtAreaImage = builtMask.multiply(pixelArea).rename('built_m2');
 
   const builtPerWard = builtAreaImage.reduceRegions({
