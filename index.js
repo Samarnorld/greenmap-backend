@@ -608,6 +608,9 @@ const startRainPast = oneYearAgo.advance(-rainRange, 'day');
 
 const ndvi_now = ee.Image(getSafeNDVI(startNDVI, now)).rename('NDVI_NOW');
 const ndvi_past = ee.Image(getSafeNDVI(startNDVIPast, oneYearAgo)).rename('NDVI_PAST');
+console.log("🛰 Computing NDVI stats...");
+console.log("🕐 Current NDVI window:", startNDVI.getInfo(), "→", now.getInfo());
+console.log("🕐 Past NDVI window:", startNDVIPast.getInfo(), "→", oneYearAgo.getInfo());
 
     const lst = ee.ImageCollection('MODIS/061/MOD11A1')
       .filterBounds(wards).filterDate(startNDVI, now)
@@ -626,6 +629,7 @@ const ndvi_past = ee.Image(getSafeNDVI(startNDVIPast, oneYearAgo)).rename('NDVI_
   .addBands(rain_now)
   .addBands(rain_past)
   .addBands(rain_anomaly);
+console.log("📦 Combined bands added, now reducing regions...");
 
 const results = combined.reduceRegions({
   collection: wards,
@@ -647,6 +651,7 @@ const results = combined.reduceRegions({
         return res.status(500).json({ error: 'Failed to compute ward stats', details: err });
       }
       res.setHeader('Cache-Control', 'public, max-age=900');
+console.log("✅ Sample ward NDVI result:", data?.features?.[0]?.properties);
 
       res.json(data);
     });
