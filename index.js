@@ -608,8 +608,8 @@ const startRainPast = oneYearAgo.advance(-rainRange, 'day');
   );
 }
 
-const ndvi_now = ee.Image(getSafeNDVI(startNDVI, now));
-const ndvi_past = ee.Image(getSafeNDVI(startNDVIPast, oneYearAgo));
+const ndvi_now = ee.Image(getSafeNDVI(startNDVI, now)).rename('NDVI');
+const ndvi_past = ee.Image(getSafeNDVI(startNDVIPast, oneYearAgo)).rename('NDVI_PAST');
 console.log("🛰 Computing NDVI stats...");
 console.log("🕐 Current NDVI window:", startNDVI.getInfo(), "→", now.getInfo());
 console.log("🕐 Past NDVI window:", startNDVIPast.getInfo(), "→", oneYearAgo.getInfo());
@@ -638,7 +638,7 @@ const results = combined.reduceRegions({
   reducer: ee.Reducer.mean(),
   scale: 1000,
  }).map(f => f.set({
-  ndvi: f.get('NDVI_NOW'),           // ✅ fixed
+ndvi: f.get('NDVI'),         // ✅ fixed
   ndvi_past: f.get('NDVI_PAST'),
   lst: f.get('LST_C'),
   rain_mm: f.get('Rain_Current'),
