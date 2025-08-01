@@ -637,8 +637,14 @@ const results = combined.reduceRegions({
   collection: wards,
   reducer: ee.Reducer.mean(),
   scale: 1000,
-});
-
+ }).map(f => f.set({
+ndvi: f.get('NDVI'),         // ✅ fixed
+  ndvi_past: f.get('NDVI_PAST'),
+  lst: f.get('LST_C'),
+  rain_mm: f.get('Rain_Current'),
+  rain_past: f.get('Rain_Past'),
+  anomaly_mm: f.get('Rain_Anomaly')
+}));
 
 
 
