@@ -159,7 +159,9 @@ app.get('/ndvi-anomaly', async (req, res) => {
 
   const currentNDVI = getNDVI(currentDate);
   const pastNDVI = getNDVI(pastDate);
-  const anomaly = ee.Image(currentNDVI).subtract(ee.Image(pastNDVI)).rename('NDVI_Anomaly');
+  const anomaly = ee.Image(currentNDVI).rename('NOW')
+  .subtract(ee.Image(pastNDVI).rename('PAST'))
+  .rename('NDVI_Anomaly');
 anomaly.getInfo((imgInfo, err) => {
   if (err) {
     console.error("❌ Failed to compute NDVI anomaly image:", err);
@@ -606,8 +608,8 @@ const startRainPast = oneYearAgo.advance(-rainRange, 'day');
   );
 }
 
-const ndvi_now = ee.Image(getSafeNDVI(startNDVI, now)).rename('NDVI_NOW');
-const ndvi_past = ee.Image(getSafeNDVI(startNDVIPast, oneYearAgo)).rename('NDVI_PAST');
+const ndvi_now = ee.Image(getSafeNDVI(startNDVI, now));
+const ndvi_past = ee.Image(getSafeNDVI(startNDVIPast, oneYearAgo));
 console.log("🛰 Computing NDVI stats...");
 console.log("🕐 Current NDVI window:", startNDVI.getInfo(), "→", now.getInfo());
 console.log("🕐 Past NDVI window:", startNDVIPast.getInfo(), "→", oneYearAgo.getInfo());
@@ -623,8 +625,8 @@ console.log("🕐 Past NDVI window:", startNDVIPast.getInfo(), "→", oneYearAgo
     const rain_past = chirps.filterDate(startRainPast, oneYearAgo).sum().rename('Rain_Past');
     const rain_anomaly = rain_now.subtract(rain_past).rename('Rain_Anomaly');
 
-    const combined = ndvi_now
-  .addBands(ndvi_past)
+   const combined = ndvi_now.rename('NDVI_NOW')
+  .addBands(ndvi_past.rename('NDVI_PAST'))
   .addBands(lst)
   .addBands(rain_now)
   .addBands(rain_past)
