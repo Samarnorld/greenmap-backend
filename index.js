@@ -27,6 +27,46 @@ ee.data.authenticateViaPrivateKey(
 
 function startServer() {
   const wards = ee.FeatureCollection("projects/greenmap-backend/assets/nairobi_wards_filtered");
+  function getNDVI(start, end) {
+  // Sentinel-2 collection
+  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(wards)
+    .filterDate(start, end)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+    .select(['B4', 'B8']);
+
+  // Landsat-7 collection
+  const landsat = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+    .filterBounds(wards)
+    .filterDate(start, end)
+    .filter(ee.Filter.lt('CLOUD_COVER', 10))
+    .select(['SR_B4', 'SR_B5'])
+    .map(img =>
+      img
+        .multiply(0.0000275)
+        .add(-0.2)
+        .copyProperties(img, img.propertyNames())
+    );
+
+  // Compute NDVI for each
+  const sentinelNDVI = s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI');
+  const landsatNDVI = landsat.median().normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+
+  // A zero-image *with valid pixels* as ultimate fallback
+  const fallback = ee.Image.constant(0).rename('NDVI').clip(wards).unmask(0);
+
+  // Decide which to use: Sentinel for dates ≥2015, otherwise Landsat
+  const year = end.get('year');
+  const ndviImage = ee.Algorithms.If(
+    ee.Number(year).gte(2015),
+    ee.Algorithms.If(s2.size().gt(0), sentinelNDVI, landsatNDVI),  // if Sentinel empty, try Landsat
+    ee.Algorithms.If(landsat.size().gt(0), landsatNDVI, sentinelNDVI)
+  );
+
+  // Ensure you always get a real Image
+  return ee.Image(ndviImage).unmask(0);
+}
+
 app.use(cors());
 function serveTile(image, visParams, res) {
   const styled = image.visualize(visParams).clip(wards);
