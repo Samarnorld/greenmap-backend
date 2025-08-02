@@ -584,17 +584,8 @@ app.get('/trend', (req, res) => {
     const normalizedWard = wardName ? wardName.trim().toLowerCase() : null;
 
     const geometry = normalizedWard
-  ? wards.filter(ee.Filter.eq('NAME_3', ee.String(wardName).capitalize())).geometry()
-  : wards.geometry();
-
-
-    if (normalizedWard) {
-      wards.filter(ee.Filter.eq('NAME_3', wardName)).size().getInfo((count) => {
-        console.log(`✅ Matching features for "${wardName}":`, count);
-      });
-    } else {
-      console.log("📊 No ward selected — loading whole Nairobi.");
-    }
+      ? wards.filter(ee.Filter.eq('NAME_3', ee.String(wardName).capitalize())).first().geometry()
+      : wards.geometry();
 
     // 🛰 Satellite sources
     const s2Base = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
@@ -623,7 +614,7 @@ app.get('/trend', (req, res) => {
 
       const stats = combined.reduceRegion({
         reducer: ee.Reducer.mean(),
-        geometry,
+        geometry: geometry,
         scale: 500,
         maxPixels: 1e9
       });
@@ -644,16 +635,16 @@ app.get('/trend', (req, res) => {
 
       const formatted = data.features.map(f => ({
         date: f.properties.date,
-        ndvi: f.properties.NDVI ?? null,
-        rain: f.properties.Rain ?? null
-      }));
+        ndvi: f.properties.NDVI || 0,
+        rain: f.properties.Rain || 0
+      })).filter(d => d.date); // Filter out any without a date
 
+      res.setHeader('Cache-Control', 'public, max-age=86400');
       res.json(formatted);
     });
-
-  } catch (err) {
-    console.error('❌ Trend fatal error:', err);
-    res.status(500).json({ error: 'Trend route failed', details: err.message || err });
+  } catch (e) {
+    console.error('❌ Unhandled error in /trend:', e);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 app.get('/', (req, res) => {
