@@ -604,7 +604,7 @@ const startRainPast = oneYearAgo.advance(-rainRange, 'day');
   return ee.Algorithms.If(
     s2.size().gt(0),
     s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
-    ee.Image.constant(0).rename('NDVI').updateMask(ee.Image(0)) // transparent fallback
+    ee.Image.constant(0).rename('NDVI').clip(wards) // ✅
   );
 }
 const ndvi_now = ee.Image(getSafeNDVI(startNDVI, now)).rename('NDVI_NOW');
@@ -668,8 +668,9 @@ app.get('/trend', (req, res) => {
     const normalizedWard = wardName ? wardName.trim().toLowerCase() : null;
 
     const geometry = normalizedWard
-      ? wards.filter(ee.Filter.eq('NAME_3', wardName)).geometry()
-      : wards.geometry();
+  ? wards.filter(ee.Filter.eq('NAME_3', ee.String(wardName).capitalize())).geometry()
+  : wards.geometry();
+
 
     if (normalizedWard) {
       wards.filter(ee.Filter.eq('NAME_3', wardName)).size().getInfo((count) => {
