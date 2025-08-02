@@ -602,10 +602,10 @@ const startRainPast = oneYearAgo.advance(-rainRange, 'day');
     .select(['B4', 'B8']);
 
   return ee.Algorithms.If(
-    s2.size().gt(0),
-    s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
-    ee.Image.constant(0).rename('NDVI').clip(wards) // ✅
-  );
+  s2.size().gt(0),
+  s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
+  ee.Image.constant(0).rename('NDVI').clip(wards)  // ✅ fallback image with NDVI = 0
+);
 }
 const ndvi_now = ee.Image(getSafeNDVI(startNDVI, now)).rename('NDVI_NOW');
 const ndvi_past = ee.Image(getSafeNDVI(startNDVIPast, oneYearAgo)).rename('NDVI_PAST');
@@ -638,9 +638,6 @@ const results = combined.reduceRegions({
   reducer: ee.Reducer.mean(),
   scale: 1000,
 });
-
-
-
 
     results.getInfo((data, err) => {
       if (err) {
