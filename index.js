@@ -144,6 +144,48 @@ app.get('/ndvi-anomaly', (req, res) => {
     palette: ['#d7191c', '#ffffbf', '#1a9641']
   }, res);
 });
+app.get('/rainfall', (req, res) => {
+  const end = ee.Date(Date.now());
+  const start = end.advance(-30, 'day');
+
+  const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+    .filterBounds(wards)
+    .filterDate(start, end)
+    .select('precipitation');
+
+  const rain = chirps.sum().rename('Rainfall');
+
+  serveTile(rain, {
+    min: 0,
+    max: 300,
+    palette: ['#e0f3f8', '#abd9e9', '#74add1', '#4575b4', '#313695']
+  }, res);
+});
+app.get('/rainfall-anomaly', (req, res) => {
+  const now = ee.Date(Date.now());
+  const past = now.advance(-1, 'year');
+
+  const rainNow = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+    .filterBounds(wards)
+    .filterDate(now.advance(-30, 'day'), now)
+    .select('precipitation')
+    .sum();
+
+  const rainPast = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+    .filterBounds(wards)
+    .filterDate(past.advance(-30, 'day'), past)
+    .select('precipitation')
+    .sum();
+
+  const anomaly = rainNow.subtract(rainPast).rename('Rainfall_Anomaly');
+
+  serveTile(anomaly, {
+    min: -50,
+    max: 50,
+    palette: ['#d73027', '#fee08b', '#1a9850']
+  }, res);
+});
+
 app.get('/wards', (req, res) => {
   const now = ee.Date(Date.now()).advance(-30, 'day');
   const oneYearAgo = now.advance(-1, 'year');
@@ -299,6 +341,20 @@ app.get('/treecanopy-stats', (req, res) => {
     });
   });
 });
+app.get('/treecanopy', (req, res) => {
+  const end = ee.Date(Date.now());
+  const start = end.advance(-120, 'day');
+
+  const ndvi = getNDVI(start, end);
+  const treeMask = ndvi.gt(0.6).selfMask();
+
+  serveTile(treeMask, {
+    min: 0,
+    max: 1,
+    palette: ['#238b45']
+  }, res);
+});
+
 app.get('/builtup-stats', (req, res) => {
   const end = ee.Date(Date.now());
   const start = end.advance(-1, 'year');
@@ -367,6 +423,39 @@ app.get('/builtup-stats', (req, res) => {
     });
   });
 });
+app.get('/builtup', (req, res) => {
+  const end = ee.Date(Date.now());
+  const start = end.advance(-1, 'year');
+
+  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(wards)
+    .filterDate(start, end)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20));
+
+  const image = ee.Image(
+    ee.Algorithms.If(
+      s2.size().gt(0),
+      s2.median().clip(wards),
+      ee.Image(0).updateMask(ee.Image(0)).clip(wards)
+    )
+  );
+
+  const swir = image.select('B11');
+  const nir = image.select('B8');
+  const red = image.select('B4');
+
+  const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
+  const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+
+  const builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
+
+  serveTile(builtMask, {
+    min: 0,
+    max: 1,
+    palette: ['#ff3d00']
+  }, res);
+});
+
 app.get('/', (req, res) => {
   res.send('✅ GreenMap Earth Engine backend is live');
 });
