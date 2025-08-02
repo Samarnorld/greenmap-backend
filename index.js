@@ -575,7 +575,87 @@ app.get('/treecanopy', (req, res) => {
     palette: ['#238b45']
   }, res);
 });
+app.get('/trend', (req, res) => {
+  try {
+    const start = ee.Date(Date.now()).advance(-1, 'year');
+    const months = ee.List.sequence(0, 11);
+    const wardName = req.query.ward;
 
+    const normalizedWard = wardName ? wardName.trim().toLowerCase() : null;
+
+    const geometry = normalizedWard
+  ? wards.filter(ee.Filter.eq('NAME_3', ee.String(wardName).capitalize())).geometry()
+  : wards.geometry();
+
+
+    if (normalizedWard) {
+      wards.filter(ee.Filter.eq('NAME_3', wardName)).size().getInfo((count) => {
+        console.log(`✅ Matching features for "${wardName}":`, count);
+      });
+    } else {
+      console.log("📊 No ward selected — loading whole Nairobi.");
+    }
+
+    // 🛰 Satellite sources
+    const s2Base = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      .filterBounds(geometry)
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+      .select(['B4', 'B8']);
+
+    const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+      .filterBounds(geometry)
+      .select('precipitation');
+
+    const monthlyStats = ee.FeatureCollection(months.map(i => {
+      const monthStart = start.advance(i, 'month');
+      const monthEnd = monthStart.advance(1, 'month');
+
+      const s2 = s2Base.filterDate(monthStart, monthEnd);
+      const rain = chirps.filterDate(monthStart, monthEnd).sum().rename('Rain');
+
+      const ndvi = ee.Algorithms.If(
+        s2.size().gt(0),
+        s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
+        ee.Image(ee.Number(0)).updateMask(ee.Image(0)).rename('NDVI')
+      );
+
+      const combined = ee.Image(ndvi).addBands(rain);
+
+      const stats = combined.reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry,
+        scale: 500,
+        maxPixels: 1e9
+      });
+
+      return ee.Feature(null, stats.set('date', monthStart.format('YYYY-MM')));
+    }));
+
+    monthlyStats.getInfo((data, err) => {
+      if (err) {
+        console.error('❌ Trend API error:', err);
+        return res.status(500).json({ error: 'Trend API error', details: err.message || err });
+      }
+
+      if (!data || !Array.isArray(data.features)) {
+        console.error('❌ Invalid trend data returned');
+        return res.status(500).json({ error: 'Invalid data structure returned from Earth Engine' });
+      }
+
+      const formatted = data.features.map(f => ({
+        date: f.properties.date,
+        ndvi: f.properties.NDVI ?? null,
+        rain: f.properties.Rain ?? null
+      }));
+
+      res.json(formatted);
+    });
+
+  } catch (err) {
+    console.error('❌ Trend fatal error:', err);
+    res.status(500).json({ error: 'Trend route failed', details: err.message || err });
+  }
+});
 app.get('/', (req, res) => {
   res.send('✅ GreenMap Earth Engine backend is live');
 });
