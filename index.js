@@ -23,7 +23,12 @@ ee.data.authenticateViaPrivateKey(
   }
 );
 function startServer() {
-  app.use(cors());
+  app.use(cors({
+  origin: '*', // ✅ Allow all origins (or specify your domain here)
+  methods: ['GET'],
+  allowedHeaders: ['Content-Type']
+}));
+
 
   const wards = ee.FeatureCollection("projects/greenmap-backend/assets/nairobi_wards_filtered");
 
