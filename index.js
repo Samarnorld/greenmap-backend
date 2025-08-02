@@ -22,17 +22,9 @@ ee.data.authenticateViaPrivateKey(
     console.error("❌ EE Auth error:", err);
   }
 );
-function startServer() {
-  app.use(cors({
-  origin: '*', // ✅ Allow all origins (or specify your domain here)
-  methods: ['GET'],
-  allowedHeaders: ['Content-Type']
-}));
-
 
   const wards = ee.FeatureCollection("projects/greenmap-backend/assets/nairobi_wards_filtered");
-
-  // ✅ Universal NDVI function with MODIS fallback
+// ✅ Universal NDVI function with MODIS fallback
   function getNDVI(start, end) {
     const year = end.get('year');
 
@@ -72,6 +64,14 @@ function startServer() {
 
     return ee.Image(image).clip(wards).unmask(0);
   }
+function startServer() {
+  app.use(cors({
+  origin: '*', // ✅ Allow all origins (or specify your domain here)
+  methods: ['GET'],
+  allowedHeaders: ['Content-Type']
+}));
+
+  
 
   // ✅ After this, we’ll define tile + stat routes next...
 }
