@@ -1,0 +1,371 @@
+const express = require('express');
+const cors = require('cors');
+const fs = require('fs');
+const ee = require('@google/earthengine');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// 🔐 Auth
+const privateKey = JSON.parse(fs.readFileSync('/etc/secrets/ee-key.json', 'utf8'));
+process.env.GOOGLE_APPLICATION_CREDENTIALS = '/etc/secrets/ee-key.json';
+
+ee.data.authenticateViaPrivateKey(
+  privateKey,
+  () => {
+    ee.initialize(null, null, () => {
+      console.log("✅ Earth Engine initialized");
+      startServer();
+    });
+  },
+  (err) => {
+    console.error("❌ EE Auth error:", err);
+  }
+);
+function startServer() {
+  app.use(cors());
+
+  const wards = ee.FeatureCollection("projects/greenmap-backend/assets/nairobi_wards_filtered");
+
+  // ✅ Universal NDVI function with MODIS fallback
+  function getNDVI(start, end) {
+    const year = end.get('year');
+
+    const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      .filterBounds(wards)
+      .filterDate(start, end)
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+      .select(['B4', 'B8']);
+
+    const l7 = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+      .filterBounds(wards)
+      .filterDate(start, end)
+      .filter(ee.Filter.lt('CLOUD_COVER', 10))
+      .select(['SR_B4', 'SR_B5'])
+      .map(img => img.multiply(0.0000275).add(-0.2).copyProperties(img, img.propertyNames()));
+
+    const modis = ee.ImageCollection('MODIS/006/MOD13Q1')
+      .filterBounds(wards)
+      .filterDate(start, end)
+      .select('NDVI')
+      .map(img => img.multiply(0.0001));
+    const md = modis.median().rename('NDVI');
+
+    const sn = s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI');
+    const ln = l7.median().normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+    const useSentinel = ee.Number(year).gte(2015);
+
+    const image = ee.Algorithms.If(
+      useSentinel,
+      ee.Algorithms.If(s2.size().gt(0), sn,
+        ee.Algorithms.If(l7.size().gt(0), ln, md)
+      ),
+      ee.Algorithms.If(l7.size().gt(0), ln,
+        ee.Algorithms.If(s2.size().gt(0), sn, md)
+      )
+    );
+
+    return ee.Image(image).clip(wards).unmask(0);
+  }
+
+  // ✅ After this, we’ll define tile + stat routes next...
+}
+function serveTile(image, visParams, res) {
+  image.visualize(visParams).getMap({}, (map, err) => {
+    if (err || !map || !map.urlFormat) {
+      console.error("❌ NDVI tile error:", err || "Missing URL");
+      return res.status(500).json({ error: 'Failed to get tile', details: err });
+    }
+    console.log("✅ NDVI tile generated");
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.json({ urlFormat: map.urlFormat });
+  });
+}
+
+app.get('/ndvi', (req, res) => {
+  const end = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
+  const start = end.advance(-120, 'day');
+  const ndvi = getNDVI(start, end);
+
+  serveTile(ndvi, {
+    min: 0,
+    max: 0.8,
+    palette: ['red', 'yellow', 'green']
+  }, res);
+});
+app.get('/lst', (req, res) => {
+  const end = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
+  const start = end.advance(-120, 'day');
+
+  const lst = ee.ImageCollection('MODIS/061/MOD11A1')
+    .filterBounds(wards)
+    .filterDate(start, end)
+    .select('LST_Day_1km')
+    .mean()
+    .multiply(0.02)
+    .subtract(273.15)
+    .rename('LST_C');
+
+  serveTile(lst, {
+    min: 25,
+    max: 45,
+    palette: ['blue', 'yellow', 'red']
+  }, res);
+});
+app.get('/ndvi-mask', (req, res) => {
+  const end = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
+  const start = end.advance(-120, 'day');
+
+  const ndvi = getNDVI(start, end);
+  const mask = ndvi.updateMask(ndvi.gt(0.3));
+
+  serveTile(mask, {
+    min: 0.3,
+    max: 0.8,
+    palette: ['yellow', 'green']
+  }, res);
+});
+app.get('/ndvi-anomaly', (req, res) => {
+  const now = req.query.current ? ee.Date(req.query.current) : ee.Date(Date.now());
+  const past = req.query.past ? ee.Date(req.query.past) : now.advance(-1, 'year');
+
+  const nowNDVI = getNDVI(now.advance(-120, 'day'), now);
+  const pastNDVI = getNDVI(past.advance(-120, 'day'), past);
+  const anomaly = nowNDVI.subtract(pastNDVI).rename('NDVI_Anomaly');
+
+  serveTile(anomaly, {
+    min: -0.4,
+    max: 0.4,
+    palette: ['#d7191c', '#ffffbf', '#1a9641']
+  }, res);
+});
+app.get('/wards', (req, res) => {
+  const now = ee.Date(Date.now()).advance(-30, 'day');
+  const oneYearAgo = now.advance(-1, 'year');
+
+  const startNDVI = now.advance(-120, 'day');
+  const startNDVIPast = oneYearAgo.advance(-120, 'day');
+
+  const rainRange = parseInt(req.query.range) || 30;
+  const startRain = now.advance(-rainRange, 'day');
+  const startRainPast = oneYearAgo.advance(-rainRange, 'day');
+
+  const ndvi_now = getNDVI(startNDVI, now).rename('NDVI_NOW');
+  const ndvi_past = getNDVI(startNDVIPast, oneYearAgo).rename('NDVI_PAST');
+
+  const lst = ee.ImageCollection('MODIS/061/MOD11A1')
+    .filterBounds(wards)
+    .filterDate(startNDVI, now)
+    .select('LST_Day_1km')
+    .mean()
+    .multiply(0.02)
+    .subtract(273.15)
+    .rename('LST_C');
+
+  const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+    .filterBounds(wards)
+    .select('precipitation');
+
+  const rain_now = chirps.filterDate(startRain, now).sum().rename('Rain_Current');
+  const rain_past = chirps.filterDate(startRainPast, oneYearAgo).sum().rename('Rain_Past');
+  const rain_anomaly = rain_now.subtract(rain_past).rename('Rain_Anomaly');
+
+  const combined = ndvi_now
+    .addBands(ndvi_past)
+    .addBands(lst)
+    .addBands(rain_now)
+    .addBands(rain_past)
+    .addBands(rain_anomaly);
+
+  const results = combined.reduceRegions({
+    collection: wards,
+    reducer: ee.Reducer.mean(),
+    scale: 1000,
+  });
+
+  results.getInfo((data, err) => {
+    if (err) {
+      console.error("❌ /wards error:", err);
+      return res.status(500).json({ error: 'Failed to compute ward stats', details: err });
+    }
+
+    console.log("✅ /wards returned features:", data?.features?.length);
+    res.setHeader('Cache-Control', 'public, max-age=900');
+    res.json(data);
+  });
+});
+app.get('/greencoverage', (req, res) => {
+  console.log("🌿 /greencoverage called");
+
+  const now = ee.Date(Date.now());
+  const start = now.advance(-120, 'day');
+  const ndvi = getNDVI(start, now);
+
+  const greenMask = ndvi.gt(0.3).selfMask();  // healthy NDVI
+  const pixelArea = ee.Image.pixelArea();
+  const greenArea = greenMask.multiply(pixelArea).rename('green_m2');
+
+  const totalGreen = greenArea.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: wards.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
+
+  const totalArea = pixelArea.clip(wards).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: wards.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
+
+  totalGreen.getInfo((greenRes, err1) => {
+    if (err1) {
+      console.error("❌ Green cover error:", err1);
+      return res.status(500).json({ error: 'Failed to compute green area' });
+    }
+
+    totalArea.getInfo((areaRes, err2) => {
+      if (err2) {
+        console.error("❌ Total area error:", err2);
+        return res.status(500).json({ error: 'Failed to compute area' });
+      }
+
+      const green_m2 = greenRes['green_m2'] || 0;
+      const total_m2 = areaRes['area'] || 1;
+      const green_pct = (green_m2 / total_m2) * 100;
+
+      res.setHeader('Cache-Control', 'public, max-age=1800');
+      res.json({
+        updated: new Date().toISOString(),
+        city_green_m2: green_m2,
+        city_total_m2: total_m2,
+        city_green_pct: green_pct
+      });
+    });
+  });
+});
+app.get('/treecanopy-stats', (req, res) => {
+  const now = ee.Date(Date.now());
+  const start = now.advance(-120, 'day');
+  const ndvi = getNDVI(start, now);
+  const treeMask = ndvi.gt(0.6).selfMask();
+
+  const pixelArea = ee.Image.pixelArea();
+  const treeArea = treeMask.multiply(pixelArea).rename('tree_m2');
+
+  const totalTree = treeArea.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: wards.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
+
+  const totalArea = pixelArea.clip(wards).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: wards.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
+
+  totalTree.getInfo((treeRes, err1) => {
+    if (err1) {
+      console.error("❌ Tree area error:", err1);
+      return res.status(500).json({ error: 'Failed to compute tree area' });
+    }
+
+    totalArea.getInfo((areaRes, err2) => {
+      if (err2) {
+        console.error("❌ Area error:", err2);
+        return res.status(500).json({ error: 'Failed to compute area' });
+      }
+
+      const tree_m2 = treeRes?.['tree_m2'] ?? 0;
+      const total_m2 = areaRes?.['area'] ?? 1;
+      const tree_pct = (tree_m2 / total_m2) * 100;
+
+      res.setHeader('Cache-Control', 'public, max-age=1800');
+      res.json({
+        updated: new Date().toISOString(),
+        city_tree_m2: tree_m2,
+        city_total_m2: total_m2,
+        city_tree_pct: tree_pct
+      });
+    });
+  });
+});
+app.get('/builtup-stats', (req, res) => {
+  const end = ee.Date(Date.now());
+  const start = end.advance(-1, 'year');
+
+  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(wards)
+    .filterDate(start, end)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20));
+
+  const image = ee.Image(
+    ee.Algorithms.If(
+      s2.size().gt(0),
+      s2.median().clip(wards),
+      ee.Image(0).updateMask(ee.Image(0)).clip(wards)
+    )
+  );
+
+  const swir = image.select('B11');
+  const nir = image.select('B8');
+  const red = image.select('B4');
+
+  const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
+  const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+
+  const builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
+  const pixelArea = ee.Image.pixelArea();
+  const builtArea = builtMask.multiply(pixelArea).rename('built_m2');
+
+  const totalBuilt = builtArea.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: wards.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
+
+  const totalArea = pixelArea.clip(wards).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: wards.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
+
+  totalBuilt.getInfo((builtRes, err1) => {
+    if (err1) {
+      console.error("❌ Built-up area error:", err1);
+      return res.status(500).json({ error: 'Failed to compute built area' });
+    }
+
+    totalArea.getInfo((areaRes, err2) => {
+      if (err2) {
+        console.error("❌ Total area error:", err2);
+        return res.status(500).json({ error: 'Failed to compute area' });
+      }
+
+      const built_m2 = builtRes?.['built_m2'] ?? 0;
+      const total_m2 = areaRes?.['area'] ?? 1;
+      const built_pct = (built_m2 / total_m2) * 100;
+
+      res.setHeader('Cache-Control', 'public, max-age=1800');
+      res.json({
+        updated: new Date().toISOString(),
+        city_built_m2: built_m2,
+        city_total_m2: total_m2,
+        city_built_pct: built_pct
+      });
+    });
+  });
+});
+app.get('/', (req, res) => {
+  res.send('✅ GreenMap Earth Engine backend is live');
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 Backend running on http://localhost:${PORT}`);
+});
