@@ -217,17 +217,19 @@ anomaly.getInfo((imgInfo, err) => {
   }, res);
 });
 app.get('/rainfall', (req, res) => {
-  const end = ee.Date(Date.now());
-  const start = end.advance(-30, 'day');
+  const date = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
+  const range = parseInt(req.query.range) || 90;
+const startDate = date.advance(-range, 'day');
+  const endDate = date;
 
   const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
     .filterBounds(wards)
-    .filterDate(start, end)
+    .filterDate(startDate, endDate)
     .select('precipitation');
 
-  const rain = chirps.sum().rename('Rainfall');
+  const totalRain = chirps.sum().rename('Rainfall_90d').clip(wards);
 
-  serveTile(rain, {
+  serveTile(totalRain, {
     min: 0,
     max: 300,
     palette: ['#e0f3f8', '#abd9e9', '#74add1', '#4575b4', '#313695']
@@ -235,22 +237,20 @@ app.get('/rainfall', (req, res) => {
 });
 
 app.get('/rainfall-anomaly', (req, res) => {
-  const now = ee.Date(Date.now());
-  const past = now.advance(-1, 'year');
+  const date = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
+  const past = date.advance(-1, 'year');
+  const range = parseInt(req.query.range) || 90;
+const startNow = date.advance(-range, 'day');
+const startPast = past.advance(-range, 'day');
 
-  const rainNow = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+
+  const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
     .filterBounds(wards)
-    .filterDate(now.advance(-30, 'day'), now)
-    .select('precipitation')
-    .sum();
+    .select('precipitation');
 
-  const rainPast = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
-    .filterBounds(wards)
-    .filterDate(past.advance(-30, 'day'), past)
-    .select('precipitation')
-    .sum();
-
-  const anomaly = rainNow.subtract(rainPast).rename('Rainfall_Anomaly');
+  const rainfallNow = chirps.filterDate(startNow, date).sum();
+  const rainfallPast = chirps.filterDate(startPast, past).sum();
+  const anomaly = rainfallNow.subtract(rainfallPast).rename('Rainfall_Anomaly').clip(wards);
 
   serveTile(anomaly, {
     min: -50,
@@ -258,7 +258,155 @@ app.get('/rainfall-anomaly', (req, res) => {
     palette: ['#d73027', '#fee08b', '#1a9850']
   }, res);
 });
+app.get('/builtup', (req, res) => {
+  console.log("📡 /builtup endpoint hit");
 
+  const currentDate = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
+  const pastDate = currentDate.advance(-1, 'year');
+
+  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(wards)
+    .filterDate(pastDate, currentDate)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20));
+
+  const safeImage = ee.Algorithms.If(
+    s2.size().gt(0),
+    s2.median().clip(wards),
+    ee.Image(0).updateMask(ee.Image(0)).clip(wards) // fully transparent fallback
+  );
+
+  const image = ee.Image(safeImage);
+  const swir = image.select('B11');
+  const nir = image.select('B8');
+  const red = image.select('B4');
+
+  const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
+  const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+
+  const builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
+
+  serveTile(builtMask, {
+  min: 0,
+  max: 1,
+  palette: ['#fee5d9', '#fcae91', '#fb6a4a', '#de2d26', '#a50f15']  // 🔴 RED URBAN GRADIENT
+}, res);
+
+});
+app.get('/builtup-stats', (req, res) => {
+  console.log("📊 /builtup-stats called");
+
+  const currentDate = ee.Date(Date.now());
+  const pastDate = currentDate.advance(-1, 'year');
+
+  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(wards)
+    .filterDate(pastDate, currentDate)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20));
+
+  const safeImage = ee.Algorithms.If(
+    s2.size().gt(0),
+    s2.median().clip(wards),
+    ee.Image(0).updateMask(ee.Image(0)).clip(wards)
+  );
+
+  const image = ee.Image(safeImage);
+  const swir = image.select('B11');
+  const nir = image.select('B8');
+  const red = image.select('B4');
+
+  const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
+  const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+ const pixelArea = ee.Image.pixelArea();
+ const greenMask = ndvi.gt(0.3); // healthy vegetation
+const builtMask = ndbi.gt(0).and(ndvi.lte(0.3)).and(greenMask.not()).selfMask();
+const overlap = greenMask.and(builtMask).selfMask();
+const overlapArea = overlap.multiply(pixelArea).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: wards.geometry(),
+  scale: 10,
+  maxPixels: 1e13
+});
+
+overlapArea.getInfo((overlapRes, err) => {
+  if (err) {
+    console.error("❌ Overlap check failed:", err);
+  } else {
+    const m2 = overlapRes['NDVI'] || overlapRes['constant'] || 0;
+    console.log(`⚠️ Overlapping green+built area: ${(m2 / 1e6).toFixed(2)} km²`);
+  }
+});
+
+ 
+  const builtAreaImage = builtMask.multiply(pixelArea).rename('built_m2');
+
+  const builtPerWard = builtAreaImage.reduceRegions({
+    collection: wards,
+    reducer: ee.Reducer.sum(),
+    scale: 10
+  }).map(f => {
+    const wardArea = f.geometry().area();
+    const built_m2 = ee.Number(f.get('sum'));
+    const built_pct = built_m2.divide(wardArea).multiply(100);
+    return f.set({
+      built_m2,
+      ward_area_m2: wardArea,
+      built_pct
+    });
+  });
+
+  const totalBuilt = builtAreaImage.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: wards.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
+
+  const totalArea = pixelArea.clip(wards).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: wards.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
+
+  builtPerWard.getInfo((wardStats, err1) => {
+    if (err1) {
+      console.error('❌ Built-up ward stats error:', err1);
+      return res.status(500).json({ error: 'Failed to compute built-up per ward', details: err1 });
+    }
+
+    totalBuilt.getInfo((builtRes, err2) => {
+      if (err2) {
+        console.error('❌ Built-up total error:', err2);
+        return res.status(500).json({ error: 'Failed to compute total built-up area', details: err2 });
+      }
+
+     totalArea.getInfo((areaRes, err3) => {
+  if (err3) {
+    console.error('❌ Total area error:', err3);
+    return res.status(500).json({ error: 'Failed to compute total Nairobi area', details: err3 });
+  }
+
+  const built_m2 = builtRes['built_m2'];
+  const total_m2 = areaRes['area'];
+  const built_pct = (built_m2 / total_m2) * 100;
+
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.json({
+    updated: new Date().toISOString(),
+    city_built_m2: built_m2,
+    city_total_m2: total_m2,
+    city_built_pct: built_pct,
+    per_ward: (wardStats.features || []).map(w => ({
+      ward: w.properties.wards || w.properties.NAME_3 || 'Unknown',
+      built_m2: w.properties.built_m2,
+      ward_area_m2: w.properties.ward_area_m2,
+      built_pct: w.properties.built_pct
+    }))
+  });
+});
+}); 
+  });
+});
 app.get('/wards', (req, res) => {
   const now = ee.Date(Date.now()).advance(-30, 'day');
   const oneYearAgo = now.advance(-1, 'year');
@@ -425,107 +573,6 @@ app.get('/treecanopy', (req, res) => {
     min: 0,
     max: 1,
     palette: ['#238b45']
-  }, res);
-});
-
-app.get('/builtup-stats', (req, res) => {
-  const end = ee.Date(Date.now());
-  const start = end.advance(-1, 'year');
-
-  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-    .filterBounds(wards)
-    .filterDate(start, end)
-    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20));
-
-  const image = ee.Image(
-    ee.Algorithms.If(
-      s2.size().gt(0),
-      s2.median().clip(wards),
-      ee.Image(0).updateMask(ee.Image(0)).clip(wards)
-    )
-  );
-
-  const swir = image.select('B11');
-  const nir = image.select('B8');
-  const red = image.select('B4');
-
-  const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
-  const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
-
-  const builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
-  const pixelArea = ee.Image.pixelArea();
-  const builtArea = builtMask.multiply(pixelArea).rename('built_m2');
-
-  const totalBuilt = builtArea.reduceRegion({
-    reducer: ee.Reducer.sum(),
-    geometry: wards.geometry(),
-    scale: 10,
-    maxPixels: 1e13
-  });
-
-  const totalArea = pixelArea.clip(wards).reduceRegion({
-    reducer: ee.Reducer.sum(),
-    geometry: wards.geometry(),
-    scale: 10,
-    maxPixels: 1e13
-  });
-
-  totalBuilt.getInfo((builtRes, err1) => {
-    if (err1) {
-      console.error("❌ Built-up area error:", err1);
-      return res.status(500).json({ error: 'Failed to compute built area' });
-    }
-
-    totalArea.getInfo((areaRes, err2) => {
-      if (err2) {
-        console.error("❌ Total area error:", err2);
-        return res.status(500).json({ error: 'Failed to compute area' });
-      }
-
-      const built_m2 = builtRes?.['built_m2'] ?? 0;
-      const total_m2 = areaRes?.['area'] ?? 1;
-      const built_pct = (built_m2 / total_m2) * 100;
-
-      res.setHeader('Cache-Control', 'public, max-age=1800');
-      res.json({
-        updated: new Date().toISOString(),
-        city_built_m2: built_m2,
-        city_total_m2: total_m2,
-        city_built_pct: built_pct
-      });
-    });
-  });
-});
-app.get('/builtup', (req, res) => {
-  const end = ee.Date(Date.now());
-  const start = end.advance(-1, 'year');
-
-  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-    .filterBounds(wards)
-    .filterDate(start, end)
-    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20));
-
-  const image = ee.Image(
-    ee.Algorithms.If(
-      s2.size().gt(0),
-      s2.median().clip(wards),
-      ee.Image(0).updateMask(ee.Image(0)).clip(wards)
-    )
-  );
-
-  const swir = image.select('B11');
-  const nir = image.select('B8');
-  const red = image.select('B4');
-
-  const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
-  const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
-
-  const builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
-
-  serveTile(builtMask, {
-    min: 0,
-    max: 1,
-    palette: ['#ff3d00']
   }, res);
 });
 
