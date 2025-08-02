@@ -233,6 +233,7 @@ app.get('/rainfall', (req, res) => {
     palette: ['#e0f3f8', '#abd9e9', '#74add1', '#4575b4', '#313695']
   }, res);
 });
+
 app.get('/rainfall-anomaly', (req, res) => {
   const now = ee.Date(Date.now());
   const past = now.advance(-1, 'year');
