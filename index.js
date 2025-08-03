@@ -64,7 +64,7 @@ function startServer() {
   );
 
   // Ensure you always get a real Image
-  return ee.Image(ndviImage).unmask(0);
+  return ee.Image(ndvi).unmask(0).clip(wards);
 }
 
 app.use(cors());
@@ -438,18 +438,64 @@ app.get('/wards', (req, res) => {
   const rain_past = chirps.filterDate(startRainPast, oneYearAgo).sum().rename('Rain_Past');
   const rain_anomaly = rain_now.subtract(rain_past).rename('Rain_Anomaly');
 
-  const combined = ndvi_now
-    .addBands(ndvi_past)
-    .addBands(lst)
-    .addBands(rain_now)
-    .addBands(rain_past)
-    .addBands(rain_anomaly);
+ const pixelArea = ee.Image.pixelArea();
 
-  const results = combined.reduceRegions({
-    collection: wards,
+// Reduce NDVI and other stats per ward
+const results = wards.map(function (ward) {
+  const geom = ward.geometry();
+
+  const ndvi_now_mean = ndvi_now.reduceRegion({
     reducer: ee.Reducer.mean(),
+    geometry: geom,
+    scale: 10,
+    maxPixels: 1e13
+  }).get('NDVI_NOW');
+
+  const ndvi_past_mean = ndvi_past.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: geom,
+    scale: 10,
+    maxPixels: 1e13
+  }).get('NDVI_PAST');
+
+  const lst_mean = lst.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: geom,
     scale: 1000,
+    maxPixels: 1e13
+  }).get('LST_C');
+
+  const rain_now_total = rain_now.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: geom,
+    scale: 5000,
+    maxPixels: 1e13
+  }).get('Rain_Current');
+
+  const rain_past_total = rain_past.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: geom,
+    scale: 5000,
+    maxPixels: 1e13
+  }).get('Rain_Past');
+
+  const rain_anomaly_val = rain_anomaly.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: geom,
+    scale: 5000,
+    maxPixels: 1e13
+  }).get('Rain_Anomaly');
+
+  return ward.set({
+    'NDVI_NOW': ndvi_now_mean,
+    'NDVI_PAST': ndvi_past_mean,
+    'LST_C': lst_mean,
+    'Rain_Current': rain_now_total,
+    'Rain_Past': rain_past_total,
+    'Rain_Anomaly': rain_anomaly_val
   });
+});
+
 
   results.getInfo((data, err) => {
     if (err) {
