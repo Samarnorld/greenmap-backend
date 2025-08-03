@@ -64,7 +64,7 @@ function startServer() {
   );
 
   // Ensure you always get a real Image
-  return ee.Image(ndvi).unmask(0).clip(wards);
+ return ee.Image(ndviImage).unmask(0).clip(wards);
 }
 
 app.use(cors());
