@@ -469,14 +469,22 @@ app.get('/wards', (req, res) => {
 
  const pixelArea = ee.Image.pixelArea();
 // Sentinel-2 built-up detection: NDBI = (SWIR - NIR) / (SWIR + NIR)
-const s2_builtup = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+const s2_collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
   .filterBounds(wards)
   .filterDate(now.advance(-30, 'day'), now)
-  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
-  .median();
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20));
+s2_collection.size().getInfo(size => {
+  console.log(`🛰️ Sentinel-2 image count for last 30 days: ${size}`);
+});
 
-const swir = s2_builtup.select('B11');
-const nir = s2_builtup.select('B8');
+const s2_builtup = ee.Algorithms.If(
+  s2_collection.size().gt(0),
+  s2_collection.median(),
+  ee.Image.constant(0).rename(['B11', 'B8']) // fallback blank image
+);
+
+const swir = ee.Image(s2_builtup).select('B11');
+const nir = ee.Image(s2_builtup).select('B8');
 const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
 
 // Threshold NDBI > 0 to identify built-up
