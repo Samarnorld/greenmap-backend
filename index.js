@@ -588,56 +588,138 @@ app.get('/greencoverage', (req, res) => {
     });
   });
 });
+
 app.get('/treecanopy-stats', async (req, res) => {
   try {
     const geometry = wards.geometry();
-
-    const dw = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
-      .filterBounds(geometry)
-      .sort('system:time_start', false)
-      .first(); // Get most recent image
-
-const classification = dw.select('label');       // Select the single 'label' band
-const treeMask = classification.eq(1).selfMask(); // Class 1 means Trees
-
-
     const pixelArea = ee.Image.pixelArea();
-    const treeArea = treeMask.multiply(pixelArea).rename('tree_m2');
 
-    const totalTree = treeArea.reduceRegion({
-      reducer: ee.Reducer.sum(),
-      geometry,
-      scale: 10,
-      maxPixels: 1e13
-    });
+    // === 1. Quick ESA Tree Cover ===
+    const esa = ee.ImageCollection("ESA/WorldCover/v100").first().select('Map');
+    const treeMaskESA = esa.eq(10).selfMask(); // Trees
+    const treeAreaESA = treeMaskESA.multiply(pixelArea).rename('tree_m2');
 
-    const totalArea = pixelArea.clip(geometry).reduceRegion({
-      reducer: ee.Reducer.sum(),
-      geometry,
-      scale: 10,
-      maxPixels: 1e13
-    });
-
-    const [treeStats, areaStats] = await Promise.all([
-      totalTree.getInfo(),
-      totalArea.getInfo()
+    const [esaTreeInfo, esaTotalInfo] = await Promise.all([
+      treeAreaESA.reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry,
+        scale: 10,
+        maxPixels: 1e13
+      }).getInfo(),
+      pixelArea.clip(geometry).reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry,
+        scale: 10,
+        maxPixels: 1e13
+      }).getInfo()
     ]);
 
-    const tree_m2 = treeStats?.tree_m2 ?? 0;
-    const total_m2 = areaStats?.area ?? 1;
-    const tree_pct = (tree_m2 / total_m2) * 100;
+    const esa_m2 = esaTreeInfo?.tree_m2 ?? 0;
+    const esa_total_m2 = esaTotalInfo?.area ?? 1;
+    const esa_tree_pct = (esa_m2 / esa_total_m2) * 100;
+
+    // === 2. Get all available Dynamic World years (2020 → latest) ===
+    const dwCollection = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+      .filterBounds(geometry)
+      .select('label');
+
+    const yearsList = ee.List.sequence(2020, ee.Date(Date.now()).get('year'));
+
+    const getYearlyStats = async (year) => {
+      const start = ee.Date.fromYMD(year, 1, 1);
+      const end = start.advance(1, 'year');
+
+      const dwYearImg = dwCollection
+        .filterDate(start, end)
+        .mode(); // most common label per pixel
+
+      const treeMask = dwYearImg.eq(1).selfMask();
+      const treeArea = treeMask.multiply(pixelArea).rename('tree_m2');
+
+      // City stats
+      const [cityTreeInfo, cityTotalInfo] = await Promise.all([
+        treeArea.reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry,
+          scale: 10,
+          maxPixels: 1e13
+        }).getInfo(),
+        pixelArea.reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry,
+          scale: 10,
+          maxPixels: 1e13
+        }).getInfo()
+      ]);
+
+      const city_tree_m2 = cityTreeInfo?.tree_m2 ?? 0;
+      const city_total_m2 = cityTotalInfo?.area ?? 1;
+      const city_tree_pct = (city_tree_m2 / city_total_m2) * 100;
+
+      // Per-ward stats
+      const wardStats = await wards.map(function (ward) {
+        const geom = ward.geometry();
+
+        const wardTree = treeArea.reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry: geom,
+          scale: 10,
+          maxPixels: 1e13
+        });
+
+        const wardTotal = pixelArea.reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry: geom,
+          scale: 10,
+          maxPixels: 1e13
+        });
+
+        return ward.set({
+          'ward': ward.get('ward'),
+          'tree_m2': wardTree.get('tree_m2'),
+          'total_m2': wardTotal.get('area')
+        });
+      }).getInfo();
+
+      const wards_pct = wardStats.map(w => {
+        const tree_m2 = w.properties.tree_m2 || 0;
+        const total_m2 = w.properties.total_m2 || 1;
+        return {
+          ward: w.properties.ward,
+          tree_pct: (tree_m2 / total_m2) * 100
+        };
+      });
+
+      return {
+        year,
+        city_tree_pct,
+        wards: wards_pct
+      };
+    };
+
+    // Loop through years and fetch data
+    const yearList = await yearsList.getInfo();
+    const trend = [];
+    for (const y of yearList) {
+      if (y <= 2019 || y > 2100) continue;
+      try {
+        const result = await getYearlyStats(y);
+        trend.push(result);
+      } catch (err) {
+        console.warn(`⚠️ Skipping year ${y} due to error`, err.message);
+      }
+    }
 
     res.setHeader('Cache-Control', 'public, max-age=1800');
     res.json({
       updated: new Date().toISOString(),
-      city_tree_m2: tree_m2,
-      city_total_m2: total_m2,
-      city_tree_pct: tree_pct
+      esa_tree_pct,
+      trend
     });
 
   } catch (err) {
-    console.error('❌ Dynamic World Tree Stat Error:', err);
-    res.status(500).json({ error: 'Tree canopy stats failed' });
+    console.error("❌ /treecanopy-stats error:", err);
+    res.status(500).json({ error: 'Tree canopy trend stats failed', details: err.message });
   }
 });
 
