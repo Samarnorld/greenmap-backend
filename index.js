@@ -544,38 +544,41 @@ app.get('/greencoverage', (req, res) => {
   const start = now.advance(-120, 'day');
   const ndvi = getNDVI(start, now);
 
-  const greenMask = ndvi.gt(0.3).selfMask();  // healthy NDVI
+  const greenMask = ndvi.gt(0.3).selfMask(); // You can tweak threshold here
   const pixelArea = ee.Image.pixelArea();
+
   const greenArea = greenMask.multiply(pixelArea).rename('green_m2');
 
-  const totalGreen = greenArea.reduceRegion({
+  const totalArea = pixelArea.rename('total_m2').clip(wards);
+
+  const greenStats = greenArea.reduceRegion({
     reducer: ee.Reducer.sum(),
     geometry: wards.geometry(),
     scale: 10,
     maxPixels: 1e13
   });
 
-  const totalArea = pixelArea.clip(wards).reduceRegion({
+  const totalStats = totalArea.reduceRegion({
     reducer: ee.Reducer.sum(),
     geometry: wards.geometry(),
     scale: 10,
     maxPixels: 1e13
   });
 
-  totalGreen.getInfo((greenRes, err1) => {
+  greenStats.getInfo((greenRes, err1) => {
     if (err1) {
       console.error("❌ Green cover error:", err1);
       return res.status(500).json({ error: 'Failed to compute green area' });
     }
 
-    totalArea.getInfo((areaRes, err2) => {
+    totalStats.getInfo((areaRes, err2) => {
       if (err2) {
         console.error("❌ Total area error:", err2);
         return res.status(500).json({ error: 'Failed to compute area' });
       }
 
       const green_m2 = greenRes['green_m2'] || 0;
-      const total_m2 = areaRes['area'] || 1;
+      const total_m2 = areaRes['total_m2'] || 1;
       const green_pct = (green_m2 / total_m2) * 100;
 
       res.setHeader('Cache-Control', 'public, max-age=1800');
@@ -588,6 +591,7 @@ app.get('/greencoverage', (req, res) => {
     });
   });
 });
+
 
 app.get('/treecanopy-stats', async (req, res) => {
   try {
