@@ -618,7 +618,9 @@ app.get('/treecanopy-stats', async (req, res) => {
       .sort('system:time_start', false)
       .first(); // Get most recent image
 
-    const treeMask = dw.eq(1).selfMask(); // Class 1 = Trees
+const classification = dw.select('label');       // Select the single 'label' band
+const treeMask = classification.eq(1).selfMask(); // Class 1 means Trees
+
 
     const pixelArea = ee.Image.pixelArea();
     const treeArea = treeMask.multiply(pixelArea).rename('tree_m2');
