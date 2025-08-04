@@ -27,6 +27,10 @@ ee.data.authenticateViaPrivateKey(
 
 function startServer() {
   const wards = ee.FeatureCollection("projects/greenmap-backend/assets/nairobi_wards_filtered");
+  function getWardGeometryByName(wardName) {
+  const normalized = wardName.trim().toLowerCase();
+  return wards.filter(ee.Filter.eq('NAME_3', ee.String(normalized).capitalize())).first().geometry();
+}
   function getNDVI(start, end) {
   // Sentinel-2 collection
   const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
