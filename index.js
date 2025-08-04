@@ -100,7 +100,9 @@ const startDate = endDate.advance(-120, 'day');
    ee.Image.constant(0).rename('NDVI').updateMask(ee.Image(0)).clip(wards)
   );
 
-  serveTile(ee.Image(ndvi), {
+  const geometry = req.query.ward ? getWardGeometryByName(req.query.ward) : wards.geometry();
+const ndviClipped = ee.Image(ndvi).clip(geometry);
+serveTile(ndviClipped, {
     min: 0,
     max: 0.8,
     palette: ['red', 'yellow', 'green']
@@ -285,7 +287,9 @@ app.get('/builtup', (req, res) => {
 
   const builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
 
-  serveTile(builtMask, {
+ const geometry = req.query.ward ? getWardGeometryByName(req.query.ward) : wards.geometry();
+const builtClipped = builtMask.clip(geometry);
+serveTile(builtClipped, {
   min: 0,
   max: 1,
   palette: ['#fee5d9', '#fcae91', '#fb6a4a', '#de2d26', '#a50f15']  // 🔴 RED URBAN GRADIENT
@@ -615,7 +619,9 @@ app.get('/treecanopy', (req, res) => {
   const ndvi = getNDVI(start, end);
   const treeMask = ndvi.gt(0.6).selfMask();
 
-  serveTile(treeMask, {
+ const geometry = req.query.ward ? getWardGeometryByName(req.query.ward) : wards.geometry();
+const treeClipped = treeMask.clip(geometry);
+serveTile(treeClipped, {
     min: 0,
     max: 1,
     palette: ['#238b45']
