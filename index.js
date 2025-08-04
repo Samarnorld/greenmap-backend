@@ -486,55 +486,54 @@ const builtAreaImage = builtMask.multiply(pixelArea).rename('BuiltUp_Area');
 // Reduce NDVI and other stats per ward
 const results = wards.map(function (ward) {
   const geom = ward.geometry();
+const ndvi_now_mean = ee.Number(ndvi_now.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: geom,
+  scale: 10,
+  maxPixels: 1e13
+}).get('NDVI_NOW')).or(0);
 
-  const ndvi_now_mean = ee.Number(ndvi_now.reduceRegion({
-    reducer: ee.Reducer.mean(),
-    geometry: geom,
-    scale: 10,
-    maxPixels: 1e13
-  }).get('NDVI_NOW')).defaultValue(0);
+const ndvi_past_mean = ee.Number(ndvi_past.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: geom,
+  scale: 10,
+  maxPixels: 1e13
+}).get('NDVI_PAST')).or(0);
 
-  const ndvi_past_mean = ee.Number(ndvi_past.reduceRegion({
-    reducer: ee.Reducer.mean(),
-    geometry: geom,
-    scale: 10,
-    maxPixels: 1e13
-  }).get('NDVI_PAST')).defaultValue(0);
+const lst_mean = ee.Number(lst.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: geom,
+  scale: 1000,
+  maxPixels: 1e13
+}).get('LST_C')).or(0);
 
-  const lst_mean = ee.Number(lst.reduceRegion({
-    reducer: ee.Reducer.mean(),
-    geometry: geom,
-    scale: 1000,
-    maxPixels: 1e13
-  }).get('LST_C')).defaultValue(0);
+const rain_now_total = ee.Number(rain_now.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: geom,
+  scale: 5000,
+  maxPixels: 1e13
+}).get('Rain_Current')).or(0);
 
-  const rain_now_total = ee.Number(rain_now.reduceRegion({
-    reducer: ee.Reducer.sum(),
-    geometry: geom,
-    scale: 5000,
-    maxPixels: 1e13
-  }).get('Rain_Current')).defaultValue(0);
+const rain_past_total = ee.Number(rain_past.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: geom,
+  scale: 5000,
+  maxPixels: 1e13
+}).get('Rain_Past')).or(0);
 
-  const rain_past_total = ee.Number(rain_past.reduceRegion({
-    reducer: ee.Reducer.sum(),
-    geometry: geom,
-    scale: 5000,
-    maxPixels: 1e13
-  }).get('Rain_Past')).defaultValue(0);
+const rain_anomaly_val = ee.Number(rain_anomaly.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: geom,
+  scale: 5000,
+  maxPixels: 1e13
+}).get('Rain_Anomaly')).or(0);
 
-  const rain_anomaly_val = ee.Number(rain_anomaly.reduceRegion({
-    reducer: ee.Reducer.mean(),
-    geometry: geom,
-    scale: 5000,
-    maxPixels: 1e13
-  }).get('Rain_Anomaly')).defaultValue(0);
-
-  const builtup_area = ee.Number(builtAreaImage.reduceRegion({
-    reducer: ee.Reducer.sum(),
-    geometry: geom,
-    scale: 10,
-    maxPixels: 1e13
-  }).get('BuiltUp_Area')).defaultValue(0);
+const builtup_area = ee.Number(builtAreaImage.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: geom,
+  scale: 10,
+  maxPixels: 1e13
+}).get('BuiltUp_Area')).or(0);
 
   return ward.set({
     'NDVI_NOW': ndvi_now_mean,
