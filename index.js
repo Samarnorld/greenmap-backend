@@ -800,6 +800,106 @@ app.get('/trend', (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+app.get('/ward-trend', async (req, res) => {
+  try {
+    const wardName = req.query.ward;
+    if (!wardName) return res.status(400).json({ error: 'Missing ?ward= name' });
+
+    const geometry = getWardGeometryByName(wardName);
+
+    const pixelArea = ee.Image.pixelArea();
+    const currentYear = new Date().getFullYear();
+    const yearsList = ee.List.sequence(2017, currentYear);
+    const trend = [];
+
+    const treeCollection = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').select('label');
+    const s2Collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      .filterBounds(geometry)
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+      .select(['B4', 'B8', 'B11']);
+
+    const yearList = await yearsList.getInfo();
+
+    for (const y of yearList) {
+      const start = ee.Date.fromYMD(y, 1, 1);
+      const end = start.advance(1, 'year');
+
+      const s2 = s2Collection.filterDate(start, end);
+      const image = ee.Algorithms.If(
+        s2.size().gt(0),
+        s2.median().clip(geometry),
+        ee.Image.constant(0).updateMask(ee.Image(0)).clip(geometry)
+      );
+      const img = ee.Image(image);
+      const nir = img.select('B8');
+      const red = img.select('B4');
+      const swir = img.select('B11');
+
+      const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+      const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
+
+      const builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
+      const builtArea = builtMask.multiply(pixelArea).rename('built_m2');
+
+      const treeMask = treeCollection
+        .filterDate(start, end)
+        .mode()
+        .eq(1)
+        .selfMask();
+      const treeArea = treeMask.multiply(pixelArea).rename('tree_m2');
+
+      const totalArea = pixelArea.clip(geometry).reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry,
+        scale: 10,
+        maxPixels: 1e13
+      });
+
+      const [ndviMean, builtStats, treeStats, totalStats] = await Promise.all([
+        ndvi.reduceRegion({
+          reducer: ee.Reducer.mean(),
+          geometry,
+          scale: 10,
+          maxPixels: 1e13
+        }).getInfo(),
+        builtArea.reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry,
+          scale: 10,
+          maxPixels: 1e13
+        }).getInfo(),
+        treeArea.reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry,
+          scale: 10,
+          maxPixels: 1e13
+        }).getInfo(),
+        totalArea.getInfo()
+      ]);
+
+      const total_m2 = totalStats.area || 1;
+
+      trend.push({
+        year: y,
+        ndvi: ndviMean.NDVI || 0,
+        tree_pct: ((treeStats.tree_m2 || 0) / total_m2) * 100,
+        built_pct: ((builtStats.built_m2 || 0) / total_m2) * 100
+      });
+    }
+
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.json({
+      ward: wardName,
+      trend,
+      updated: new Date().toISOString()
+    });
+
+  } catch (err) {
+    console.error('❌ /ward-trend error:', err);
+    res.status(500).json({ error: 'Ward trend error', details: err.message });
+  }
+});
+
 app.get('/', (req, res) => {
   res.send('✅ GreenMap Earth Engine backend is live');
 });
