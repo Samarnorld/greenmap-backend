@@ -592,6 +592,28 @@ app.get('/greencoverage', (req, res) => {
     });
   });
 });
+app.get('/treecoverage', (req, res) => {
+  const geometry = req.query.ward
+    ? getWardGeometryByName(req.query.ward)
+    : wards.geometry();
+
+  const year = parseInt(req.query.year) || new Date().getFullYear();
+  const start = ee.Date.fromYMD(year, 1, 1);
+  const end = start.advance(1, 'year');
+
+  const dw = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+    .filterBounds(geometry)
+    .filterDate(start, end)
+    .select('label');
+
+  const treeMask = dw.mode().eq(1).selfMask(); // Class 1 = Trees
+
+  serveTile(treeMask, {
+    min: 0,
+    max: 1,
+    palette: ['#d9f0d3', '#1a9850'] // light to dark green
+  }, res);
+});
 
 app.get('/treecanopy-stats', async (req, res) => {
   try {
