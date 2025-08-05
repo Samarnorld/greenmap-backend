@@ -908,8 +908,7 @@ app.get('/ward-trend', async (req, res) => {
     console.error('❌ /ward-trend error:', err);
     res.status(500).json({ error: 'Ward trend error', details: err.message });
   }
-});
-app.get('/ward-coverages', async (req, res) => {
+});app.get('/ward-coverages', async (req, res) => {
   try {
     const currentYear = new Date().getFullYear();
     const start = ee.Date.fromYMD(currentYear, 1, 1);
@@ -923,9 +922,9 @@ app.get('/ward-coverages', async (req, res) => {
 
     const pixelArea = ee.Image.pixelArea();
 
-    const tasks = wards.features.map((f) => {
-      const name = f.properties.ward;
-      const geometry = ee.Feature(f).geometry();
+    const tasks = wards.map(function (f) {
+      const name = f.get('NAME_3'); // or use 'ward' if your asset uses that
+      const geometry = f.geometry();
 
       const s2 = s2Collection.filterBounds(geometry);
       const image = ee.Algorithms.If(
@@ -933,6 +932,7 @@ app.get('/ward-coverages', async (req, res) => {
         s2.median().clip(geometry),
         ee.Image(0).addBands([ee.Image(0), ee.Image(0)]).rename(['B4', 'B8', 'B11']).updateMask(ee.Image(0)).clip(geometry)
       );
+
       const img = ee.Image(image);
       const nir = img.select('B8');
       const red = img.select('B4');
@@ -973,19 +973,21 @@ app.get('/ward-coverages', async (req, res) => {
         maxPixels: 1e13
       });
 
-      return ee.Dictionary({
+      const result = ee.Dictionary({
         ward: name,
         tree_pct: ee.Number(treeStats.get('tree_m2')).divide(ee.Number(totalArea.get('area'))).multiply(100),
         built_pct: ee.Number(builtStats.get('built_m2')).divide(ee.Number(totalArea.get('area'))).multiply(100)
       });
+
+      return ee.Feature(null, result);
     });
 
-    const result = await ee.List(tasks).getInfo();
+    const result = await tasks.getInfo();
 
     res.setHeader('Cache-Control', 'public, max-age=86400');
     res.json({
       updated: new Date().toISOString(),
-      wards: result
+      wards: result.map(f => f.properties)
     });
 
   } catch (err) {
@@ -993,6 +995,7 @@ app.get('/ward-coverages', async (req, res) => {
     res.status(500).json({ error: 'Ward coverages error', details: err.message });
   }
 });
+
 
 app.get('/', (req, res) => {
   res.send('✅ GreenMap Earth Engine backend is live');
