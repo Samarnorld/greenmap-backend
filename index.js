@@ -895,24 +895,14 @@ app.get('/ward-trend', async (req, res) => {
         tree_pct: ((treeStats.tree_m2 || 0) / total_m2) * 100,
         built_pct: ((builtStats.built_m2 || 0) / total_m2) * 100
       });
-         }
-
-    const latest = trend[trend.length - 1]; // ✅ Move it here, outside the loop
-console.log("📊 Final trend data:", trend);
-console.log("🟢 Latest:", latest);
+    }
 
     res.setHeader('Cache-Control', 'public, max-age=86400');
     res.json({
       ward: wardName,
       trend,
-      current: {
-        year: latest?.year,
-        tree_pct: latest?.tree_pct ?? null,
-        built_pct: latest?.built_pct ?? null
-      },
       updated: new Date().toISOString()
     });
-
 
   } catch (err) {
     console.error('❌ /ward-trend error:', err);
