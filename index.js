@@ -908,86 +908,93 @@ app.get('/ward-trend', async (req, res) => {
     console.error('❌ /ward-trend error:', err);
     res.status(500).json({ error: 'Ward trend error', details: err.message });
   }
-});app.get('/ward-coverages', async (req, res) => {
+});
+app.get('/ward-coverages', async (req, res) => {
   try {
     const currentYear = new Date().getFullYear();
     const start = ee.Date.fromYMD(currentYear, 1, 1);
     const end = start.advance(1, 'year');
 
+    const pixelArea = ee.Image.pixelArea();
     const treeCollection = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').select('label');
     const s2Collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
       .filterDate(start, end)
       .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
       .select(['B4', 'B8', 'B11']);
 
-    const pixelArea = ee.Image.pixelArea();
+    const results = wards
+      .filter(ee.Filter.geometry()) // ⚠️ filters out features with null/empty geometry
+      .map(f => {
+        const name = f.get('ward');
+        const geom = f.geometry();
 
-    const tasks = wards.map(function (f) {
-      const name = f.get('NAME_3'); // or use 'ward' if your asset uses that
-      const geometry = f.geometry();
+        const s2 = s2Collection.filterBounds(geom);
+        const image = ee.Algorithms.If(
+          s2.size().gt(0),
+          s2.median().clip(geom),
+          ee.Image(0).addBands([ee.Image(0), ee.Image(0)]).rename(['B4', 'B8', 'B11']).updateMask(ee.Image(0)).clip(geom)
+        );
+        const img = ee.Image(image);
+        const nir = img.select('B8');
+        const red = img.select('B4');
+        const swir = img.select('B11');
 
-      const s2 = s2Collection.filterBounds(geometry);
-      const image = ee.Algorithms.If(
-        s2.size().gt(0),
-        s2.median().clip(geometry),
-        ee.Image(0).addBands([ee.Image(0), ee.Image(0)]).rename(['B4', 'B8', 'B11']).updateMask(ee.Image(0)).clip(geometry)
-      );
+        const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+        const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
 
-      const img = ee.Image(image);
-      const nir = img.select('B8');
-      const red = img.select('B4');
-      const swir = img.select('B11');
+        const builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
+        const builtArea = builtMask.multiply(pixelArea).rename('built_m2');
 
-      const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
-      const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
+        const treeMask = treeCollection
+          .filterDate(start, end)
+          .filterBounds(geom)
+          .mode()
+          .eq(1)
+          .selfMask();
+        const treeArea = treeMask.multiply(pixelArea).rename('tree_m2');
 
-      const builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
-      const builtArea = builtMask.multiply(pixelArea).rename('built_m2');
+        const totalArea = pixelArea.clip(geom).reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry: geom,
+          scale: 10,
+          maxPixels: 1e13
+        });
 
-      const treeMask = treeCollection
-        .filterBounds(geometry)
-        .filterDate(start, end)
-        .mode()
-        .eq(1)
-        .selfMask();
-      const treeArea = treeMask.multiply(pixelArea).rename('tree_m2');
+        const builtStats = builtArea.reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry: geom,
+          scale: 10,
+          maxPixels: 1e13
+        });
 
-      const totalArea = pixelArea.clip(geometry).reduceRegion({
-        reducer: ee.Reducer.sum(),
-        geometry,
-        scale: 10,
-        maxPixels: 1e13
+        const treeStats = treeArea.reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry: geom,
+          scale: 10,
+          maxPixels: 1e13
+        });
+
+        return ee.Feature(null, {
+          ward: name,
+          tree_pct: ee.Number(treeStats.get('tree_m2')).divide(ee.Number(totalArea.get('area'))).multiply(100),
+          built_pct: ee.Number(builtStats.get('built_m2')).divide(ee.Number(totalArea.get('area'))).multiply(100)
+        });
       });
 
-      const builtStats = builtArea.reduceRegion({
-        reducer: ee.Reducer.sum(),
-        geometry,
-        scale: 10,
-        maxPixels: 1e13
-      });
+    const data = await results.aggregate_array('ward').getInfo();
+    const trees = await results.aggregate_array('tree_pct').getInfo();
+    const built = await results.aggregate_array('built_pct').getInfo();
 
-      const treeStats = treeArea.reduceRegion({
-        reducer: ee.Reducer.sum(),
-        geometry,
-        scale: 10,
-        maxPixels: 1e13
-      });
-
-      const result = ee.Dictionary({
-        ward: name,
-        tree_pct: ee.Number(treeStats.get('tree_m2')).divide(ee.Number(totalArea.get('area'))).multiply(100),
-        built_pct: ee.Number(builtStats.get('built_m2')).divide(ee.Number(totalArea.get('area'))).multiply(100)
-      });
-
-      return ee.Feature(null, result);
-    });
-
-    const result = await tasks.getInfo();
+    const wardData = data.map((ward, i) => ({
+      ward,
+      tree_pct: trees[i],
+      built_pct: built[i]
+    }));
 
     res.setHeader('Cache-Control', 'public, max-age=86400');
     res.json({
       updated: new Date().toISOString(),
-      wards: result.map(f => f.properties)
+      wards: wardData
     });
 
   } catch (err) {
@@ -995,7 +1002,6 @@ app.get('/ward-trend', async (req, res) => {
     res.status(500).json({ error: 'Ward coverages error', details: err.message });
   }
 });
-
 
 app.get('/', (req, res) => {
   res.send('✅ GreenMap Earth Engine backend is live');
