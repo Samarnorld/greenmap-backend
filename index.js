@@ -800,6 +800,12 @@ app.get('/trend', (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+function getWardGeometryByName(name) {
+  const wards = ee.FeatureCollection("projects/greenmap-backend/assets/nairobi_wards_filtered")
+    .filter(ee.Filter.eq("NAME_3", name));
+  return wards.geometry();
+}
+
 app.get('/ward-trend', async (req, res) => {
   try {
     const wardName = req.query.ward;
