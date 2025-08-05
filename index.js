@@ -909,6 +909,8 @@ app.get('/ward-trend', async (req, res) => {
     res.status(500).json({ error: 'Ward trend error', details: err.message });
   }
 });
+const wards = require('./data/wards.geojson');
+
 app.get('/ward-coverages', async (req, res) => {
   try {
     const currentYear = new Date().getFullYear();
