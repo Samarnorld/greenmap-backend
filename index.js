@@ -4,6 +4,7 @@ const ee = require('@google/earthengine');
 const fs = require('fs');
 
 const app = express();
+app.use(cors());
 const PORT = process.env.PORT || 3000;
 
 
@@ -71,7 +72,7 @@ function startServer() {
  return ee.Image(ndviImage).unmask(0).clip(wards);
 }
 
-app.use(cors());
+
 function serveTile(image, visParams, res) {
   const styled = image.visualize(visParams).clip(wards);
 
