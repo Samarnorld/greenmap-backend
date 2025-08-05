@@ -831,11 +831,15 @@ app.get('/ward-trend', async (req, res) => {
       const end = start.advance(1, 'year');
 
       const s2 = s2Collection.filterDate(start, end);
-      const image = ee.Algorithms.If(
-        s2.size().gt(0),
-        s2.median().clip(geometry),
-        ee.Image.constant(0).updateMask(ee.Image(0)).clip(geometry)
-      );
+    const image = ee.Algorithms.If(
+  s2.size().gt(0),
+  s2.median().clip(geometry),
+  ee.Image(0).addBands([ee.Image(0), ee.Image(0)])
+    .rename(['B4', 'B8', 'B11'])
+    .updateMask(ee.Image(0))
+    .clip(geometry)
+);
+
       const img = ee.Image(image);
       const nir = img.select('B8');
       const red = img.select('B4');
