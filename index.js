@@ -325,7 +325,7 @@ app.get('/builtup-stats', (req, res) => {
   const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
     .filterBounds(wards)
     .filterDate(pastDate, currentDate)
-    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20));
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10));
 
   const safeImage = ee.Algorithms.If(
     s2.size().gt(0),
@@ -821,7 +821,7 @@ app.get('/ward-trend', async (req, res) => {
     const treeCollection = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').select('label');
     const s2Collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
       .filterBounds(geometry)
-      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
       .select(['B4', 'B8', 'B11']);
 
     const yearList = await yearsList.getInfo();
