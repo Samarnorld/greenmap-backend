@@ -909,6 +909,90 @@ app.get('/ward-trend', async (req, res) => {
     res.status(500).json({ error: 'Ward trend error', details: err.message });
   }
 });
+app.get('/ward-coverages', async (req, res) => {
+  try {
+    const currentYear = new Date().getFullYear();
+    const start = ee.Date.fromYMD(currentYear, 1, 1);
+    const end = start.advance(1, 'year');
+
+    const treeCollection = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').select('label');
+    const s2Collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      .filterDate(start, end)
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+      .select(['B4', 'B8', 'B11']);
+
+    const pixelArea = ee.Image.pixelArea();
+
+    const tasks = wards.features.map((f) => {
+      const name = f.properties.ward;
+      const geometry = ee.Feature(f).geometry();
+
+      const s2 = s2Collection.filterBounds(geometry);
+      const image = ee.Algorithms.If(
+        s2.size().gt(0),
+        s2.median().clip(geometry),
+        ee.Image(0).addBands([ee.Image(0), ee.Image(0)]).rename(['B4', 'B8', 'B11']).updateMask(ee.Image(0)).clip(geometry)
+      );
+      const img = ee.Image(image);
+      const nir = img.select('B8');
+      const red = img.select('B4');
+      const swir = img.select('B11');
+
+      const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+      const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
+
+      const builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
+      const builtArea = builtMask.multiply(pixelArea).rename('built_m2');
+
+      const treeMask = treeCollection
+        .filterBounds(geometry)
+        .filterDate(start, end)
+        .mode()
+        .eq(1)
+        .selfMask();
+      const treeArea = treeMask.multiply(pixelArea).rename('tree_m2');
+
+      const totalArea = pixelArea.clip(geometry).reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry,
+        scale: 10,
+        maxPixels: 1e13
+      });
+
+      const builtStats = builtArea.reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry,
+        scale: 10,
+        maxPixels: 1e13
+      });
+
+      const treeStats = treeArea.reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry,
+        scale: 10,
+        maxPixels: 1e13
+      });
+
+      return ee.Dictionary({
+        ward: name,
+        tree_pct: ee.Number(treeStats.get('tree_m2')).divide(ee.Number(totalArea.get('area'))).multiply(100),
+        built_pct: ee.Number(builtStats.get('built_m2')).divide(ee.Number(totalArea.get('area'))).multiply(100)
+      });
+    });
+
+    const result = await ee.List(tasks).getInfo();
+
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.json({
+      updated: new Date().toISOString(),
+      wards: result
+    });
+
+  } catch (err) {
+    console.error('❌ /ward-coverages error:', err);
+    res.status(500).json({ error: 'Ward coverages error', details: err.message });
+  }
+});
 
 app.get('/', (req, res) => {
   res.send('✅ GreenMap Earth Engine backend is live');
