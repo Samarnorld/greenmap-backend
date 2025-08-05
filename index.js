@@ -898,6 +898,8 @@ app.get('/ward-trend', async (req, res) => {
          }
 
     const latest = trend[trend.length - 1]; // ✅ Move it here, outside the loop
+console.log("📊 Final trend data:", trend);
+console.log("🟢 Latest:", latest);
 
     res.setHeader('Cache-Control', 'public, max-age=86400');
     res.json({
