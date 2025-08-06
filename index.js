@@ -688,21 +688,21 @@ app.get('/treecanopy-stats', async (req, res) => {
 
         // Ward-level coverage
        // ✅ Corrected ward-level coverage with real area computation
-const wardStats = await treeArea.reduceRegions({
-  collection: wards.map(f => {
-  const area = f.geometry().area(10);
-  return f.set('area_m2', area);
-}),
-
+// Ward-level coverage - ✅ CORRECTED to calculate ward area after reduction
+const wardStatsRaw = await treeArea.reduceRegions({
+  collection: wards,
   reducer: ee.Reducer.sum(),
   scale: 10
 }).getInfo();
 
-const wards_pct = (wardStats.features || []).map(w => {
-  const props = w.properties;
-  const tree_m2 = props.tree_m2 || 0;
-  const total_m2 = props.area_m2 || 1;
-  const wardName = props.ward || props.NAME_3 || 'Unknown';
+const wards_pct = (wardStatsRaw.features || []).map(w => {
+  const tree_m2 = w.properties.tree_m2 || 0;
+  const geom = w.geometry;
+
+  // calculate geometry area in m² directly
+  const total_m2 = ee.Geometry(geom).area(10).getInfo() || 1;
+  const wardName = w.properties.ward || w.properties.NAME_3 || 'Unknown';
+
   return {
     ward: wardName,
     tree_pct: (tree_m2 / total_m2) * 100
