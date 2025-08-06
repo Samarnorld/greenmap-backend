@@ -687,20 +687,18 @@ app.get('/treecanopy-stats', async (req, res) => {
         const city_tree_pct = (city_tree_m2 / city_total_m2) * 100;
 
         // Ward-level coverage
-       // ✅ Corrected ward-level coverage with real area computation
-// Ward-level coverage - ✅ CORRECTED to calculate ward area after reduction
-const wardStatsRaw = await treeArea.reduceRegions({
-  collection: wards,
+ const wardStatsRaw = await treeArea.reduceRegions({
+  collection: wards.map(w => {
+    const geom = w.geometry();
+    return w.set({ ward_area_m2: geom.area(10) });
+  }),
   reducer: ee.Reducer.sum(),
   scale: 10
 }).getInfo();
 
 const wards_pct = (wardStatsRaw.features || []).map(w => {
   const tree_m2 = w.properties.tree_m2 || 0;
-  const geom = w.geometry;
-
-  // calculate geometry area in m² directly
-  const total_m2 = ee.Geometry(geom).area(10).getInfo() || 1;
+  const total_m2 = w.properties.ward_area_m2 || 1;
   const wardName = w.properties.ward || w.properties.NAME_3 || 'Unknown';
 
   return {
