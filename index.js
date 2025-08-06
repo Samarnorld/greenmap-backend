@@ -689,7 +689,11 @@ app.get('/treecanopy-stats', async (req, res) => {
         // Ward-level coverage
        // ✅ Corrected ward-level coverage with real area computation
 const wardStats = await treeArea.reduceRegions({
-  collection: wards.map(f => f.set({ area_m2: f.geometry().area(10) })),
+  collection: wards.map(f => {
+  const area = f.geometry().area(10);
+  return f.set('area_m2', area);
+}),
+
   reducer: ee.Reducer.sum(),
   scale: 10
 }).getInfo();
