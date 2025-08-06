@@ -687,23 +687,24 @@ app.get('/treecanopy-stats', async (req, res) => {
         const city_tree_pct = (city_tree_m2 / city_total_m2) * 100;
 
         // Ward-level coverage
-        const wardStats = await treeArea.reduceRegions({
-          collection: wards,
-          reducer: ee.Reducer.sum(),
-          scale: 10
-        }).getInfo();
+       // ✅ Corrected ward-level coverage with real area computation
+const wardStats = await treeArea.reduceRegions({
+  collection: wards.map(f => f.set({ area_m2: f.geometry().area(10) })),
+  reducer: ee.Reducer.sum(),
+  scale: 10
+}).getInfo();
 
-        const wards_pct = (wardStats.features || []).map(w => {
-          const props = w.properties;
-          const tree_m2 = props.tree_m2 || 0;
-          const area = w.geometry ? w.geometry.area : 1;
-          const total_m2 = area || 1;
-          const wardName = props.ward || props.NAME_3 || 'Unknown';
-          return {
-            ward: wardName,
-            tree_pct: (tree_m2 / total_m2) * 100
-          };
-        });
+const wards_pct = (wardStats.features || []).map(w => {
+  const props = w.properties;
+  const tree_m2 = props.tree_m2 || 0;
+  const total_m2 = props.area_m2 || 1;
+  const wardName = props.ward || props.NAME_3 || 'Unknown';
+  return {
+    ward: wardName,
+    tree_pct: (tree_m2 / total_m2) * 100
+  };
+});
+
 
         trend.push({
           year: y,
