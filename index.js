@@ -793,7 +793,7 @@ app.get('/trend', (req, res) => {
     // 🛰 Satellite sources
     const s2Base = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
       .filterBounds(geometry)
-      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
       .select(['B4', 'B8']);
 
     const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
