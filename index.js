@@ -779,68 +779,135 @@ app.get('/treecanopy-stats', async (req, res) => {
 });
 app.get('/trend', async (req, res) => {
   try {
-    const start = ee.Date(Date.now()).advance(-1, 'year');
-    const months = Array.from({ length: 12 }, (_, i) => i);
-    const wardName = req.query.ward;
+    const startYear = 2016;
+    const currentYear = new Date().getFullYear();
 
-    const normalizedWard = wardName ? wardName.trim().toLowerCase() : null;
+    const geometry = wards.geometry();
+    const pixelArea = ee.Image.pixelArea();
 
-    const geometry = normalizedWard
-      ? wards.filter(ee.Filter.eq('NAME_3', ee.String(wardName).capitalize())).first().geometry()
-      : wards.geometry();
+    // Helper function to mask clouds from Sentinel-2 SR
+    function maskS2Clouds(image) {
+      const qa = image.select('QA60');
 
-    // Base collections
-    const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
-      .filterBounds(geometry)
-      .select('precipitation');
+      // Bits 10 and 11 are clouds and cirrus
+      const cloudBitMask = 1 << 10;
+      const cirrusBitMask = 1 << 11;
 
-    const results = [];
+      // Both flags set to zero indicates clear conditions
+      const mask = qa.bitwiseAnd(cloudBitMask).eq(0).and(
+        qa.bitwiseAnd(cirrusBitMask).eq(0)
+      );
 
-    for (const i of months) {
-      const monthStart = start.advance(i, 'month');
-      const monthEnd = monthStart.advance(1, 'month');
+      return image.updateMask(mask).copyProperties(image, ['system:time_start']);
+    }
 
-      const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    const yearsList = ee.List.sequence(startYear, currentYear);
+    const yearList = await yearsList.getInfo();
+
+    const trend = [];
+
+    for (const year of yearList) {
+      const startDate = ee.Date.fromYMD(year, 1, 1);
+      const endDate = startDate.advance(1, 'year');
+
+      const s2Collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
         .filterBounds(geometry)
-        .filterDate(monthStart, monthEnd)
-        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
-        .select(['B4', 'B8']);
+        .filterDate(startDate, endDate)
+        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+        .map(maskS2Clouds);
 
-      // Fetch size client-side
-      const s2Count = await s2.size().getInfo();
-
-      let ndviImage;
-      if (s2Count > 0) {
-        ndviImage = s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI');
-      } else {
-        // fallback to zero NDVI masked image
-        ndviImage = ee.Image(0).rename('NDVI').updateMask(ee.Image(0));
+      const s2Size = await s2Collection.size().getInfo();
+      if (s2Size === 0) {
+        trend.push({
+          year,
+          ndvi: 0,
+          built_pct: 0,
+          tree_pct: 0,
+          rainfall_mm: 0
+        });
+        continue;
       }
 
-      const rain = chirps.filterDate(monthStart, monthEnd).sum().rename('Rain');
+      const s2Median = s2Collection.median().clip(geometry);
 
-      const combined = ndviImage.addBands(rain);
+      const ndvi = s2Median.normalizedDifference(['B8', 'B4']).rename('NDVI');
+      const ndbi = s2Median.normalizedDifference(['B11', 'B8']).rename('NDBI');
 
-      // Reduce region async
-      const stats = await combined.reduceRegion({
-        reducer: ee.Reducer.mean(),
-        geometry: geometry,
-        scale: 500,
-        maxPixels: 1e9
-      }).getInfo();
+      const builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
+      const builtArea = builtMask.multiply(pixelArea).rename('built_m2');
 
-      results.push({
-        date: monthStart.format('YYYY-MM').getInfo(),
-        ndvi: stats.NDVI ?? 0,
-        rain: stats.Rain ?? 0
+      const dw = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+        .filterBounds(geometry)
+        .filterDate(startDate, endDate)
+        .select('label');
+
+      const treeMode = dw.mode().eq(1).selfMask();
+      const treeArea = treeMode.multiply(pixelArea).rename('tree_m2');
+
+      const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+        .filterBounds(geometry)
+        .filterDate(startDate, endDate)
+        .select('precipitation');
+
+      const rainfall = chirps.sum().rename('rainfall_mm');
+
+      const [ndviMean, builtSum, treeSum, totalArea, rainfallSum] = await Promise.all([
+        ndvi.reduceRegion({
+          reducer: ee.Reducer.mean(),
+          geometry,
+          scale: 10,
+          maxPixels: 1e13
+        }).getInfo(),
+
+        builtArea.reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry,
+          scale: 10,
+          maxPixels: 1e13
+        }).getInfo(),
+
+        treeArea.reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry,
+          scale: 10,
+          maxPixels: 1e13
+        }).getInfo(),
+
+        pixelArea.reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry,
+          scale: 10,
+          maxPixels: 1e13
+        }).getInfo(),
+
+        rainfall.reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry,
+          scale: 5000,
+          maxPixels: 1e13
+        }).getInfo()
+      ]);
+
+      const total_m2 = totalArea?.area || totalArea?.sum || 1;
+
+      trend.push({
+        year,
+        ndvi: ndviMean?.NDVI ?? 0,
+        built_pct: ((builtSum?.built_m2 ?? 0) / total_m2) * 100,
+        tree_pct: ((treeSum?.tree_m2 ?? 0) / total_m2) * 100,
+        rainfall_mm: rainfallSum?.rainfall_mm ?? 0
       });
     }
 
     res.setHeader('Cache-Control', 'public, max-age=86400');
-    res.json(results);
-  } catch (e) {
-    console.error('❌ Unhandled error in /trend:', e);
-    res.status(500).json({ error: 'Internal server error', details: e.message || e.toString() });
+    res.json({
+      updated: new Date().toISOString(),
+      city: 'Nairobi',
+      trend
+    });
+  } catch (err) {
+    console.error('❌ /trend error:', err);
+    res.status(500).json({ error: 'Failed to get yearly trend', details: err.message });
   }
 });
 
