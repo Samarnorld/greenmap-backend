@@ -782,7 +782,6 @@ app.get('/trend', async (req, res) => {
     const now = ee.Date(Date.now());
     const startOfYear = ee.Date.fromYMD(now.get('year'), 1, 1);
     const currentMonth = now.get('month'); // 1–12
-
     const months = ee.List.sequence(1, currentMonth);
 
     const wardName = req.query.ward;
@@ -794,96 +793,112 @@ app.get('/trend', async (req, res) => {
       ? wardsFC.filter(ee.Filter.eq('NAME_3', normalizedWard)).first().geometry()
       : wardsFC.geometry();
 
-    // Satellite collections
+    // Collections for satellite data
     const s2Base = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
       .filterBounds(geometry)
-      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
-      .select(['B4', 'B8']);
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20));
 
     const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
       .filterBounds(geometry)
       .select('precipitation');
 
-    const esaWorldCover = 'ESA/WorldCover/v200';
+    const dwCollection = ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1")
+      .filterBounds(geometry)
+      .select('label');
 
     const monthlyStats = ee.FeatureCollection(
       months.map(m => {
         const monthStart = ee.Date.fromYMD(now.get('year'), m, 1);
         const monthEnd = monthStart.advance(1, 'month');
 
-        // NDVI
+        // Sentinel-2 for NDVI and NDBI filtered by month
         const s2 = s2Base.filterDate(monthStart, monthEnd);
+
         const ndvi = ee.Algorithms.If(
           s2.size().gt(0),
           s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
           ee.Image(0).rename('NDVI')
         );
+        const ndviImage = ee.Image(ndvi);
 
-        // Rainfall
+        // NDBI Calculation: (SWIR - NIR)/(SWIR + NIR)
+        const ndbi = ee.Algorithms.If(
+          s2.size().gt(0),
+          s2.median().expression(
+            '(B11 - B8) / (B11 + B8)', {
+              'B11': s2.median().select('B11'),
+              'B8': s2.median().select('B8')
+            }
+          ).rename('NDBI'),
+          ee.Image(0).rename('NDBI')
+        );
+        const ndbiImage = ee.Image(ndbi);
+
+        // Built-up mask: NDBI > 0 and NDVI < 0.3
+        const builtMask = ndbiImage.gt(0).and(ndviImage.lt(0.3)).selfMask();
+
+        // Dynamic World trees median for month
+        const dwTrees = dwCollection
+          .filterDate(monthStart, monthEnd)
+          .map(img => img.eq(1).selfMask())  // Class 1 = Trees
+          .median();
+
+        // Rainfall monthly sum
         const rain = chirps.filterDate(monthStart, monthEnd)
           .sum()
           .rename('Rain');
 
-        // Built-up %
-        const builtUpMask = ee.ImageCollection(esaWorldCover)
-          .filterDate(monthStart, monthEnd)
-          .first()
-          .eq(50) // Built-up class
-          .selfMask();
+        // Calculate pixel areas
+        const pixelArea = ee.Image.pixelArea();
 
-        const builtUpPct = builtUpMask.multiply(ee.Image.pixelArea())
-          .reduceRegion({
-            reducer: ee.Reducer.sum(),
-            geometry: geometry,
-            scale: 10,
-            maxPixels: 1e9
-          })
-          .getNumber('Map');
+        // Reduce regions to get stats
+        const ndviMean = ndviImage.reduceRegion({
+          reducer: ee.Reducer.mean(),
+          geometry: geometry,
+          scale: 10,
+          maxPixels: 1e9
+        }).get('NDVI');
 
-        const totalArea = ee.Image.pixelArea()
-          .reduceRegion({
-            reducer: ee.Reducer.sum(),
-            geometry: geometry,
-            scale: 10,
-            maxPixels: 1e9
-          })
-          .getNumber('area');
+        const rainSum = rain.reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry: geometry,
+          scale: 10,
+          maxPixels: 1e9
+        }).get('Rain');
 
-        const builtPct = ee.Number(builtUpPct).divide(totalArea).multiply(100);
+        const builtArea = builtMask.multiply(pixelArea).reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry: geometry,
+          scale: 10,
+          maxPixels: 1e9
+        }).get('NDBI');
 
-        // Tree coverage %
-        const treeMask = ee.ImageCollection(esaWorldCover)
-          .filterDate(monthStart, monthEnd)
-          .first()
-          .eq(10) // Tree class
-          .selfMask();
+        const totalArea = pixelArea.reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry: geometry,
+          scale: 10,
+          maxPixels: 1e9
+        }).get('area');
 
-        const treeArea = treeMask.multiply(ee.Image.pixelArea())
-          .reduceRegion({
-            reducer: ee.Reducer.sum(),
-            geometry: geometry,
-            scale: 10,
-            maxPixels: 1e9
-          })
-          .getNumber('Map');
+        const builtPct = ee.Number(builtArea).divide(totalArea).multiply(100);
+
+        const treeArea = dwTrees.multiply(pixelArea).reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry: geometry,
+          scale: 10,
+          maxPixels: 1e9
+        }).get('label');
 
         const treePct = ee.Number(treeArea).divide(totalArea).multiply(100);
 
-        // Combine NDVI + Rain into one image for mean calculation
-        const combined = ee.Image(ndvi).addBands(rain);
-
-        const stats = combined.reduceRegion({
-          reducer: ee.Reducer.mean(),
-          geometry: geometry,
-          scale: 500,
-          maxPixels: 1e9
+        // Return Feature with all stats
+        return ee.Feature(null, {
+          date: monthStart.format('YYYY-MM'),
+          NDVI: ndviMean,
+          Rain: rainSum,
+          built_pct: builtPct,
+          tree_pct: treePct
         });
-
-        return ee.Feature(null, stats
-          .set('date', monthStart.format('YYYY-MM'))
-          .set('built_pct', builtPct)
-          .set('tree_pct', treePct)
-        );
       })
     );
 
@@ -892,12 +907,10 @@ app.get('/trend', async (req, res) => {
         console.error('❌ Trend API error:', err);
         return res.status(500).json({ error: 'Trend API error', details: err.message || err });
       }
-
       if (!data || !Array.isArray(data.features)) {
         console.error('❌ Invalid trend data returned');
         return res.status(500).json({ error: 'Invalid data structure returned from Earth Engine' });
       }
-
       const formatted = data.features.map(f => ({
         date: f.properties.date,
         ndvi: f.properties.NDVI || 0,
@@ -905,16 +918,15 @@ app.get('/trend', async (req, res) => {
         built_pct: f.properties.built_pct || 0,
         tree_pct: f.properties.tree_pct || 0
       })).filter(d => d.date);
-
       res.setHeader('Cache-Control', 'public, max-age=86400');
       res.json(formatted);
     });
-
   } catch (e) {
     console.error('❌ Unhandled error in /trend:', e);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
 
 app.get('/ward-trend', async (req, res) => {
   try {
