@@ -689,65 +689,70 @@ app.get('/treecanopy-stats', async (req, res) => {
     const yearList = await yearsList.getInfo();
 
     const trend = [];
-
     for (const y of yearList) {
-      const start = ee.Date.fromYMD(y, 1, 1);
-      const end = start.advance(1, 'year');
+  const start = ee.Date.fromYMD(y, 1, 1);
+  const end = start.advance(1, 'year');
 
-      try {
-        const dwImg = dwCollection.filterDate(start, end).mode();
-        const treeMask = dwImg.eq(1).selfMask(); // Class 1 = Trees
-        const treeArea = treeMask.multiply(pixelArea).rename('tree_m2');
+  try {
+    const dwImg = dwCollection.filterDate(start, end).mode();
+    const treeMask = dwImg.eq(1).selfMask(); // Class 1 = Trees
+    const treeArea = treeMask.multiply(pixelArea).rename('tree_m2');
 
-        // City-level tree coverage
-        const [cityTreeInfo, cityTotalInfo] = await Promise.all([
-          treeArea.reduceRegion({
-            reducer: ee.Reducer.sum(),
-            geometry,
-            scale: 10,
-            maxPixels: 1e13
-          }).getInfo(),
-          pixelArea.clip(geometry).reduceRegion({
-            reducer: ee.Reducer.sum(),
-            geometry,
-            scale: 10,
-            maxPixels: 1e13
-          }).getInfo()
-        ]);
+    // City-level tree coverage
+    const [cityTreeInfo, cityTotalInfo] = await Promise.all([
+      treeArea.reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry,
+        scale: 10,
+        maxPixels: 1e13
+      }).getInfo(),
+      pixelArea.clip(geometry).reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry,
+        scale: 10,
+        maxPixels: 1e13
+      }).getInfo()
+    ]);
 
-        const city_tree_m2 = cityTreeInfo?.tree_m2 ?? 0;
-        const city_total_m2 = cityTotalInfo?.area ?? 1;
-        const city_tree_pct = (city_tree_m2 / city_total_m2) * 100;
+    const city_tree_m2 = cityTreeInfo?.tree_m2 ?? 0;
+    const city_total_m2 = cityTotalInfo?.area ?? 1;
+    const city_tree_pct = (city_tree_m2 / city_total_m2) * 100;
 
-     // Calculate total area per ward using EE pixelArea reducer:
-const totalAreaStats = await pixelArea.reduceRegions({
-  collection: wards,
-  reducer: ee.Reducer.sum(),
-  scale: 10
-}).getInfo();
+    // === Add this ===
+    const wardStatsRaw = await treeArea.reduceRegions({
+      collection: wards,
+      reducer: ee.Reducer.sum(),
+      scale: 10
+    }).getInfo();
 
-const wards_pct = (wardStatsRaw.features || []).map((w, i) => {
-  const tree_m2 = w.properties.tree_m2 || 0;
-  const total_m2 = totalAreaStats.features[i]?.properties.area || 1; // use EE area
-  const wardName = w.properties.ward || w.properties.NAME_3 || 'Unknown';
+    // Calculate total area per ward using EE pixelArea reducer:
+    const totalAreaStats = await pixelArea.reduceRegions({
+      collection: wards,
+      reducer: ee.Reducer.sum(),
+      scale: 10
+    }).getInfo();
 
-  return {
-    ward: wardName,
-    tree_pct: (tree_m2 / total_m2) * 100
-  };
-});
+    const wards_pct = (wardStatsRaw.features || []).map((w, i) => {
+      const tree_m2 = w.properties.tree_m2 || 0;
+      const total_m2 = totalAreaStats.features[i]?.properties.area || 1; // use EE area
+      const wardName = w.properties.ward || w.properties.NAME_3 || 'Unknown';
 
+      return {
+        ward: wardName,
+        tree_pct: (tree_m2 / total_m2) * 100
+      };
+    });
 
-        trend.push({
-          year: y,
-          city_tree_pct,
-          wards: wards_pct
-        });
+    trend.push({
+      year: y,
+      city_tree_pct,
+      wards: wards_pct
+    });
 
-      } catch (err) {
-        console.warn(`⚠️ Skipping year ${y} due to error:`, err.message);
-      }
-    }
+  } catch (err) {
+    console.warn(`⚠️ Skipping year ${y} due to error:`, err.message);
+  }
+}
 
     // ✅ All done
     res.setHeader('Cache-Control', 'public, max-age=1800');
