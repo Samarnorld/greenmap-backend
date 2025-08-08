@@ -880,25 +880,25 @@ app.get('/ward-trend', async (req, res) => {
         .filterBounds(geometry)
         .filterDate(start, end)
         .filter(ee.Filter.lt('CLOUD_COVER', 10))
-        .select(['SR_B4', 'SR_B5', 'SR_B6'])
-        .map(img => img.multiply(0.0000275).add(-0.2).copyProperties(img, img.propertyNames()));
+  .select(['SR_B4', 'SR_B5', 'SR_B7']) // ✅ SR_B7 instead of SR_B6
+  .map(img => img.multiply(0.0000275).add(-0.2).copyProperties(img, img.propertyNames()));
 
-      // Choose dataset: Sentinel if available, else Landsat
-      const image = ee.Algorithms.If(
-        s2.size().gt(0),
-        s2.median(),
-        landsat.median()
-      );
+// Choose dataset: Sentinel if available, else Landsat
+const image = ee.Algorithms.If(
+  s2.size().gt(0),
+  s2.median(),
+  landsat.median()
+);
 
-      const img = ee.Image(image).clip(geometry);
+const img = ee.Image(image).clip(geometry);
 
-      // Bands for NDVI & NDBI
-      const nir = img.select(['B8', 'SR_B5']).reduce(ee.Reducer.firstNonNull());
-      const red = img.select(['B4', 'SR_B4']).reduce(ee.Reducer.firstNonNull());
-      const swir = img.select(['B11', 'SR_B6']).reduce(ee.Reducer.firstNonNull());
+// Bands for NDVI & NDBI
+const nir = img.select(['B8', 'SR_B5']).reduce(ee.Reducer.firstNonNull());
+const red = img.select(['B4', 'SR_B4']).reduce(ee.Reducer.firstNonNull());
+const swir = img.select(['B11', 'SR_B7']).reduce(ee.Reducer.firstNonNull()); // ✅ use SR_B7
 
-      const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
-      const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
+const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
 
       const builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
       const builtArea = builtMask.multiply(pixelArea).rename('built_m2');
