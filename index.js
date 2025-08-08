@@ -857,6 +857,8 @@ app.get('/ward-trend', async (req, res) => {
     }
 
     const geometry = getWardGeometryByName(wardName);
+    if (!geometry) return res.status(400).json({ error: 'Ward geometry not found' });
+
     const pixelArea = ee.Image.pixelArea();
     const currentYear = new Date().getFullYear();
     const yearsList = ee.List.sequence(2017, currentYear);
@@ -869,60 +871,36 @@ app.get('/ward-trend', async (req, res) => {
       const start = ee.Date.fromYMD(y, 1, 1);
       const end = start.advance(1, 'year');
 
-      // Sentinel-2
       const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
         .filterBounds(geometry)
         .filterDate(start, end)
         .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
         .select(['B4', 'B8', 'B11']);
 
-      // Landsat-7 as backup (for early years/cloudy)
       const landsat = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
         .filterBounds(geometry)
         .filterDate(start, end)
         .filter(ee.Filter.lt('CLOUD_COVER', 10))
-  .select(['SR_B4', 'SR_B5', 'SR_B7']) // ✅ SR_B7 instead of SR_B6
-  .map(img => img.multiply(0.0000275).add(-0.2).copyProperties(img, img.propertyNames()));
+        .select(['SR_B4', 'SR_B5', 'SR_B7'])
+        .map(img => img.multiply(0.0000275).add(-0.2).copyProperties(img, img.propertyNames()));
 
-// Choose dataset: Sentinel if available, else Landsat
-const image = ee.Algorithms.If(
-  s2.size().gt(0),
-  s2.median(),
-  landsat.median()
-);
+      const s2Size = await s2.size().getInfo();
 
-const img = ee.Image(image).clip(geometry);
+      const medianImage = s2Size > 0 ? s2.median() : landsat.median();
+      const img = medianImage.clip(geometry);
 
-// Bands for NDVI & NDBI
-// Get available band names
-const bandNames = img.bandNames();
+      const bandNames = await img.bandNames().getInfo();
 
-// Choose NIR
-const nirBand = ee.Algorithms.If(
-  bandNames.contains('B8'),
-  'B8',
-  'SR_B5'
-);
-const nir = img.select(ee.String(nirBand));
+      const nirBand = bandNames.includes('B8') ? 'B8' : 'SR_B5';
+      const redBand = bandNames.includes('B4') ? 'B4' : 'SR_B4';
+      const swirBand = bandNames.includes('B11') ? 'B11' : 'SR_B7';
 
-// Choose Red
-const redBand = ee.Algorithms.If(
-  bandNames.contains('B4'),
-  'B4',
-  'SR_B4'
-);
-const red = img.select(ee.String(redBand));
+      const nir = img.select(nirBand);
+      const red = img.select(redBand);
+      const swir = img.select(swirBand);
 
-// Choose SWIR
-const swirBand = ee.Algorithms.If(
-  bandNames.contains('B11'),
-  'B11',
-  'SR_B7'
-);
-const swir = img.select(ee.String(swirBand));
-
-const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
-const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
+      const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+      const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
 
       const builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
       const builtArea = builtMask.multiply(pixelArea).rename('built_m2');
@@ -963,7 +941,7 @@ const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
         totalArea.getInfo()
       ]);
 
-      const total_m2 = totalStats.area || 1;
+      const total_m2 = totalStats['area'] || totalStats['sum'] || 1; // check keys here!
 
       trend.push({
         year: y,
@@ -979,13 +957,11 @@ const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
       trend,
       updated: new Date().toISOString()
     });
-
   } catch (err) {
     console.error('❌ /ward-trend error:', err);
     res.status(500).json({ error: 'Ward trend error', details: err.message });
   }
 });
-
 
 app.get('/', (req, res) => {
   res.send('✅ GreenMap Earth Engine backend is live');
