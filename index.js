@@ -20,14 +20,7 @@ ee.data.authenticateViaPrivateKey(
   () => {
     ee.initialize(null, null, () => {
       console.log('✅ Earth Engine authenticated via secret file');
-      startServer(); // <== make sure this exists below
-    });
-  },
-  (err) => {
-    console.error('❌ EE auth failed:', err);
-  }
-);
-// 🌍 Warm-up Earth Engine to avoid TLS delays on first request
+      // 🌍 Warm-up Earth Engine to avoid TLS delays on first request
 (async () => {
   try {
     console.log("🌍 Warming up Earth Engine...");
@@ -44,6 +37,14 @@ ee.data.authenticateViaPrivateKey(
     console.error("⚠️ EE warm-up failed:", err.message);
   }
 })();
+      startServer(); // <== make sure this exists below
+    });
+  },
+  (err) => {
+    console.error('❌ EE auth failed:', err);
+  }
+);
+
 // 📌 Retry helper for Earth Engine getInfo calls
 async function withRetry(eeObject, retries = 3, delayMs = 2000) {
   for (let attempt = 1; attempt <= retries; attempt++) {
