@@ -768,58 +768,38 @@ app.get('/treecanopy-stats', async (req, res) => {
     res.status(500).json({ error: 'Tree canopy trend stats failed', details: err.message });
   }
 });
+const fetch = require('node-fetch'); // if you don't have it, install with: npm install node-fetch@2
+
 app.get('/treesperwardstat', async (req, res) => {
   try {
-    const pixelArea = ee.Image.pixelArea();
-    const geometry = wards.geometry();
+    const wardsList = wards.features.map(f => f.properties.NAME_3 || f.properties.ward);
 
     const currentYear = new Date().getFullYear();
-    const start = ee.Date.fromYMD(currentYear, 1, 1);
-    const end = start.advance(1, 'year');
 
-    // Get Dynamic World images for current year
-    const dwCollection = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
-      .filterBounds(geometry)
-      .filterDate(start, end)
-      .select('label');
+    // Fetch /ward-trend data for each ward in parallel
+    const trendPromises = wardsList.map(async (wardName) => {
+      try {
+        // Adjust URL if needed
+        const response = await fetch(`https://greenmap-backend.onrender.com/ward-trend?ward=${encodeURIComponent(wardName)}`);
+        if (!response.ok) throw new Error(`Failed to fetch ward-trend for ${wardName}`);
+        const json = await response.json();
 
-    const dwModeImage = dwCollection.mode();
+        // Find latest year data: either currentYear or last available
+        const latestEntry = json.trend.find(d => d.year === currentYear) || json.trend[json.trend.length - 1];
 
-    // Tree class = 1
-    const treeMask = dwModeImage.eq(1).selfMask();
-
-    // Multiply by pixel area to get tree canopy area
-    const treeArea = treeMask.multiply(pixelArea).rename('tree_m2');
-
-    // Total area per ward
-    const totalAreaStats = await pixelArea.reduceRegions({
-      collection: wards,
-      reducer: ee.Reducer.sum(),
-      scale: 10,
-      tileScale: 4
-    }).getInfo();
-
-    // Tree canopy area per ward
-    const treeAreaStats = await treeArea.reduceRegions({
-      collection: wards,
-      reducer: ee.Reducer.sum(),
-      scale: 10,
-      tileScale: 4
-    }).getInfo();
-
-    // Combine for % tree coverage per ward
-    const wardsCoverage = (treeAreaStats.features || []).map((wardFeature, i) => {
-      const tree_m2 = wardFeature.properties.tree_m2 || 0;
-      const total_m2 = totalAreaStats.features[i]?.properties.area || 1;
-      const wardName = wardFeature.properties.NAME_3 || wardFeature.properties.ward || 'Unknown';
-
-      return {
-        ward: wardName,
-        tree_pct: (tree_m2 / total_m2) * 100
-      };
+        return {
+          ward: wardName,
+          tree_pct: latestEntry ? latestEntry.tree_pct : 0
+        };
+      } catch (e) {
+        console.warn(`⚠️ Could not get tree_pct for ward ${wardName}:`, e.message);
+        return { ward: wardName, tree_pct: 0 };
+      }
     });
 
-    res.setHeader('Cache-Control', 'public, max-age=1800'); // cache 30 mins
+    const wardsCoverage = await Promise.all(trendPromises);
+
+    res.setHeader('Cache-Control', 'public, max-age=1800'); // 30 minutes cache
     res.json({
       updated: new Date().toISOString(),
       year: currentYear,
