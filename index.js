@@ -27,6 +27,39 @@ ee.data.authenticateViaPrivateKey(
     console.error('❌ EE auth failed:', err);
   }
 );
+// 🌍 Warm-up Earth Engine to avoid TLS delays on first request
+(async () => {
+  try {
+    console.log("🌍 Warming up Earth Engine...");
+    const warmupImg = ee.Image("COPERNICUS/S2_SR/20220101T083601_20220101T083602_T36MYF")
+      .reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: ee.Geometry.Point(36.8219, -1.2921), // Nairobi
+        scale: 10,
+        maxPixels: 1e9
+      });
+    const result = await warmupImg.getInfo();
+    console.log("✅ EE warm-up complete:", result);
+  } catch (err) {
+    console.error("⚠️ EE warm-up failed:", err.message);
+  }
+})();
+// 📌 Retry helper for Earth Engine getInfo calls
+async function withRetry(eeObject, retries = 3, delayMs = 2000) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await eeObject.getInfo();
+    } catch (err) {
+      console.warn(`⚠️ Attempt ${attempt} failed: ${err.message}`);
+      if (attempt < retries) {
+        await new Promise(r => setTimeout(r, delayMs));
+        console.log(`🔄 Retrying Earth Engine request (Attempt ${attempt + 1})...`);
+      } else {
+        throw err; // Out of retries
+      }
+    }
+  }
+}
 
 function startServer() {
   const wards = ee.FeatureCollection("projects/greenmap-backend/assets/nairobi_wards_filtered");
@@ -439,7 +472,8 @@ app.get('/builtup-stats', (req, res) => {
   });
 });
 
-app.get('/wards', (req, res) => {
+app.get('/wards', async (req, res) => {
+
   const now = ee.Date(Date.now()).advance(-30, 'day');
   const oneYearAgo = now.advance(-1, 'year');
 
@@ -527,18 +561,16 @@ const results = wards.map(function (ward) {
     'Rain_Anomaly': rain_anomaly_val
   });
 });
+try {
+  const data = await withRetry(results, 3, 2000); // Retry up to 3 times with 2s delay
+  console.log("✅ /wards returned features:", data?.features?.length);
+  res.setHeader('Cache-Control', 'public, max-age=900');
+  res.json(data);
+} catch (err) {
+  console.error("❌ /wards error:", err);
+  res.status(500).json({ error: 'Failed to compute ward stats', details: err.message });
+}
 
-
-  results.getInfo((data, err) => {
-    if (err) {
-      console.error("❌ /wards error:", err);
-      return res.status(500).json({ error: 'Failed to compute ward stats', details: err });
-    }
-
-    console.log("✅ /wards returned features:", data?.features?.length);
-    res.setHeader('Cache-Control', 'public, max-age=900');
-    res.json(data);
-  });
 });
 app.get('/greencoverage', (req, res) => {
   console.log("🌿 /greencoverage called");
@@ -816,47 +848,54 @@ function getWardGeometryByName(name) {
     .filter(ee.Filter.eq("NAME_3", name));
   return wards.geometry();
 }
-
 app.get('/ward-trend', async (req, res) => {
   try {
     const wardName = req.query.ward;
-    if (!wardName) return res.status(400).json({ error: 'Missing ?ward= name' });
+    if (!wardName) {
+      return res.status(400).json({ error: 'Missing ?ward= name' });
+    }
 
     const geometry = getWardGeometryByName(wardName);
-
     const pixelArea = ee.Image.pixelArea();
     const currentYear = new Date().getFullYear();
     const yearsList = ee.List.sequence(2017, currentYear);
-    const trend = [];
-
     const treeCollection = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').select('label');
-   const s2Collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-  .filterBounds(geometry)
-  .filterDate(start, end)
-  .map(maskS2clouds) // <-- same as NDVI map route
-  .select(['B4', 'B8', 'B11']);
-
 
     const yearList = await yearsList.getInfo();
+    const trend = [];
 
     for (const y of yearList) {
       const start = ee.Date.fromYMD(y, 1, 1);
       const end = start.advance(1, 'year');
 
-      const s2 = s2Collection.filterDate(start, end);
-    const image = ee.Algorithms.If(
-  s2.size().gt(0),
-  s2.median().clip(geometry),
-  ee.Image(0).addBands([ee.Image(0), ee.Image(0)])
-    .rename(['B4', 'B8', 'B11'])
-    .updateMask(ee.Image(0))
-    .clip(geometry)
-);
+      // Sentinel-2
+      const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+        .filterBounds(geometry)
+        .filterDate(start, end)
+        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+        .select(['B4', 'B8', 'B11']);
 
-      const img = ee.Image(image);
-      const nir = img.select('B8');
-      const red = img.select('B4');
-      const swir = img.select('B11');
+      // Landsat-7 as backup (for early years/cloudy)
+      const landsat = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+        .filterBounds(geometry)
+        .filterDate(start, end)
+        .filter(ee.Filter.lt('CLOUD_COVER', 10))
+        .select(['SR_B4', 'SR_B5', 'SR_B6'])
+        .map(img => img.multiply(0.0000275).add(-0.2).copyProperties(img, img.propertyNames()));
+
+      // Choose dataset: Sentinel if available, else Landsat
+      const image = ee.Algorithms.If(
+        s2.size().gt(0),
+        s2.median(),
+        landsat.median()
+      );
+
+      const img = ee.Image(image).clip(geometry);
+
+      // Bands for NDVI & NDBI
+      const nir = img.select(['B8', 'SR_B5']).reduce(ee.Reducer.firstNonNull());
+      const red = img.select(['B4', 'SR_B4']).reduce(ee.Reducer.firstNonNull());
+      const swir = img.select(['B11', 'SR_B6']).reduce(ee.Reducer.firstNonNull());
 
       const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
       const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
@@ -922,6 +961,7 @@ app.get('/ward-trend', async (req, res) => {
     res.status(500).json({ error: 'Ward trend error', details: err.message });
   }
 });
+
 
 app.get('/', (req, res) => {
   res.send('✅ GreenMap Earth Engine backend is live');
