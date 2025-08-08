@@ -733,15 +733,16 @@ app.get('/treecanopy-stats', async (req, res) => {
     }).getInfo();
 
     const wards_pct = (wardStatsRaw.features || []).map((w, i) => {
-      const tree_m2 = w.properties.tree_m2 || 0;
-      const total_m2 = totalAreaStats.features[i]?.properties.area || 1; // use EE area
-      const wardName = w.properties.ward || w.properties.NAME_3 || 'Unknown';
+  const tree_m2 = w.properties.tree_m2 || 0;
+  const total_m2 = totalAreaStats.features[i]?.properties.area || 1; // use EE area
+  // Use NAME_3 first because frontend uses that for matching
+  const wardName = w.properties.NAME_3 || w.properties.ward || 'Unknown';
 
-      return {
-        ward: wardName,
-        tree_pct: (tree_m2 / total_m2) * 100
-      };
-    });
+  return {
+    ward: wardName,
+    tree_pct: (tree_m2 / total_m2) * 100
+  };
+});
 
     trend.push({
       year: y,
