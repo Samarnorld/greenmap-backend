@@ -777,139 +777,70 @@ app.get('/treecanopy-stats', async (req, res) => {
     res.status(500).json({ error: 'Tree canopy trend stats failed', details: err.message });
   }
 });
-app.get('/trend', async (req, res) => {
-  try {
-    const startYear = 2016;
-    const currentYear = new Date().getFullYear();
+app.get('/api/trend', async (req, res) => {
+    try {
+        // Fetch all data from DB
+        const sql = `
+            SELECT year, month, ndvi, builtUp, treeCoverage, rainfall
+            FROM your_table_name
+            WHERE year >= 2017
+            ORDER BY year, month
+        `;
+        db.all(sql, [], (err, rows) => {
+            if (err) {
+                console.error(err);
+                return res.status(500).json({ error: err.message });
+            }
 
-    const geometry = wards.geometry();
-    const pixelArea = ee.Image.pixelArea();
+            // Group data by year
+            const yearlyData = {};
+            rows.forEach(row => {
+                if (!yearlyData[row.year]) yearlyData[row.year] = [];
+                yearlyData[row.year].push(row);
+            });
 
-    // Helper function to mask clouds from Sentinel-2 SR
-    function maskS2Clouds(image) {
-      const qa = image.select('QA60');
+            const trend = [];
 
-      // Bits 10 and 11 are clouds and cirrus
-      const cloudBitMask = 1 << 10;
-      const cirrusBitMask = 1 << 11;
+            Object.keys(yearlyData).forEach(year => {
+                const months = yearlyData[year];
 
-      // Both flags set to zero indicates clear conditions
-      const mask = qa.bitwiseAnd(cloudBitMask).eq(0).and(
-        qa.bitwiseAnd(cirrusBitMask).eq(0)
-      );
+                // Find dry month (lowest rainfall)
+                const dryMonth = months.reduce((min, curr) =>
+                    curr.rainfall < min.rainfall ? curr : min
+                );
 
-      return image.updateMask(mask).copyProperties(image, ['system:time_start']);
-    }
+                // Find wet month (highest rainfall)
+                const wetMonth = months.reduce((max, curr) =>
+                    curr.rainfall > max.rainfall ? curr : max
+                );
 
-    const yearsList = ee.List.sequence(startYear, currentYear);
-    const yearList = await yearsList.getInfo();
+                // Push both dry and wet months to trend array
+                trend.push({
+                    date: `${year}-Dry`,
+                    ndvi: parseFloat(dryMonth.ndvi.toFixed(3)),
+                    builtUp: parseFloat(dryMonth.builtUp.toFixed(3)),
+                    treeCoverage: parseFloat(dryMonth.treeCoverage.toFixed(3)),
+                    rainfall: parseFloat(dryMonth.rainfall.toFixed(3))
+                });
 
-    const trend = [];
+                trend.push({
+                    date: `${year}-Wet`,
+                    ndvi: parseFloat(wetMonth.ndvi.toFixed(3)),
+                    builtUp: parseFloat(wetMonth.builtUp.toFixed(3)),
+                    treeCoverage: parseFloat(wetMonth.treeCoverage.toFixed(3)),
+                    rainfall: parseFloat(wetMonth.rainfall.toFixed(3))
+                });
+            });
 
-    for (const year of yearList) {
-      const startDate = ee.Date.fromYMD(year, 1, 1);
-      const endDate = startDate.advance(1, 'year');
-
-      const s2Collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-        .filterBounds(geometry)
-        .filterDate(startDate, endDate)
-        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
-        .map(maskS2Clouds);
-
-      const s2Size = await s2Collection.size().getInfo();
-      if (s2Size === 0) {
-        trend.push({
-          year,
-          ndvi: 0,
-          built_pct: 0,
-          tree_pct: 0,
-          rainfall_mm: 0
+            // Send sorted by year then Dry/Wet order
+            res.json(trend);
         });
-        continue;
-      }
-
-      const s2Median = s2Collection.median().clip(geometry);
-
-      const ndvi = s2Median.normalizedDifference(['B8', 'B4']).rename('NDVI');
-      const ndbi = s2Median.normalizedDifference(['B11', 'B8']).rename('NDBI');
-
-      const builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
-      const builtArea = builtMask.multiply(pixelArea).rename('built_m2');
-
-      const dw = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
-        .filterBounds(geometry)
-        .filterDate(startDate, endDate)
-        .select('label');
-
-      const treeMode = dw.mode().eq(1).selfMask();
-      const treeArea = treeMode.multiply(pixelArea).rename('tree_m2');
-
-      const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
-        .filterBounds(geometry)
-        .filterDate(startDate, endDate)
-        .select('precipitation');
-
-      const rainfall = chirps.sum().rename('rainfall_mm');
-
-      const [ndviMean, builtSum, treeSum, totalArea, rainfallSum] = await Promise.all([
-        ndvi.reduceRegion({
-          reducer: ee.Reducer.mean(),
-          geometry,
-          scale: 10,
-          maxPixels: 1e13
-        }).getInfo(),
-
-        builtArea.reduceRegion({
-          reducer: ee.Reducer.sum(),
-          geometry,
-          scale: 10,
-          maxPixels: 1e13
-        }).getInfo(),
-
-        treeArea.reduceRegion({
-          reducer: ee.Reducer.sum(),
-          geometry,
-          scale: 10,
-          maxPixels: 1e13
-        }).getInfo(),
-
-        pixelArea.reduceRegion({
-          reducer: ee.Reducer.sum(),
-          geometry,
-          scale: 10,
-          maxPixels: 1e13
-        }).getInfo(),
-
-        rainfall.reduceRegion({
-          reducer: ee.Reducer.sum(),
-          geometry,
-          scale: 5000,
-          maxPixels: 1e13
-        }).getInfo()
-      ]);
-
-      const total_m2 = totalArea?.area || totalArea?.sum || 1;
-
-      trend.push({
-        year,
-        ndvi: ndviMean?.NDVI ?? 0,
-        built_pct: ((builtSum?.built_m2 ?? 0) / total_m2) * 100,
-        tree_pct: ((treeSum?.tree_m2 ?? 0) / total_m2) * 100,
-        rainfall_mm: rainfallSum?.rainfall_mm ?? 0
-      });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to get trend data' });
     }
-
-    res.setHeader('Cache-Control', 'public, max-age=86400');
-    res.json({
-      updated: new Date().toISOString(),
-      city: 'Nairobi',
-      trend
-    });
-  } catch (err) {
-    console.error('❌ /trend error:', err);
-    res.status(500).json({ error: 'Failed to get yearly trend', details: err.message });
-  }
 });
+
 
 app.get('/ward-trend', async (req, res) => {
   try {
