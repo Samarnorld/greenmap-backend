@@ -830,10 +830,12 @@ app.get('/ward-trend', async (req, res) => {
     const trend = [];
 
     const treeCollection = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').select('label');
-    const s2Collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-      .filterBounds(geometry)
-      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
-      .select(['B4', 'B8', 'B11']);
+   const s2Collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(geometry)
+  .filterDate(start, end)
+  .map(maskS2clouds) // <-- same as NDVI map route
+  .select(['B4', 'B8', 'B11']);
+
 
     const yearList = await yearsList.getInfo();
 
