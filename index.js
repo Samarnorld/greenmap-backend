@@ -768,6 +768,69 @@ app.get('/treecanopy-stats', async (req, res) => {
     res.status(500).json({ error: 'Tree canopy trend stats failed', details: err.message });
   }
 });
+app.get('/treesperwardstat', async (req, res) => {
+  try {
+    const pixelArea = ee.Image.pixelArea();
+    const geometry = wards.geometry();
+
+    const currentYear = new Date().getFullYear();
+    const start = ee.Date.fromYMD(currentYear, 1, 1);
+    const end = start.advance(1, 'year');
+
+    // Get Dynamic World images for current year
+    const dwCollection = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+      .filterBounds(geometry)
+      .filterDate(start, end)
+      .select('label');
+
+    const dwModeImage = dwCollection.mode();
+
+    // Tree class = 1
+    const treeMask = dwModeImage.eq(1).selfMask();
+
+    // Multiply by pixel area to get tree canopy area
+    const treeArea = treeMask.multiply(pixelArea).rename('tree_m2');
+
+    // Total area per ward
+    const totalAreaStats = await pixelArea.reduceRegions({
+      collection: wards,
+      reducer: ee.Reducer.sum(),
+      scale: 10,
+      tileScale: 4
+    }).getInfo();
+
+    // Tree canopy area per ward
+    const treeAreaStats = await treeArea.reduceRegions({
+      collection: wards,
+      reducer: ee.Reducer.sum(),
+      scale: 10,
+      tileScale: 4
+    }).getInfo();
+
+    // Combine for % tree coverage per ward
+    const wardsCoverage = (treeAreaStats.features || []).map((wardFeature, i) => {
+      const tree_m2 = wardFeature.properties.tree_m2 || 0;
+      const total_m2 = totalAreaStats.features[i]?.properties.area || 1;
+      const wardName = wardFeature.properties.NAME_3 || wardFeature.properties.ward || 'Unknown';
+
+      return {
+        ward: wardName,
+        tree_pct: (tree_m2 / total_m2) * 100
+      };
+    });
+
+    res.setHeader('Cache-Control', 'public, max-age=1800'); // cache 30 mins
+    res.json({
+      updated: new Date().toISOString(),
+      year: currentYear,
+      wards: wardsCoverage
+    });
+
+  } catch (err) {
+    console.error('❌ /treesperwardstat error:', err);
+    res.status(500).json({ error: 'Failed to get trees per ward stat', details: err.message });
+  }
+});
 
 app.get('/trend', (req, res) => {
   try {
