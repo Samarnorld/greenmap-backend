@@ -768,49 +768,6 @@ app.get('/treecanopy-stats', async (req, res) => {
     res.status(500).json({ error: 'Tree canopy trend stats failed', details: err.message });
   }
 });
-const fetch = require('node-fetch'); // if you don't have it, install with: npm install node-fetch@2
-
-app.get('/treesperwardstat', async (req, res) => {
-  try {
-    const wardsList = wards.features.map(f => f.properties.NAME_3 || f.properties.ward);
-
-    const currentYear = new Date().getFullYear();
-
-    // Fetch /ward-trend data for each ward in parallel
-    const trendPromises = wardsList.map(async (wardName) => {
-      try {
-        // Adjust URL if needed
-        const response = await fetch(`https://greenmap-backend.onrender.com/ward-trend?ward=${encodeURIComponent(wardName)}`);
-        if (!response.ok) throw new Error(`Failed to fetch ward-trend for ${wardName}`);
-        const json = await response.json();
-
-        // Find latest year data: either currentYear or last available
-        const latestEntry = json.trend.find(d => d.year === currentYear) || json.trend[json.trend.length - 1];
-
-        return {
-          ward: wardName,
-          tree_pct: latestEntry ? latestEntry.tree_pct : 0
-        };
-      } catch (e) {
-        console.warn(`⚠️ Could not get tree_pct for ward ${wardName}:`, e.message);
-        return { ward: wardName, tree_pct: 0 };
-      }
-    });
-
-    const wardsCoverage = await Promise.all(trendPromises);
-
-    res.setHeader('Cache-Control', 'public, max-age=1800'); // 30 minutes cache
-    res.json({
-      updated: new Date().toISOString(),
-      year: currentYear,
-      wards: wardsCoverage
-    });
-
-  } catch (err) {
-    console.error('❌ /treesperwardstat error:', err);
-    res.status(500).json({ error: 'Failed to get trees per ward stat', details: err.message });
-  }
-});
 
 app.get('/trend', (req, res) => {
   try {
