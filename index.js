@@ -719,33 +719,24 @@ app.get('/treecanopy-stats', async (req, res) => {
         const city_total_m2 = cityTotalInfo?.area ?? 1;
         const city_tree_pct = (city_tree_m2 / city_total_m2) * 100;
 
-      const wardStatsRaw = await treeArea.reduceRegions({
+     // Calculate total area per ward using EE pixelArea reducer:
+const totalAreaStats = await pixelArea.reduceRegions({
   collection: wards,
   reducer: ee.Reducer.sum(),
   scale: 10
 }).getInfo();
 
-const wards_pct = (wardStatsRaw.features || []).map(w => {
-  const geom = w.geometry;
+const wards_pct = (wardStatsRaw.features || []).map((w, i) => {
   const tree_m2 = w.properties.tree_m2 || 0;
+  const total_m2 = totalAreaStats.features[i]?.properties.area || 1; // use EE area
   const wardName = w.properties.ward || w.properties.NAME_3 || 'Unknown';
-
-  let total_m2 = 1;
-  try {
-    if (geom) {
-      const turf = require('@turf/turf'); // make sure you install this with npm
-      const areaKm2 = turf.area(geom); // m²
-      total_m2 = areaKm2 || 1;
-    }
-  } catch (e) {
-    console.warn(`⚠️ Could not calculate area for ward ${wardName}:`, e.message);
-  }
 
   return {
     ward: wardName,
     tree_pct: (tree_m2 / total_m2) * 100
   };
 });
+
 
         trend.push({
           year: y,
