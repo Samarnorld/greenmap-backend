@@ -894,9 +894,32 @@ const image = ee.Algorithms.If(
 const img = ee.Image(image).clip(geometry);
 
 // Bands for NDVI & NDBI
-const nir = img.select(['B8', 'SR_B5']).reduce(ee.Reducer.firstNonNull());
-const red = img.select(['B4', 'SR_B4']).reduce(ee.Reducer.firstNonNull());
-const swir = img.select(['B11', 'SR_B7']).reduce(ee.Reducer.firstNonNull()); // ✅ use SR_B7
+// Get available band names
+const bandNames = img.bandNames();
+
+// Choose NIR
+const nirBand = ee.Algorithms.If(
+  bandNames.contains('B8'),
+  'B8',
+  'SR_B5'
+);
+const nir = img.select(ee.String(nirBand));
+
+// Choose Red
+const redBand = ee.Algorithms.If(
+  bandNames.contains('B4'),
+  'B4',
+  'SR_B4'
+);
+const red = img.select(ee.String(redBand));
+
+// Choose SWIR
+const swirBand = ee.Algorithms.If(
+  bandNames.contains('B11'),
+  'B11',
+  'SR_B7'
+);
+const swir = img.select(ee.String(swirBand));
 
 const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
 const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
