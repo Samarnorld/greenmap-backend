@@ -777,11 +777,10 @@ app.get('/treecanopy-stats', async (req, res) => {
     res.status(500).json({ error: 'Tree canopy trend stats failed', details: err.message });
   }
 });
-
-app.get('/trend', (req, res) => {
+app.get('/trend', async (req, res) => {
   try {
     const start = ee.Date(Date.now()).advance(-1, 'year');
-    const months = ee.List.sequence(0, 11);
+    const months = Array.from({ length: 12 }, (_, i) => i);
     const wardName = req.query.ward;
 
     const normalizedWard = wardName ? wardName.trim().toLowerCase() : null;
@@ -790,71 +789,61 @@ app.get('/trend', (req, res) => {
       ? wards.filter(ee.Filter.eq('NAME_3', ee.String(wardName).capitalize())).first().geometry()
       : wards.geometry();
 
-    // 🛰 Satellite sources
-    const s2Base = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-      .filterBounds(geometry)
-      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
-      .select(['B4', 'B8']);
-
+    // Base collections
     const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
       .filterBounds(geometry)
       .select('precipitation');
 
-    const monthlyStats = ee.FeatureCollection(months.map(i => {
+    const results = [];
+
+    for (const i of months) {
       const monthStart = start.advance(i, 'month');
       const monthEnd = monthStart.advance(1, 'month');
 
-      const s2 = s2Base.filterDate(monthStart, monthEnd);
+      const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+        .filterBounds(geometry)
+        .filterDate(monthStart, monthEnd)
+        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
+        .select(['B4', 'B8']);
+
+      // Fetch size client-side
+      const s2Count = await s2.size().getInfo();
+
+      let ndviImage;
+      if (s2Count > 0) {
+        ndviImage = s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI');
+      } else {
+        // fallback to zero NDVI masked image
+        ndviImage = ee.Image(0).rename('NDVI').updateMask(ee.Image(0));
+      }
+
       const rain = chirps.filterDate(monthStart, monthEnd).sum().rename('Rain');
 
-      const ndvi = ee.Algorithms.If(
-        s2.size().gt(0),
-        s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
-        ee.Image(ee.Number(0)).updateMask(ee.Image(0)).rename('NDVI')
-      );
+      const combined = ndviImage.addBands(rain);
 
-      const combined = ee.Image(ndvi).addBands(rain);
-
-      const stats = combined.reduceRegion({
+      // Reduce region async
+      const stats = await combined.reduceRegion({
         reducer: ee.Reducer.mean(),
         geometry: geometry,
         scale: 500,
         maxPixels: 1e9
+      }).getInfo();
+
+      results.push({
+        date: monthStart.format('YYYY-MM').getInfo(),
+        ndvi: stats.NDVI ?? 0,
+        rain: stats.Rain ?? 0
       });
+    }
 
-      return ee.Feature(null, stats.set('date', monthStart.format('YYYY-MM')));
-    }));
-
-    monthlyStats.getInfo((data, err) => {
-      if (err) {
-        console.error('❌ Trend API error:', err);
-        return res.status(500).json({ error: 'Trend API error', details: err.message || err });
-      }
-
-      if (!data || !Array.isArray(data.features)) {
-        console.error('❌ Invalid trend data returned');
-        return res.status(500).json({ error: 'Invalid data structure returned from Earth Engine' });
-      }
-
-      const formatted = data.features.map(f => ({
-        date: f.properties.date,
-        ndvi: f.properties.NDVI || 0,
-        rain: f.properties.Rain || 0
-      })).filter(d => d.date); // Filter out any without a date
-
-      res.setHeader('Cache-Control', 'public, max-age=86400');
-      res.json(formatted);
-    });
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.json(results);
   } catch (e) {
     console.error('❌ Unhandled error in /trend:', e);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error', details: e.message || e.toString() });
   }
 });
-function getWardGeometryByName(name) {
-  const wards = ee.FeatureCollection("projects/greenmap-backend/assets/nairobi_wards_filtered")
-    .filter(ee.Filter.eq("NAME_3", name));
-  return wards.geometry();
-}
+
 app.get('/ward-trend', async (req, res) => {
   try {
     const wardName = req.query.ward;
