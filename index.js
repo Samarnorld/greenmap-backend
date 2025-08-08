@@ -777,7 +777,7 @@ app.get('/treecanopy-stats', async (req, res) => {
     res.status(500).json({ error: 'Tree canopy trend stats failed', details: err.message });
   }
 });
-app.get('/api/trend', async (req, res) => {
+app.get('/trend', async (req, res) => {
     try {
         // Fetch all data from DB
         const sql = `
