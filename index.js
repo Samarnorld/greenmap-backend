@@ -354,7 +354,7 @@ serveTile(builtClipped, {
 }, res);
 
 });
-app.get('/builtup-stats', async (req, res) => {
+app.get('/builtup-stats', (req, res) => {
   console.log("📊 /builtup-stats called");
   let currentDate, pastDate;
 
@@ -399,145 +399,189 @@ app.get('/builtup-stats', async (req, res) => {
     scale: 10,
     maxPixels: 1e13
   });
-try {
-  const overlapRes = await withRetry(overlapArea);
-  const m2 = overlapRes['overlap_m2'] || 0;
-  console.log(`⚠️ Overlapping green+built area: ${(m2 / 1e6).toFixed(2)} km²`);
 
-  const wardStats = await withRetry(builtPerWard);
-  const builtRes = await withRetry(totalBuilt);
-  const areaRes = await withRetry(totalArea);
-
-  if (res.headersSent) return;
-
-  const built_m2 = builtRes['built_m2'];
-  const total_m2 = areaRes['area'];
-  const built_pct = (built_m2 / total_m2) * 100;
-
-  res.setHeader('Cache-Control', 'public, max-age=3600');
-  res.json({
-    updated: new Date().toISOString(),
-    city_built_m2: built_m2,
-    city_total_m2: total_m2,
-    city_built_pct: built_pct,
-    per_ward: (wardStats.features || []).map(w => ({
-      ward: w.properties.wards || w.properties.NAME_3 || 'Unknown',
-      built_m2: w.properties.built_m2,
-      ward_area_m2: w.properties.ward_area_m2,
-      built_pct: w.properties.built_pct
-    }))
+  overlapArea.getInfo((overlapRes, err) => {
+    if (err) {
+      console.error("❌ Overlap check failed:", err);
+    } else {
+      const m2 = overlapRes['overlap_m2'] || 0;
+      console.log(`⚠️ Overlapping green+built area: ${(m2 / 1e6).toFixed(2)} km²`);
+    }
   });
 
-} catch (err) {
-  console.error('❌ Built-up stats error:', err);
-  if (!res.headersSent) {
-    res.status(500).json({ error: 'Failed to compute built-up stats', details: err.message });
-  }
-}
-});
-app.get('/wards', async (req, res) => {
-  console.log("📊 /wards called");
+  const builtAreaImage = builtMask.multiply(pixelArea).rename('built_m2');
 
-  try {
-    const now = ee.Date(Date.now()).advance(-30, 'day');
-    const oneYearAgo = now.advance(-1, 'year');
+  const builtPerWard = builtAreaImage.reduceRegions({
+    collection: wards,
+    reducer: ee.Reducer.sum(),
+    scale: 10
+  }).map(f => {
+    const wardArea = f.geometry().area(10); // accurate ward area in m²
+    const built_m2 = ee.Number(f.get('sum'));
+    const built_pct = built_m2.divide(wardArea).multiply(100);
+    return f.set({
+      built_m2,
+      ward_area_m2: wardArea,
+      built_pct
+    });
+  });
 
-    const startNDVI = now.advance(-120, 'day');
-    const startNDVIPast = oneYearAgo.advance(-120, 'day');
+  const totalBuilt = builtAreaImage.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: wards.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
 
-    const rainRange = parseInt(req.query.range) || 30;
-    const startRain = now.advance(-rainRange, 'day');
-    const startRainPast = oneYearAgo.advance(-rainRange, 'day');
+  const totalArea = pixelArea.rename('area').clip(wards).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: wards.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
 
-    const ndvi_now = getNDVI(startNDVI, now).rename('NDVI_NOW');
-    const ndvi_past = getNDVI(startNDVIPast, oneYearAgo).rename('NDVI_PAST');
+  builtPerWard.getInfo((wardStats, err1) => {
+    if (err1) {
+      console.error('❌ Built-up ward stats error:', err1);
+      return res.status(500).json({ error: 'Failed to compute built-up per ward', details: err1 });
+    }
 
-    const lst = ee.ImageCollection('MODIS/061/MOD11A1')
-      .filterBounds(wards)
-      .filterDate(startNDVI, now)
-      .select('LST_Day_1km')
-      .mean()
-      .multiply(0.02)
-      .subtract(273.15)
-      .rename('LST_C');
+    totalBuilt.getInfo((builtRes, err2) => {
+      if (err2) {
+        console.error('❌ Built-up total error:', err2);
+        return res.status(500).json({ error: 'Failed to compute total built-up area', details: err2 });
+      }
 
-    const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
-      .filterBounds(wards)
-      .select('precipitation');
+      totalArea.getInfo((areaRes, err3) => {
+        if (err3) {
+          console.error('❌ Total area error:', err3);
+          return res.status(500).json({ error: 'Failed to compute total Nairobi area', details: err3 });
+        }
 
-    const rain_now = chirps.filterDate(startRain, now).sum().rename('Rain_Current');
-    const rain_past = chirps.filterDate(startRainPast, oneYearAgo).sum().rename('Rain_Past');
-    const rain_anomaly = rain_now.subtract(rain_past).rename('Rain_Anomaly');
+        const built_m2 = builtRes['built_m2'];
+        const total_m2 = areaRes['area'];
+        const built_pct = (built_m2 / total_m2) * 100;
 
-    // Calculate stats per ward
-    const results = wards.map(function (ward) {
-      const geom = ward.geometry();
+        if (res.headersSent) return;
 
-      const ndvi_now_mean = ndvi_now.reduceRegion({
-        reducer: ee.Reducer.mean(),
-        geometry: geom,
-        scale: 10,
-        maxPixels: 1e13
-      }).get('NDVI_NOW');
-
-      const ndvi_past_mean = ndvi_past.reduceRegion({
-        reducer: ee.Reducer.mean(),
-        geometry: geom,
-        scale: 10,
-        maxPixels: 1e13
-      }).get('NDVI_PAST');
-
-      const lst_mean = lst.reduceRegion({
-        reducer: ee.Reducer.mean(),
-        geometry: geom,
-        scale: 1000,
-        maxPixels: 1e13
-      }).get('LST_C');
-
-      const rain_now_total = rain_now.reduceRegion({
-        reducer: ee.Reducer.sum(),
-        geometry: geom,
-        scale: 5000,
-        maxPixels: 1e13
-      }).get('Rain_Current');
-
-      const rain_past_total = rain_past.reduceRegion({
-        reducer: ee.Reducer.sum(),
-        geometry: geom,
-        scale: 5000,
-        maxPixels: 1e13
-      }).get('Rain_Past');
-
-      const rain_anomaly_val = rain_anomaly.reduceRegion({
-        reducer: ee.Reducer.mean(),
-        geometry: geom,
-        scale: 5000,
-        maxPixels: 1e13
-      }).get('Rain_Anomaly');
-
-      return ward.set({
-        'NDVI_NOW': ndvi_now_mean,
-        'NDVI_PAST': ndvi_past_mean,
-        'LST_C': lst_mean,
-        'Rain_Current': rain_now_total,
-        'Rain_Past': rain_past_total,
-        'Rain_Anomaly': rain_anomaly_val
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+        res.json({
+          updated: new Date().toISOString(),
+          city_built_m2: built_m2,
+          city_total_m2: total_m2,
+          city_built_pct: built_pct,
+          per_ward: (wardStats.features || []).map(w => ({
+            ward: w.properties.wards || w.properties.NAME_3 || 'Unknown',
+            built_m2: w.properties.built_m2,
+            ward_area_m2: w.properties.ward_area_m2,
+            built_pct: w.properties.built_pct
+          }))
+        });
       });
     });
-
-    // Apply retry logic to the final Earth Engine computation
-    const data = await withRetry(results, 3, 2000);
-    console.log(`✅ /wards returned features: ${data?.features?.length}`);
-
-    res.setHeader('Cache-Control', 'public, max-age=900');
-    res.json(data);
-
-  } catch (err) {
-    console.error("❌ /wards error:", err);
-    res.status(500).json({ error: 'Failed to compute ward stats', details: err.message });
-  }
+  });
 });
 
+app.get('/wards', async (req, res) => {
+
+  const now = ee.Date(Date.now()).advance(-30, 'day');
+  const oneYearAgo = now.advance(-1, 'year');
+
+  const startNDVI = now.advance(-120, 'day');
+  const startNDVIPast = oneYearAgo.advance(-120, 'day');
+
+  const rainRange = parseInt(req.query.range) || 30;
+  const startRain = now.advance(-rainRange, 'day');
+  const startRainPast = oneYearAgo.advance(-rainRange, 'day');
+
+  const ndvi_now = getNDVI(startNDVI, now).rename('NDVI_NOW');
+  const ndvi_past = getNDVI(startNDVIPast, oneYearAgo).rename('NDVI_PAST');
+
+  const lst = ee.ImageCollection('MODIS/061/MOD11A1')
+    .filterBounds(wards)
+    .filterDate(startNDVI, now)
+    .select('LST_Day_1km')
+    .mean()
+    .multiply(0.02)
+    .subtract(273.15)
+    .rename('LST_C');
+
+  const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+    .filterBounds(wards)
+    .select('precipitation');
+
+  const rain_now = chirps.filterDate(startRain, now).sum().rename('Rain_Current');
+  const rain_past = chirps.filterDate(startRainPast, oneYearAgo).sum().rename('Rain_Past');
+  const rain_anomaly = rain_now.subtract(rain_past).rename('Rain_Anomaly');
+
+ const pixelArea = ee.Image.pixelArea();
+
+// Reduce NDVI and other stats per ward
+const results = wards.map(function (ward) {
+  const geom = ward.geometry();
+
+  const ndvi_now_mean = ndvi_now.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: geom,
+    scale: 10,
+    maxPixels: 1e13
+  }).get('NDVI_NOW');
+
+  const ndvi_past_mean = ndvi_past.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: geom,
+    scale: 10,
+    maxPixels: 1e13
+  }).get('NDVI_PAST');
+
+  const lst_mean = lst.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: geom,
+    scale: 1000,
+    maxPixels: 1e13
+  }).get('LST_C');
+
+  const rain_now_total = rain_now.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: geom,
+    scale: 5000,
+    maxPixels: 1e13
+  }).get('Rain_Current');
+
+  const rain_past_total = rain_past.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: geom,
+    scale: 5000,
+    maxPixels: 1e13
+  }).get('Rain_Past');
+
+  const rain_anomaly_val = rain_anomaly.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: geom,
+    scale: 5000,
+    maxPixels: 1e13
+  }).get('Rain_Anomaly');
+
+  return ward.set({
+    'NDVI_NOW': ndvi_now_mean,
+    'NDVI_PAST': ndvi_past_mean,
+    'LST_C': lst_mean,
+    'Rain_Current': rain_now_total,
+    'Rain_Past': rain_past_total,
+    'Rain_Anomaly': rain_anomaly_val
+  });
+});
+try {
+  const data = await withRetry(results, 3, 2000); // Retry up to 3 times with 2s delay
+  console.log("✅ /wards returned features:", data?.features?.length);
+  res.setHeader('Cache-Control', 'public, max-age=900');
+  res.json(data);
+} catch (err) {
+  console.error("❌ /wards error:", err);
+  res.status(500).json({ error: 'Failed to compute ward stats', details: err.message });
+}
+
+});
 app.get('/greencoverage', (req, res) => {
   console.log("🌿 /greencoverage called");
 
