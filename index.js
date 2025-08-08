@@ -777,71 +777,84 @@ app.get('/treecanopy-stats', async (req, res) => {
     res.status(500).json({ error: 'Tree canopy trend stats failed', details: err.message });
   }
 });
-app.get('/trend', async (req, res) => {
-    try {
-        // Fetch all data from DB
-        const sql = `
-            SELECT year, month, ndvi, builtUp, treeCoverage, rainfall
-            FROM your_table_name
-            WHERE year >= 2017
-            ORDER BY year, month
-        `;
-        db.all(sql, [], (err, rows) => {
-            if (err) {
-                console.error(err);
-                return res.status(500).json({ error: err.message });
-            }
 
-            // Group data by year
-            const yearlyData = {};
-            rows.forEach(row => {
-                if (!yearlyData[row.year]) yearlyData[row.year] = [];
-                yearlyData[row.year].push(row);
-            });
+app.get('/trend', (req, res) => {
+  try {
+    const start = ee.Date(Date.now()).advance(-1, 'year');
+    const months = ee.List.sequence(0, 11);
+    const wardName = req.query.ward;
 
-            const trend = [];
+    const normalizedWard = wardName ? wardName.trim().toLowerCase() : null;
 
-            Object.keys(yearlyData).forEach(year => {
-                const months = yearlyData[year];
+    const geometry = normalizedWard
+      ? wards.filter(ee.Filter.eq('NAME_3', ee.String(wardName).capitalize())).first().geometry()
+      : wards.geometry();
 
-                // Find dry month (lowest rainfall)
-                const dryMonth = months.reduce((min, curr) =>
-                    curr.rainfall < min.rainfall ? curr : min
-                );
+    // 🛰 Satellite sources
+    const s2Base = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      .filterBounds(geometry)
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+      .select(['B4', 'B8']);
 
-                // Find wet month (highest rainfall)
-                const wetMonth = months.reduce((max, curr) =>
-                    curr.rainfall > max.rainfall ? curr : max
-                );
+    const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+      .filterBounds(geometry)
+      .select('precipitation');
 
-                // Push both dry and wet months to trend array
-                trend.push({
-                    date: `${year}-Dry`,
-                    ndvi: parseFloat(dryMonth.ndvi.toFixed(3)),
-                    builtUp: parseFloat(dryMonth.builtUp.toFixed(3)),
-                    treeCoverage: parseFloat(dryMonth.treeCoverage.toFixed(3)),
-                    rainfall: parseFloat(dryMonth.rainfall.toFixed(3))
-                });
+    const monthlyStats = ee.FeatureCollection(months.map(i => {
+      const monthStart = start.advance(i, 'month');
+      const monthEnd = monthStart.advance(1, 'month');
 
-                trend.push({
-                    date: `${year}-Wet`,
-                    ndvi: parseFloat(wetMonth.ndvi.toFixed(3)),
-                    builtUp: parseFloat(wetMonth.builtUp.toFixed(3)),
-                    treeCoverage: parseFloat(wetMonth.treeCoverage.toFixed(3)),
-                    rainfall: parseFloat(wetMonth.rainfall.toFixed(3))
-                });
-            });
+      const s2 = s2Base.filterDate(monthStart, monthEnd);
+      const rain = chirps.filterDate(monthStart, monthEnd).sum().rename('Rain');
 
-            // Send sorted by year then Dry/Wet order
-            res.json(trend);
-        });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Failed to get trend data' });
-    }
+      const ndvi = ee.Algorithms.If(
+        s2.size().gt(0),
+        s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
+        ee.Image(ee.Number(0)).updateMask(ee.Image(0)).rename('NDVI')
+      );
+
+      const combined = ee.Image(ndvi).addBands(rain);
+
+      const stats = combined.reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: geometry,
+        scale: 500,
+        maxPixels: 1e9
+      });
+
+      return ee.Feature(null, stats.set('date', monthStart.format('YYYY-MM')));
+    }));
+
+    monthlyStats.getInfo((data, err) => {
+      if (err) {
+        console.error('❌ Trend API error:', err);
+        return res.status(500).json({ error: 'Trend API error', details: err.message || err });
+      }
+
+      if (!data || !Array.isArray(data.features)) {
+        console.error('❌ Invalid trend data returned');
+        return res.status(500).json({ error: 'Invalid data structure returned from Earth Engine' });
+      }
+
+      const formatted = data.features.map(f => ({
+        date: f.properties.date,
+        ndvi: f.properties.NDVI || 0,
+        rain: f.properties.Rain || 0
+      })).filter(d => d.date); // Filter out any without a date
+
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.json(formatted);
+    });
+  } catch (e) {
+    console.error('❌ Unhandled error in /trend:', e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
-
-
+function getWardGeometryByName(name) {
+  const wards = ee.FeatureCollection("projects/greenmap-backend/assets/nairobi_wards_filtered")
+    .filter(ee.Filter.eq("NAME_3", name));
+  return wards.geometry();
+}
 app.get('/ward-trend', async (req, res) => {
   try {
     const wardName = req.query.ward;
