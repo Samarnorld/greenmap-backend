@@ -777,15 +777,26 @@ app.get('/treecanopy-stats', async (req, res) => {
     res.status(500).json({ error: 'Tree canopy trend stats failed', details: err.message });
   }
 });
+// Chart trend route - robust version with detailed logging and error detection
 app.get('/charttrend', async (req, res) => {
-  try {
-    // Load Nairobi city boundary
-    const nairobi = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_boundary')
-      .geometry();
+  // Small helper to log with a tag so it's easy to search in Render logs
+  const log = {
+    info: (...args) => console.info('[charttrend][INFO]', ...args),
+    warn: (...args) => console.warn('[charttrend][WARN]', ...args),
+    error: (...args) => console.error('[charttrend][ERROR]', ...args)
+  };
 
-    const startYear = new Date().getFullYear() - 6; // last 7 years
+  try {
+    log.info('Request received for /charttrend');
+
+    // Load Nairobi geometry (server-side EE object)
+    const nairobi = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_boundary').geometry();
+
+    // last 7 years
+    const startYear = new Date().getFullYear() - 6;
     const endYear = new Date().getFullYear();
 
+    // --- Helpers returning EE numbers / images (server-side objects) ---
     function getYearlyNDVI(year) {
       const start = ee.Date.fromYMD(year, 1, 1);
       const end = start.advance(1, 'year');
@@ -846,7 +857,7 @@ app.get('/charttrend', async (req, res) => {
         .select('LST_Day_1km')
         .mean()
         .multiply(0.02)
-        .subtract(273.15);
+        .subtract(273.15); // Kelvin -> °C
       return lst.reduceRegion({
         reducer: ee.Reducer.mean(),
         geometry: nairobi,
@@ -870,6 +881,7 @@ app.get('/charttrend', async (req, res) => {
       }).get('precipitation');
     }
 
+    // Build lists of EE objects (ee.Number / ee.Image results)
     const years = [];
     const ndviVals = [];
     const treeVals = [];
@@ -886,6 +898,36 @@ app.get('/charttrend', async (req, res) => {
       rainVals.push(getYearlyRain(y));
     }
 
+    log.info(`Prepared EE lists for years ${startYear}..${endYear} (count=${years.length}). Calling evaluate()`);
+
+    // Wrap evaluate in a Promise so we can await and catch errors
+    const evaluateAsync = (eeObject, timeoutMs = 120000) => new Promise((resolve, reject) => {
+      let finished = false;
+      try {
+        eeObject.evaluate((result, err) => {
+          finished = true;
+          if (err) {
+            log.error('EE evaluate callback returned error:', err);
+            return reject(err);
+          }
+          return resolve(result);
+        });
+      } catch (e) {
+        finished = true;
+        log.error('Exception calling ee.evaluate:', e);
+        return reject(e);
+      }
+      // safety timeout so request doesn't hang forever
+      setTimeout(() => {
+        if (!finished) {
+          const msg = `EE evaluate timed out after ${timeoutMs}ms`;
+          log.error(msg);
+          reject(new Error(msg));
+        }
+      }, timeoutMs);
+    });
+
+    // Put everything in an ee.Dictionary and evaluate once
     const allData = ee.Dictionary({
       years: years,
       ndvi: ee.List(ndviVals),
@@ -895,17 +937,68 @@ app.get('/charttrend', async (req, res) => {
       rainfall: ee.List(rainVals)
     });
 
-    allData.evaluate(data => {
-      res.json(data);
+    // Await evaluated result and handle errors
+    let rawResult;
+    try {
+      rawResult = await evaluateAsync(allData);
+    } catch (eeErr) {
+      log.error('Earth Engine evaluation failed:', eeErr && eeErr.stack ? eeErr.stack : eeErr);
+      // return a meaningful JSON error so client doesn't try to parse empty body
+      return res.status(502).json({ error: 'Earth Engine evaluation failed', details: String(eeErr) });
+    }
+
+    if (!rawResult) {
+      log.error('EE evaluate returned empty result (null/undefined).');
+      return res.status(502).json({ error: 'Empty result from Earth Engine' });
+    }
+
+    // Normalize result arrays to numbers or null, ensure lengths match years
+    const normalizeArray = (arr, expectedLen) => {
+      if (!Array.isArray(arr)) {
+        // Sometimes EE returns a single scalar; convert to repeated values or nulls
+        if (arr !== undefined && arr !== null && typeof arr === 'number') {
+          return Array.from({ length: expectedLen }, () => arr);
+        }
+        return Array.from({ length: expectedLen }, () => null);
+      }
+      const out = arr.slice(0, expectedLen).map(v => {
+        if (v === null || v === undefined || v === '') return null;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : null;
+      });
+      while (out.length < expectedLen) out.push(null);
+      return out;
+    };
+
+    const n = years.length;
+    const payload = {
+      years: rawResult.years ?? years,
+      ndvi: normalizeArray(rawResult.ndvi ?? rawResult.NDVI, n),
+      tree: normalizeArray(rawResult.tree ?? rawResult.tree_vals ?? rawResult.trees, n),
+      builtup: normalizeArray(rawResult.builtup ?? rawResult.built_up ?? rawResult.NDBI, n),
+      lst: normalizeArray(rawResult.lst ?? rawResult.LST, n),
+      rainfall: normalizeArray(rawResult.rainfall ?? rawResult.rain ?? rawResult.precipitation, n)
+    };
+
+    // Quick sanity check logs for render
+    log.info('Returning charttrend payload summary:', {
+      years_count: payload.years.length || n,
+      ndvi_sample: payload.ndvi.slice(0, 3),
+      rainfall_sample: payload.rainfall.slice(0, 3),
+      builtup_sample: payload.builtup.slice(0, 3),
+      tree_sample: payload.tree.slice(0, 3),
+      lst_sample: payload.lst.slice(0, 3)
     });
 
+    // send JSON
+    res.json(payload);
   } catch (error) {
-    console.error('Error generating charttrend:', error);
-    res.status(500).json({ error: error.message });
+    // Final catch-all (should be rare because most EE errors are handled above)
+    console.error('[charttrend][FATAL] Uncaught error in /charttrend:', error && error.stack ? error.stack : error);
+    // Always return JSON (no empty body)
+    res.status(500).json({ error: 'Internal server error generating charttrend', details: String(error) });
   }
 });
-
-
 
 app.get('/ward-trend', async (req, res) => {
   try {
