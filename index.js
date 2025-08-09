@@ -36,7 +36,8 @@ ee.data.authenticateViaPrivateKey(
         console.error("⚠️ EE warm-up failed:", err.message || err);
       }
 
-      startServer(); // Start your Express server after EE is warmed up
+console.log('✅ Earth Engine initialized (warm-up complete).');
+
     });
   },
   (err) => {
@@ -69,14 +70,37 @@ async function withRetry(eeObject, retries = 3, delayMs = 2000) {
   }
 }
 
+// Global wards FeatureCollection used by many endpoints
+const wards = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered');
 
 
-function startServer() {
-  const wards = ee.FeatureCollection("projects/greenmap-backend/assets/nairobi_wards_filtered");
-  function getWardGeometryByName(wardName) {
-  const normalized = wardName.trim().toLowerCase();
-  return wards.filter(ee.Filter.eq('NAME_3', ee.String(normalized).capitalize())).first().geometry();
+// Robust async ward geometry lookup. Returns an ee.Geometry or null.
+async function getWardGeometryByName(wardName) {
+  if (!wardName || typeof wardName !== 'string') return null;
+  const trimmed = wardName.trim();
+
+  // 1) Try exact match on NAME_3
+  const exactFeat = wards.filter(ee.Filter.eq('NAME_3', trimmed)).first();
+  try {
+    const exactInfo = await withRetry(exactFeat, 2); // will throw if not found or error
+    if (exactInfo) return exactFeat.geometry();
+  } catch (e) {
+    // ignore and try fallback
+  }
+
+  // 2) Fallback: case-insensitive / contains (less strict)
+  const containsFeat = wards.filter(ee.Filter.stringContains('NAME_3', trimmed)).first();
+  try {
+    const containsInfo = await withRetry(containsFeat, 2);
+    if (containsInfo) return containsFeat.geometry();
+  } catch (e) {
+    // ignore and return null below
+  }
+
+  // Not found
+  return null;
 }
+
   function getNDVI(start, end) {
   // Sentinel-2 collection
   const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
@@ -119,45 +143,60 @@ function startServer() {
 
 
 function serveTile(image, visParams, res) {
-  const styled = image.visualize(visParams).clip(wards);
+  // Ensure we wrap input as an ee.Image (caller should pass a clipped image if needed)
+  const styled = ee.Image(image).visualize(visParams);
 
   styled.getMap({}, (map, err) => {
     if (err || !map || !map.urlFormat) {
       console.error("🛑 serveTile failed:", err || 'Missing urlFormat');
-      return res.status(500).json({ error: 'Tile rendering failed', details: err });
+      return res.status(500).json({ error: 'Tile rendering failed', details: String(err) });
     }
-
     console.log("✅ Tile URL generated:", map.urlFormat);
     res.setHeader('Cache-Control', 'public, max-age=3600');
     res.json({ urlFormat: map.urlFormat });
   });
 }
 
- app.get('/ndvi', (req, res) => {
-  const inputDate = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
-const endDate = inputDate;
-const startDate = endDate.advance(-120, 'day');
+app.get('/ndvi', async (req, res) => {
+  try {
+    const inputDate = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
+    const endDate = inputDate;
+    const startDate = endDate.advance(-120, 'day');
 
-  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-    .filterBounds(wards)
-    .filterDate(startDate, endDate)
-    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
-    .select(['B4', 'B8']);
+    const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      .filterBounds(wards)
+      .filterDate(startDate, endDate)
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+      .select(['B4', 'B8']);
 
-  const ndvi = ee.Algorithms.If(
-    s2.size().gt(0),
-    s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
-   ee.Image.constant(0).rename('NDVI').updateMask(ee.Image(0)).clip(wards)
-  );
+    const ndvi = ee.Algorithms.If(
+      s2.size().gt(0),
+      s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
+      // safe fallback: constant 0 clipped to wards with valid pixels
+      ee.Image.constant(0).rename('NDVI').clip(wards).unmask(0)
+    );
 
-  const geometry = req.query.ward ? getWardGeometryByName(req.query.ward) : wards.geometry();
-const ndviClipped = ee.Image(ndvi).clip(geometry);
-serveTile(ndviClipped, {
-    min: 0,
-    max: 0.8,
-    palette: ['red', 'yellow', 'green']
-  }, res);
+    // Resolve geometry (ward or whole city)
+    let geometry;
+    if (req.query.ward) {
+      geometry = await getWardGeometryByName(req.query.ward);
+      if (!geometry) return res.status(400).json({ error: `Ward not found: "${req.query.ward}"` });
+    } else {
+      geometry = wards.geometry();
+    }
+
+    const ndviClipped = ee.Image(ndvi).clip(geometry);
+    serveTile(ndviClipped, {
+      min: 0,
+      max: 0.8,
+      palette: ['red', 'yellow', 'green']
+    }, res);
+  } catch (err) {
+    console.error('❌ /ndvi error:', err);
+    res.status(500).json({ error: 'Failed to generate NDVI tile', details: String(err) });
+  }
 });
+
 app.get('/lst', (req, res) => {
   const inputDate = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
 const endDate = inputDate;
@@ -179,31 +218,45 @@ const startDate = endDate.advance(-120, 'day');
   }, res);
 });
 
+app.get('/ndvi-mask', async (req, res) => {
+  try {
+    const inputDate = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
+    const endDate = inputDate;
+    const startDate = endDate.advance(-120, 'day');
 
-app.get('/ndvi-mask', (req, res) => {
-  const inputDate = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
-  const endDate = inputDate;
-  const startDate = endDate.advance(-120, 'day');
+    const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      .filterBounds(wards)
+      .filterDate(startDate, endDate)
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+      .select(['B4', 'B8']);
 
-  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-    .filterBounds(wards)
-    .filterDate(startDate, endDate)
-    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
-    .select(['B4', 'B8']);
+    const ndvi = ee.Algorithms.If(
+      s2.size().gt(0),
+      s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
+      ee.Image.constant(0).rename('NDVI').clip(wards).unmask(0)
+    );
 
-  const ndvi = ee.Algorithms.If(
-    s2.size().gt(0),
-    s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
-    ee.Image.constant(0).rename('NDVI').updateMask(ee.Image(0)) // fully transparent fallback
-  );
+    let geometry;
+    if (req.query.ward) {
+      geometry = await getWardGeometryByName(req.query.ward);
+      if (!geometry) return res.status(400).json({ error: `Ward not found: "${req.query.ward}"` });
+    } else {
+      geometry = wards.geometry();
+    }
 
-  const mask = ee.Image(ndvi).updateMask(ee.Image(ndvi).gt(0.3));
+    const mask = ee.Image(ndvi).gt(0.3).selfMask();
+    const maskClipped = mask.clip(geometry);
 
-  serveTile(mask, {
-    min: 0.3,
-    max: 0.8,
-    palette: ['yellow', 'green']
-  }, res);
+    serveTile(maskClipped, {
+      min: 0.3,
+      max: 0.8,
+      palette: ['yellow', 'green']
+    }, res);
+
+  } catch (err) {
+    console.error('❌ /ndvi-mask error:', err);
+    res.status(500).json({ error: 'Failed to generate NDVI mask', details: String(err) });
+  }
 });
 
 app.get('/ndvi-anomaly', async (req, res) => {
@@ -234,13 +287,14 @@ app.get('/ndvi-anomaly', async (req, res) => {
       ee.Algorithms.If(
         sentinel.size().gt(0),
         sentinel.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
-       ee.Image.constant(0).rename('NDVI').updateMask(ee.Image(0))
+       ee.Image.constant(0).rename('NDVI').clip(wards).unmask(0)
+
 
       ),
       ee.Algorithms.If(
         landsat.size().gt(0),
         landsat.median().normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI'),
-       ee.Image.constant(0).rename('NDVI').updateMask(ee.Image(0))
+       ee.Image.constant(0).rename('NDVI').clip(wards).unmask(0)
 
       )
     );
@@ -310,50 +364,64 @@ const startPast = past.advance(-range, 'day');
     palette: ['#d73027', '#fee08b', '#1a9850']
   }, res);
 });
-app.get('/builtup', (req, res) => {
+app.get('/builtup', async (req, res) => {
   console.log("📡 /builtup endpoint hit");
-let currentDate, pastDate;
+  try {
+    let currentDate, pastDate;
 
-if (req.query.year) {
-  const y = parseInt(req.query.year);
-  pastDate = ee.Date.fromYMD(y, 1, 1);
-  currentDate = ee.Date.fromYMD(y, 12, 31);
-} else {
-  currentDate = ee.Date(Date.now());
-  pastDate = currentDate.advance(-1, 'year');
-}
+    if (req.query.year) {
+      const y = parseInt(req.query.year);
+      pastDate = ee.Date.fromYMD(y, 1, 1);
+      currentDate = ee.Date.fromYMD(y, 12, 31);
+    } else {
+      currentDate = ee.Date(Date.now());
+      pastDate = currentDate.advance(-1, 'year');
+    }
 
+    const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      .filterBounds(wards)
+      .filterDate(pastDate, currentDate)
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20));
 
-  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-    .filterBounds(wards)
-    .filterDate(pastDate, currentDate)
-    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20));
+    const safeImage = ee.Algorithms.If(
+      s2.size().gt(0),
+      s2.median().clip(wards),
+      // safe fallback (valid pixels)
+      ee.Image.constant(0).clip(wards).unmask(0)
+    );
 
-  const safeImage = ee.Algorithms.If(
-    s2.size().gt(0),
-    s2.median().clip(wards),
-    ee.Image(0).updateMask(ee.Image(0)).clip(wards) // fully transparent fallback
-  );
+    const image = ee.Image(safeImage);
+    const swir = image.select('B11');
+    const nir = image.select('B8');
+    const red = image.select('B4');
 
-  const image = ee.Image(safeImage);
-  const swir = image.select('B11');
-  const nir = image.select('B8');
-  const red = image.select('B4');
+    const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
+    const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
 
-  const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
-  const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+    const builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
 
-  const builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
+    // Resolve geometry requested
+    let geometry;
+    if (req.query.ward) {
+      geometry = await getWardGeometryByName(req.query.ward);
+      if (!geometry) return res.status(400).json({ error: `Ward not found: "${req.query.ward}"` });
+    } else {
+      geometry = wards.geometry();
+    }
 
- const geometry = req.query.ward ? getWardGeometryByName(req.query.ward) : wards.geometry();
-const builtClipped = builtMask.clip(geometry);
-serveTile(builtClipped, {
-  min: 0,
-  max: 1,
-  palette: ['#fee5d9', '#fcae91', '#fb6a4a', '#de2d26', '#a50f15']  // 🔴 RED URBAN GRADIENT
-}, res);
+    const builtClipped = builtMask.clip(geometry);
+    serveTile(builtClipped, {
+      min: 0,
+      max: 1,
+      palette: ['#fee5d9', '#fcae91', '#fb6a4a', '#de2d26', '#a50f15']
+    }, res);
 
+  } catch (err) {
+    console.error('❌ /builtup error:', err);
+    res.status(500).json({ error: 'Failed to generate built-up tile', details: String(err) });
+  }
 });
+
 app.get('/builtup-stats', (req, res) => {
   console.log("📊 /builtup-stats called");
   let currentDate, pastDate;
@@ -375,7 +443,8 @@ app.get('/builtup-stats', (req, res) => {
   const safeImage = ee.Algorithms.If(
     s2.size().gt(0),
     s2.median().clip(wards),
-    ee.Image.constant(0).updateMask(ee.Image.constant(0)).clip(wards)
+   ee.Image.constant(0).clip(wards).unmask(0)
+
   );
 
   const image = ee.Image(safeImage);
@@ -636,27 +705,37 @@ app.get('/greencoverage', (req, res) => {
     });
   });
 });
-app.get('/treecoverage', (req, res) => {
-  const geometry = req.query.ward
-    ? getWardGeometryByName(req.query.ward)
-    : wards.geometry();
+app.get('/treecoverage', async (req, res) => {
+  try {
+    const geometry = req.query.ward
+      ? await getWardGeometryByName(req.query.ward)
+      : wards.geometry();
 
-  const year = parseInt(req.query.year) || new Date().getFullYear();
-  const start = ee.Date.fromYMD(year, 1, 1);
-  const end = start.advance(1, 'year');
+    if (req.query.ward && !geometry) {
+      return res.status(400).json({ error: `Ward not found: "${req.query.ward}"` });
+    }
 
-  const dw = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
-    .filterBounds(geometry)
-    .filterDate(start, end)
-    .select('label');
+    const year = parseInt(req.query.year) || new Date().getFullYear();
+    const start = ee.Date.fromYMD(year, 1, 1);
+    const end = start.advance(1, 'year');
 
-  const treeMask = dw.mode().eq(1).selfMask(); // Class 1 = Trees
+    const dw = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+      .filterBounds(geometry)
+      .filterDate(start, end)
+      .select('label');
 
-  serveTile(treeMask, {
-    min: 0,
-    max: 1,
-    palette: ['#d9f0d3', '#1a9850'] // light to dark green
-  }, res);
+    const treeMask = dw.mode().eq(1).selfMask(); // Class 1 = Trees
+
+    serveTile(treeMask.clip(geometry), {
+      min: 0,
+      max: 1,
+      palette: ['#d9f0d3', '#1a9850']
+    }, res);
+
+  } catch (err) {
+    console.error('❌ /treecoverage error:', err);
+    res.status(500).json({ error: 'Failed to generate tree coverage tile', details: String(err) });
+  }
 });
 
 app.get('/treecanopy-stats', async (req, res) => {
@@ -1011,7 +1090,16 @@ app.get('/ward-trend', async (req, res) => {
       return res.status(400).json({ error: 'Missing ?ward= name' });
     }
 
-    const geometry = getWardGeometryByName(wardName);
+    // Get ward geometry (async helper returns ee.Geometry or null)
+const geomObj = await getWardGeometryByName(wardName);
+if (!geomObj) {
+  return res.status(400).json({ error: `Ward geometry not found for "${wardName}".` });
+}
+
+// Use the returned ee.Geometry directly
+const geometry = ee.Geometry(geomObj);
+
+
     if (!geometry) return res.status(400).json({ error: 'Ward geometry not found' });
 
     const pixelArea = ee.Image.pixelArea();
@@ -1125,4 +1213,3 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Backend running on http://localhost:${PORT}`);
 });
-}
