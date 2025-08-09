@@ -778,8 +778,8 @@ app.get('/treecanopy-stats', async (req, res) => {
   }
 });
 // Chart trend route - robust version with detailed logging and error detection
+// Chart trend route - optimized for Render speed
 app.get('/charttrend', async (req, res) => {
-  // Small helper to log with a tag so it's easy to search in Render logs
   const log = {
     info: (...args) => console.info('[charttrend][INFO]', ...args),
     warn: (...args) => console.warn('[charttrend][WARN]', ...args),
@@ -788,28 +788,41 @@ app.get('/charttrend', async (req, res) => {
 
   try {
     log.info('Request received for /charttrend');
-   // Load Nairobi boundary from wards asset
-const nairobi = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered')
-    .union()
-    .geometry();
 
-    // last 7 years
-    const startYear = new Date().getFullYear() - 6;
+    // --- Early check: make sure asset exists ---
+    let wardsFC;
+    try {
+      wardsFC = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered');
+      await new Promise((resolve, reject) => {
+        wardsFC.limit(1).evaluate((res, err) => {
+          if (err) return reject(err);
+          resolve(res);
+        });
+      });
+    } catch (assetErr) {
+      log.error('Nairobi wards asset missing or inaccessible:', assetErr);
+      return res.status(404).json({ error: 'Nairobi wards asset not found' });
+    }
+
+    const nairobi = wardsFC.union().geometry();
+
+    // Last 5 years (lighter load)
+    const startYear = new Date().getFullYear() - 4;
     const endYear = new Date().getFullYear();
 
-    // --- Helpers returning EE numbers / images (server-side objects) ---
+    // --- Metric functions ---
     function getYearlyNDVI(year) {
       const start = ee.Date.fromYMD(year, 1, 1);
       const end = start.advance(1, 'year');
-      const ndvi = ee.ImageCollection('MODIS/061/MOD13Q1')
+      const img = ee.ImageCollection('MODIS/061/MOD13Q1')
         .filterDate(start, end)
         .select('NDVI')
         .mean()
         .multiply(0.0001);
-      return ndvi.reduceRegion({
+      return img.reduceRegion({
         reducer: ee.Reducer.mean(),
         geometry: nairobi,
-        scale: 250,
+        scale: 500, // Was 250
         bestEffort: true
       }).get('NDVI');
     }
@@ -817,12 +830,12 @@ const nairobi = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_w
     function getYearlyTree(year) {
       const start = ee.Date.fromYMD(year, 1, 1);
       const end = start.advance(1, 'year');
-      const dw = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+      const img = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
         .filterDate(start, end)
         .select('label')
-        .map(img => img.eq(1))
+        .map(i => i.eq(1))
         .mean();
-      return dw.reduceRegion({
+      return img.reduceRegion({
         reducer: ee.Reducer.mean(),
         geometry: nairobi,
         scale: 10,
@@ -833,19 +846,19 @@ const nairobi = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_w
     function getYearlyBuiltup(year) {
       const start = ee.Date.fromYMD(year, 1, 1);
       const end = start.advance(1, 'year');
-      const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      const img = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
         .filterDate(start, end)
         .filterBounds(nairobi)
-        .map(img => {
-          const ndvi = img.normalizedDifference(['B8', 'B4']);
-          const ndwi = img.normalizedDifference(['B3', 'B11']);
+        .map(i => {
+          const ndvi = i.normalizedDifference(['B8', 'B4']);
+          const ndwi = i.normalizedDifference(['B3', 'B11']);
           return ndwi.subtract(ndvi).rename('NDBI');
         })
-        .mean();
-      return s2.reduceRegion({
+        .median(); // Faster
+      return img.reduceRegion({
         reducer: ee.Reducer.mean(),
         geometry: nairobi,
-        scale: 10,
+        scale: 30, // Was 10
         bestEffort: true
       }).get('NDBI');
     }
@@ -853,13 +866,13 @@ const nairobi = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_w
     function getYearlyLST(year) {
       const start = ee.Date.fromYMD(year, 1, 1);
       const end = start.advance(1, 'year');
-      const lst = ee.ImageCollection('MODIS/061/MOD11A2')
+      const img = ee.ImageCollection('MODIS/061/MOD11A2')
         .filterDate(start, end)
         .select('LST_Day_1km')
         .mean()
         .multiply(0.02)
-        .subtract(273.15); // Kelvin -> °C
-      return lst.reduceRegion({
+        .subtract(273.15);
+      return img.reduceRegion({
         reducer: ee.Reducer.mean(),
         geometry: nairobi,
         scale: 1000,
@@ -870,11 +883,11 @@ const nairobi = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_w
     function getYearlyRain(year) {
       const start = ee.Date.fromYMD(year, 1, 1);
       const end = start.advance(1, 'year');
-      const rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+      const img = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
         .filterDate(start, end)
         .select('precipitation')
         .sum();
-      return rain.reduceRegion({
+      return img.reduceRegion({
         reducer: ee.Reducer.mean(),
         geometry: nairobi,
         scale: 5000,
@@ -882,7 +895,7 @@ const nairobi = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_w
       }).get('precipitation');
     }
 
-    // Build lists of EE objects (ee.Number / ee.Image results)
+    // --- Collect data ---
     const years = [];
     const ndviVals = [];
     const treeVals = [];
@@ -892,7 +905,9 @@ const nairobi = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_w
 
     for (let y = startYear; y <= endYear; y++) {
       years.push(y);
+      const t0 = Date.now();
       ndviVals.push(getYearlyNDVI(y));
+      log.info(`NDVI ${y} queued in ${Date.now() - t0}ms`);
       treeVals.push(getYearlyTree(y));
       builtupVals.push(getYearlyBuiltup(y));
       lstVals.push(getYearlyLST(y));
@@ -901,34 +916,19 @@ const nairobi = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_w
 
     log.info(`Prepared EE lists for years ${startYear}..${endYear} (count=${years.length}). Calling evaluate()`);
 
-    // Wrap evaluate in a Promise so we can await and catch errors
+    // --- Evaluate with timeout ---
     const evaluateAsync = (eeObject, timeoutMs = 120000) => new Promise((resolve, reject) => {
       let finished = false;
-      try {
-        eeObject.evaluate((result, err) => {
-          finished = true;
-          if (err) {
-            log.error('EE evaluate callback returned error:', err);
-            return reject(err);
-          }
-          return resolve(result);
-        });
-      } catch (e) {
+      eeObject.evaluate((result, err) => {
         finished = true;
-        log.error('Exception calling ee.evaluate:', e);
-        return reject(e);
-      }
-      // safety timeout so request doesn't hang forever
+        if (err) return reject(err);
+        resolve(result);
+      });
       setTimeout(() => {
-        if (!finished) {
-          const msg = `EE evaluate timed out after ${timeoutMs}ms`;
-          log.error(msg);
-          reject(new Error(msg));
-        }
+        if (!finished) reject(new Error(`EE evaluate timed out after ${timeoutMs}ms`));
       }, timeoutMs);
     });
 
-    // Put everything in an ee.Dictionary and evaluate once
     const allData = ee.Dictionary({
       years: years,
       ndvi: ee.List(ndviVals),
@@ -938,65 +938,53 @@ const nairobi = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_w
       rainfall: ee.List(rainVals)
     });
 
-    // Await evaluated result and handle errors
     let rawResult;
     try {
       rawResult = await evaluateAsync(allData);
     } catch (eeErr) {
-      log.error('Earth Engine evaluation failed:', eeErr && eeErr.stack ? eeErr.stack : eeErr);
-      // return a meaningful JSON error so client doesn't try to parse empty body
+      log.error('Earth Engine evaluation failed:', eeErr);
       return res.status(502).json({ error: 'Earth Engine evaluation failed', details: String(eeErr) });
     }
 
     if (!rawResult) {
-      log.error('EE evaluate returned empty result (null/undefined).');
+      log.error('Empty result from EE');
       return res.status(502).json({ error: 'Empty result from Earth Engine' });
     }
 
-    // Normalize result arrays to numbers or null, ensure lengths match years
+    // --- Normalize arrays ---
     const normalizeArray = (arr, expectedLen) => {
       if (!Array.isArray(arr)) {
-        // Sometimes EE returns a single scalar; convert to repeated values or nulls
-        if (arr !== undefined && arr !== null && typeof arr === 'number') {
-          return Array.from({ length: expectedLen }, () => arr);
-        }
-        return Array.from({ length: expectedLen }, () => null);
+        return Array.from({ length: expectedLen }, () => arr ?? null);
       }
-      const out = arr.slice(0, expectedLen).map(v => {
-        if (v === null || v === undefined || v === '') return null;
+      return arr.map(v => {
         const n = Number(v);
         return Number.isFinite(n) ? n : null;
       });
-      while (out.length < expectedLen) out.push(null);
-      return out;
     };
 
     const n = years.length;
     const payload = {
-      years: rawResult.years ?? years,
-      ndvi: normalizeArray(rawResult.ndvi ?? rawResult.NDVI, n),
-      tree: normalizeArray(rawResult.tree ?? rawResult.tree_vals ?? rawResult.trees, n),
-      builtup: normalizeArray(rawResult.builtup ?? rawResult.built_up ?? rawResult.NDBI, n),
-      lst: normalizeArray(rawResult.lst ?? rawResult.LST, n),
-      rainfall: normalizeArray(rawResult.rainfall ?? rawResult.rain ?? rawResult.precipitation, n)
+      years,
+      ndvi: normalizeArray(rawResult.ndvi, n),
+      tree: normalizeArray(rawResult.tree, n),
+      builtup: normalizeArray(rawResult.builtup, n),
+      lst: normalizeArray(rawResult.lst, n),
+      rainfall: normalizeArray(rawResult.rainfall, n)
     };
 
-    // Quick sanity check logs for render
     log.info('Returning charttrend payload summary:', {
-      years_count: payload.years.length || n,
-      ndvi_sample: payload.ndvi.slice(0, 3),
-      rainfall_sample: payload.rainfall.slice(0, 3),
-      builtup_sample: payload.builtup.slice(0, 3),
-      tree_sample: payload.tree.slice(0, 3),
-      lst_sample: payload.lst.slice(0, 3)
+      years_count: payload.years.length,
+      ndvi_sample: payload.ndvi.slice(0, 2),
+      tree_sample: payload.tree.slice(0, 2),
+      builtup_sample: payload.builtup.slice(0, 2),
+      lst_sample: payload.lst.slice(0, 2),
+      rainfall_sample: payload.rainfall.slice(0, 2)
     });
 
-    // send JSON
     res.json(payload);
+
   } catch (error) {
-    // Final catch-all (should be rare because most EE errors are handled above)
-    console.error('[charttrend][FATAL] Uncaught error in /charttrend:', error && error.stack ? error.stack : error);
-    // Always return JSON (no empty body)
+    console.error('[charttrend][FATAL] Uncaught error:', error);
     res.status(500).json({ error: 'Internal server error generating charttrend', details: String(error) });
   }
 });
