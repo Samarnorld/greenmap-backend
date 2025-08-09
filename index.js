@@ -870,7 +870,7 @@ app.get('/charttrend', async (req, res) => {
       const treeFrac = treesFracImg.reduceRegion({
         reducer: ee.Reducer.mean(),
         geometry: nairobiGeom,
-        scale: 100,
+        scale: 10,
         maxPixels: 1e13,
         tileScale: 2,
         bestEffort: true
@@ -884,7 +884,7 @@ app.get('/charttrend', async (req, res) => {
       const s2col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
         .filterBounds(nairobiGeom)
         .filterDate(start, end)
-        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20));
+        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10));
 
       // If Sentinel available, use median; otherwise fallback to a constant (no built-up)
       const s2median = ee.Image(ee.Algorithms.If(s2col.size().gt(0), s2col.median(), ee.Image.constant(0)));
