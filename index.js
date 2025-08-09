@@ -788,9 +788,10 @@ app.get('/charttrend', async (req, res) => {
 
   try {
     log.info('Request received for /charttrend');
-
-    // Load Nairobi geometry (server-side EE object)
-    const nairobi = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_boundary').geometry();
+   // Load Nairobi boundary from wards asset
+const nairobi = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered')
+    .union()
+    .geometry();
 
     // last 7 years
     const startYear = new Date().getFullYear() - 6;
