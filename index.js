@@ -777,306 +777,134 @@ app.get('/treecanopy-stats', async (req, res) => {
     res.status(500).json({ error: 'Tree canopy trend stats failed', details: err.message });
   }
 });
-app.get('/trend', async (req, res) => {
-  try {
-    const now = ee.Date(Date.now());
-    const startOfYear = ee.Date.fromYMD(now.get('year'), 1, 1);
-    const currentMonth = now.get('month'); // 1–12
-    const months = ee.List.sequence(1, currentMonth);
-
-    const wardName = req.query.ward;
-    const normalizedWard = wardName ? wardName.trim() : null;
-
-    const wardsFC = ee.FeatureCollection("projects/greenmap-backend/assets/nairobi_wards_filtered");
-
-    const geometry = normalizedWard
-      ? wardsFC.filter(ee.Filter.eq('NAME_3', normalizedWard)).first().geometry()
-      : wardsFC.geometry();
-
-    // Collections for satellite data
-    const s2Base = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-      .filterBounds(geometry)
-      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20));
-
-    const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
-      .filterBounds(geometry)
-      .select('precipitation');
-
-    const dwCollection = ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1")
-      .filterBounds(geometry)
-      .select('label');
-
-    const monthlyStats = ee.FeatureCollection(
-      months.map(m => {
-        const monthStart = ee.Date.fromYMD(now.get('year'), m, 1);
-        const monthEnd = monthStart.advance(1, 'month');
-
-        // Sentinel-2 for NDVI and NDBI filtered by month
-        const s2 = s2Base.filterDate(monthStart, monthEnd);
-
-        const ndvi = ee.Algorithms.If(
-          s2.size().gt(0),
-          s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
-          ee.Image(0).rename('NDVI')
-        );
-        const ndviImage = ee.Image(ndvi);
-
-        // NDBI Calculation: (SWIR - NIR)/(SWIR + NIR)
-        const ndbi = ee.Algorithms.If(
-          s2.size().gt(0),
-          s2.median().expression(
-            '(B11 - B8) / (B11 + B8)', {
-              'B11': s2.median().select('B11'),
-              'B8': s2.median().select('B8')
-            }
-          ).rename('NDBI'),
-          ee.Image(0).rename('NDBI')
-        );
-        const ndbiImage = ee.Image(ndbi);
-
-        // Built-up mask: NDBI > 0 and NDVI < 0.3
-        const builtMask = ndbiImage.gt(0).and(ndviImage.lt(0.3)).selfMask();
-
-        // Dynamic World trees median for month
-        const dwTrees = dwCollection
-          .filterDate(monthStart, monthEnd)
-          .map(img => img.eq(1).selfMask())  // Class 1 = Trees
-          .median();
-
-        // Rainfall monthly sum
-        const rain = chirps.filterDate(monthStart, monthEnd)
-          .sum()
-          .rename('Rain');
-
-        // Calculate pixel areas
-        const pixelArea = ee.Image.pixelArea();
-
-        // Reduce regions to get stats
-        const ndviMean = ndviImage.reduceRegion({
-          reducer: ee.Reducer.mean(),
-          geometry: geometry,
-          scale: 10,
-          maxPixels: 1e9
-        }).get('NDVI');
-
-        const rainSum = rain.reduceRegion({
-          reducer: ee.Reducer.sum(),
-          geometry: geometry,
-          scale: 10,
-          maxPixels: 1e9
-        }).get('Rain');
-
-        const builtArea = builtMask.multiply(pixelArea).reduceRegion({
-          reducer: ee.Reducer.sum(),
-          geometry: geometry,
-          scale: 10,
-          maxPixels: 1e9
-        }).get('NDBI');
-
-        const totalArea = pixelArea.reduceRegion({
-          reducer: ee.Reducer.sum(),
-          geometry: geometry,
-          scale: 10,
-          maxPixels: 1e9
-        }).get('area');
-
-        const builtPct = ee.Number(builtArea).divide(totalArea).multiply(100);
-
-        const treeArea = dwTrees.multiply(pixelArea).reduceRegion({
-          reducer: ee.Reducer.sum(),
-          geometry: geometry,
-          scale: 10,
-          maxPixels: 1e9
-        }).get('label');
-
-        const treePct = ee.Number(treeArea).divide(totalArea).multiply(100);
-
-        // Return Feature with all stats
-        return ee.Feature(null, {
-          date: monthStart.format('YYYY-MM'),
-          NDVI: ndviMean,
-          Rain: rainSum,
-          built_pct: builtPct,
-          tree_pct: treePct
-        });
-      })
-    );
-
-    monthlyStats.getInfo((data, err) => {
-      if (err) {
-        console.error('❌ Trend API error:', err);
-        return res.status(500).json({ error: 'Trend API error', details: err.message || err });
-      }
-      if (!data || !Array.isArray(data.features)) {
-        console.error('❌ Invalid trend data returned');
-        return res.status(500).json({ error: 'Invalid data structure returned from Earth Engine' });
-      }
-      const formatted = data.features.map(f => ({
-        date: f.properties.date,
-        ndvi: f.properties.NDVI || 0,
-        rain: f.properties.Rain || 0,
-        built_pct: f.properties.built_pct || 0,
-        tree_pct: f.properties.tree_pct || 0
-      })).filter(d => d.date);
-      res.setHeader('Cache-Control', 'public, max-age=86400');
-      res.json(formatted);
-    });
-  } catch (e) {
-    console.error('❌ Unhandled error in /trend:', e);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
 app.get('/charttrend', async (req, res) => {
   try {
-    // Serve from cache if available
-    const cachedData = loadCache();
-    if (cachedData) {
-      return res.json(cachedData);
-    }
+    // Load Nairobi city boundary
+    const nairobi = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_boundary')
+      .geometry();
 
-    // Current and start year for last 7 years
-    const currentYear = new Date().getFullYear();
-    const startYear = currentYear - 6; // 7 years total
+    const startYear = new Date().getFullYear() - 6; // last 7 years
+    const endYear = new Date().getFullYear();
 
-    // Define Nairobi geometry (reuse your collection)
-    const nairobi_wards = ee.FeatureCollection("projects/greenmap-backend/assets/nairobi_wards_filtered");
-    const nairobi_geom = nairobi_wards.geometry();
-
-    // Prepare arrays for results
-    const years = [];
-    const ndviArr = [];
-    const treeArr = [];
-    const builtArr = [];
-    const rainfallArr = [];
-
-    // Earth Engine batch computation helper
-    async function getYearlyStats(year) {
+    function getYearlyNDVI(year) {
       const start = ee.Date.fromYMD(year, 1, 1);
-      const end = ee.Date.fromYMD(year, 12, 31);
-
-      // Sentinel-2 median image filtered by year and cloud cover
-      const s2col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-        .filterBounds(nairobi_geom)
+      const end = start.advance(1, 'year');
+      const ndvi = ee.ImageCollection('MODIS/061/MOD13Q1')
         .filterDate(start, end)
-        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10));
-
-      // Check if S2 collection has data
-      const s2count = await s2col.size().getInfo();
-      let s2;
-      if (s2count > 0) {
-        s2 = s2col.median();
-      } else {
-        // Fallback to constant zero image clipped to Nairobi
-        s2 = ee.Image(0).clip(nairobi_geom);
-      }
-
-      // NDVI
-      let ndvi = s2.normalizedDifference(['B8', 'B4']).rename('NDVI');
-
-      // NDBI built-up
-      const swir = s2.select('B11');
-      const nir = s2.select('B8');
-      let ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
-
-      // Built-up mask: NDBI > 0 and NDVI < 0.3
-      let builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
-
-      // Dynamic World trees
-      const dw = ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1")
-        .filterBounds(nairobi_geom)
-        .filter(ee.Filter.calendarRange(year, year, 'year'))
-        .select('label');
-      const trees = dw.map(img => img.eq(1).selfMask()).median();
-
-      // Areas in m²
-      const pixelArea = ee.Image.pixelArea();
-      const builtArea = builtMask.multiply(pixelArea).rename('built_m2');
-      const treeArea = trees.multiply(pixelArea).rename('tree_m2');
-
-      // Reduce to city-wide totals
-      const ndviMean = ndvi.reduceRegion({
+        .select('NDVI')
+        .mean()
+        .multiply(0.0001);
+      return ndvi.reduceRegion({
         reducer: ee.Reducer.mean(),
-        geometry: nairobi_geom,
-        scale: 10,
-        maxPixels: 1e13
+        geometry: nairobi,
+        scale: 250,
+        bestEffort: true
       }).get('NDVI');
+    }
 
-      const builtSum = builtArea.reduceRegion({
-        reducer: ee.Reducer.sum(),
-        geometry: nairobi_geom,
-        scale: 10,
-        maxPixels: 1e13
-      }).get('built_m2');
-
-      const treeSum = treeArea.reduceRegion({
-        reducer: ee.Reducer.sum(),
-        geometry: nairobi_geom,
-        scale: 10,
-        maxPixels: 1e13
-      }).get('tree_m2');
-
-      // Nairobi total area (m²)
-      const totalArea = nairobi_geom.area();
-
-      // Compute percentages
-      const builtPct = ee.Number(builtSum).divide(totalArea).multiply(100);
-      const treePct = ee.Number(treeSum).divide(totalArea).multiply(100);
-
-      // Rainfall total for the year (mm)
-      const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
-        .filterBounds(nairobi_geom)
+    function getYearlyTree(year) {
+      const start = ee.Date.fromYMD(year, 1, 1);
+      const end = start.advance(1, 'year');
+      const dw = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
         .filterDate(start, end)
-        .select('precipitation');
-
-      const rainfallSum = chirps.sum().reduceRegion({
+        .select('label')
+        .map(img => img.eq(1))
+        .mean();
+      return dw.reduceRegion({
         reducer: ee.Reducer.mean(),
-        geometry: nairobi_geom,
-        scale: 500,
-        maxPixels: 1e13
+        geometry: nairobi,
+        scale: 10,
+        bestEffort: true
+      }).get('label');
+    }
+
+    function getYearlyBuiltup(year) {
+      const start = ee.Date.fromYMD(year, 1, 1);
+      const end = start.advance(1, 'year');
+      const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+        .filterDate(start, end)
+        .filterBounds(nairobi)
+        .map(img => {
+          const ndvi = img.normalizedDifference(['B8', 'B4']);
+          const ndwi = img.normalizedDifference(['B3', 'B11']);
+          return ndwi.subtract(ndvi).rename('NDBI');
+        })
+        .mean();
+      return s2.reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: nairobi,
+        scale: 10,
+        bestEffort: true
+      }).get('NDBI');
+    }
+
+    function getYearlyLST(year) {
+      const start = ee.Date.fromYMD(year, 1, 1);
+      const end = start.advance(1, 'year');
+      const lst = ee.ImageCollection('MODIS/061/MOD11A2')
+        .filterDate(start, end)
+        .select('LST_Day_1km')
+        .mean()
+        .multiply(0.02)
+        .subtract(273.15);
+      return lst.reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: nairobi,
+        scale: 1000,
+        bestEffort: true
+      }).get('LST_Day_1km');
+    }
+
+    function getYearlyRain(year) {
+      const start = ee.Date.fromYMD(year, 1, 1);
+      const end = start.advance(1, 'year');
+      const rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+        .filterDate(start, end)
+        .select('precipitation')
+        .sum();
+      return rain.reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: nairobi,
+        scale: 5000,
+        bestEffort: true
       }).get('precipitation');
-
-      // Return a dictionary
-      return ee.Dictionary({
-        year,
-        ndvi: ndviMean,
-        built_pct: builtPct,
-        tree_pct: treePct,
-        rainfall: rainfallSum
-      });
     }
 
-    // Run all years sequentially (could be parallelized with Promise.all)
-    for (let y = startYear; y <= currentYear; y++) {
+    const years = [];
+    const ndviVals = [];
+    const treeVals = [];
+    const builtupVals = [];
+    const lstVals = [];
+    const rainVals = [];
+
+    for (let y = startYear; y <= endYear; y++) {
       years.push(y);
-      const stats = await getYearlyStats(y).then(eeDict => eeDict.getInfo());
-
-      // Push values, use 0 or null if missing
-      ndviArr.push(stats.ndvi !== null ? stats.ndvi : 0);
-      builtArr.push(stats.built_pct !== null ? stats.built_pct : 0);
-      treeArr.push(stats.tree_pct !== null ? stats.tree_pct : 0);
-      rainfallArr.push(stats.rainfall !== null ? stats.rainfall : 0);
+      ndviVals.push(getYearlyNDVI(y));
+      treeVals.push(getYearlyTree(y));
+      builtupVals.push(getYearlyBuiltup(y));
+      lstVals.push(getYearlyLST(y));
+      rainVals.push(getYearlyRain(y));
     }
 
-    // Compose response
-    const response = {
-      years,
-      ndvi: ndviArr,
-      built_up: builtArr,
-      tree_coverage: treeArr,
-      rainfall: rainfallArr,
-    };
+    const allData = ee.Dictionary({
+      years: years,
+      ndvi: ee.List(ndviVals),
+      tree: ee.List(treeVals),
+      builtup: ee.List(builtupVals),
+      lst: ee.List(lstVals),
+      rainfall: ee.List(rainVals)
+    });
 
-    // Cache response
-    saveCache(response);
-
-    // Return JSON
-    return res.json(response);
+    allData.evaluate(data => {
+      res.json(data);
+    });
 
   } catch (error) {
-    console.error('Error generating /charttrend:', error);
-    return res.status(500).json({ error: 'Internal server error' });
+    console.error('Error generating charttrend:', error);
+    res.status(500).json({ error: error.message });
   }
 });
+
 
 
 app.get('/ward-trend', async (req, res) => {
