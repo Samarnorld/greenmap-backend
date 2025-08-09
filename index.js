@@ -78,6 +78,7 @@ function startServer() {
     const normalized = wardName.trim();
     return wards.filter(ee.Filter.eq('NAME_3', normalized)).first().geometry();
   }
+
   function getNDVI(start, end) {
   // Sentinel-2 collection
   const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
@@ -1126,3 +1127,4 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Backend running on http://localhost:${PORT}`);
 });
+}
