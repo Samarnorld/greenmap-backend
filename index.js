@@ -926,6 +926,157 @@ app.get('/trend', async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+app.get('/charttrend', async (req, res) => {
+  try {
+    // Serve from cache if available
+    const cachedData = loadCache();
+    if (cachedData) {
+      return res.json(cachedData);
+    }
+
+    // Current and start year for last 7 years
+    const currentYear = new Date().getFullYear();
+    const startYear = currentYear - 6; // 7 years total
+
+    // Define Nairobi geometry (reuse your collection)
+    const nairobi_wards = ee.FeatureCollection("projects/greenmap-backend/assets/nairobi_wards_filtered");
+    const nairobi_geom = nairobi_wards.geometry();
+
+    // Prepare arrays for results
+    const years = [];
+    const ndviArr = [];
+    const treeArr = [];
+    const builtArr = [];
+    const rainfallArr = [];
+
+    // Earth Engine batch computation helper
+    async function getYearlyStats(year) {
+      const start = ee.Date.fromYMD(year, 1, 1);
+      const end = ee.Date.fromYMD(year, 12, 31);
+
+      // Sentinel-2 median image filtered by year and cloud cover
+      const s2col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+        .filterBounds(nairobi_geom)
+        .filterDate(start, end)
+        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10));
+
+      // Check if S2 collection has data
+      const s2count = await s2col.size().getInfo();
+      let s2;
+      if (s2count > 0) {
+        s2 = s2col.median();
+      } else {
+        // Fallback to constant zero image clipped to Nairobi
+        s2 = ee.Image(0).clip(nairobi_geom);
+      }
+
+      // NDVI
+      let ndvi = s2.normalizedDifference(['B8', 'B4']).rename('NDVI');
+
+      // NDBI built-up
+      const swir = s2.select('B11');
+      const nir = s2.select('B8');
+      let ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
+
+      // Built-up mask: NDBI > 0 and NDVI < 0.3
+      let builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
+
+      // Dynamic World trees
+      const dw = ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1")
+        .filterBounds(nairobi_geom)
+        .filter(ee.Filter.calendarRange(year, year, 'year'))
+        .select('label');
+      const trees = dw.map(img => img.eq(1).selfMask()).median();
+
+      // Areas in m²
+      const pixelArea = ee.Image.pixelArea();
+      const builtArea = builtMask.multiply(pixelArea).rename('built_m2');
+      const treeArea = trees.multiply(pixelArea).rename('tree_m2');
+
+      // Reduce to city-wide totals
+      const ndviMean = ndvi.reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: nairobi_geom,
+        scale: 10,
+        maxPixels: 1e13
+      }).get('NDVI');
+
+      const builtSum = builtArea.reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry: nairobi_geom,
+        scale: 10,
+        maxPixels: 1e13
+      }).get('built_m2');
+
+      const treeSum = treeArea.reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry: nairobi_geom,
+        scale: 10,
+        maxPixels: 1e13
+      }).get('tree_m2');
+
+      // Nairobi total area (m²)
+      const totalArea = nairobi_geom.area();
+
+      // Compute percentages
+      const builtPct = ee.Number(builtSum).divide(totalArea).multiply(100);
+      const treePct = ee.Number(treeSum).divide(totalArea).multiply(100);
+
+      // Rainfall total for the year (mm)
+      const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+        .filterBounds(nairobi_geom)
+        .filterDate(start, end)
+        .select('precipitation');
+
+      const rainfallSum = chirps.sum().reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: nairobi_geom,
+        scale: 500,
+        maxPixels: 1e13
+      }).get('precipitation');
+
+      // Return a dictionary
+      return ee.Dictionary({
+        year,
+        ndvi: ndviMean,
+        built_pct: builtPct,
+        tree_pct: treePct,
+        rainfall: rainfallSum
+      });
+    }
+
+    // Run all years sequentially (could be parallelized with Promise.all)
+    for (let y = startYear; y <= currentYear; y++) {
+      years.push(y);
+      const stats = await getYearlyStats(y).then(eeDict => eeDict.getInfo());
+
+      // Push values, use 0 or null if missing
+      ndviArr.push(stats.ndvi !== null ? stats.ndvi : 0);
+      builtArr.push(stats.built_pct !== null ? stats.built_pct : 0);
+      treeArr.push(stats.tree_pct !== null ? stats.tree_pct : 0);
+      rainfallArr.push(stats.rainfall !== null ? stats.rainfall : 0);
+    }
+
+    // Compose response
+    const response = {
+      years,
+      ndvi: ndviArr,
+      built_up: builtArr,
+      tree_coverage: treeArr,
+      rainfall: rainfallArr,
+    };
+
+    // Cache response
+    saveCache(response);
+
+    // Return JSON
+    return res.json(response);
+
+  } catch (error) {
+    console.error('Error generating /charttrend:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 
 app.get('/ward-trend', async (req, res) => {
