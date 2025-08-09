@@ -1024,50 +1024,75 @@ app.get('/charttrend', async (req, res) => {
 
 app.get('/ward-trend', async (req, res) => {
   try {
-    const wardName = req.query.ward;
-    if (!wardName) {
-      return res.status(400).json({ error: 'Missing ?ward= name' });
+    const wardNameRaw = req.query.ward;
+    if (!wardNameRaw) {
+      return res.status(400).json({ error: 'Missing ?ward= query parameter' });
     }
 
+    // Normalize ward name for matching (simple lowercase trim)
+    const wardName = wardNameRaw.trim().toLowerCase();
+
+    // Function to get ward geometry by normalized name
+    // Make sure your wards FeatureCollection is loaded globally as `wards`
+    function getWardGeometryByName(name) {
+      const filtered = wards.filter(ee.Filter.stringContains('NAME_3', name, false));
+      return filtered.size().gt(0) ? filtered.first().geometry() : null;
+    }
+
+    // Get geometry
     const geometry = getWardGeometryByName(wardName);
-    if (!geometry) return res.status(400).json({ error: 'Ward geometry not found' });
+    if (!geometry) {
+      return res.status(404).json({ error: `Ward geometry not found for "${wardNameRaw}"` });
+    }
 
     const pixelArea = ee.Image.pixelArea();
     const currentYear = new Date().getFullYear();
-    const yearsList = ee.List.sequence(2017, currentYear);
+    const years = Array.from({ length: currentYear - 2017 + 1 }, (_, i) => 2017 + i);
+
     const treeCollection = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').select('label');
 
-    const yearList = await yearsList.getInfo();
     const trend = [];
 
-    for (const y of yearList) {
-      const start = ee.Date.fromYMD(y, 1, 1);
-      const end = start.advance(1, 'year');
+    // Iterate years sequentially with await inside loop to avoid quota problems
+    for (const year of years) {
+      const startDate = ee.Date.fromYMD(year, 1, 1);
+      const endDate = startDate.advance(1, 'year');
 
-      const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      // Sentinel-2 collection filtered
+      const s2Collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
         .filterBounds(geometry)
-        .filterDate(start, end)
+        .filterDate(startDate, endDate)
         .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
         .select(['B4', 'B8', 'B11']);
 
-      const landsat = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+      // Landsat 7 collection fallback
+      const landsatCollection = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
         .filterBounds(geometry)
-        .filterDate(start, end)
+        .filterDate(startDate, endDate)
         .filter(ee.Filter.lt('CLOUD_COVER', 10))
         .select(['SR_B4', 'SR_B5', 'SR_B7'])
         .map(img => img.multiply(0.0000275).add(-0.2).copyProperties(img, img.propertyNames()));
 
-      const s2Size = await s2.size().getInfo();
+      // Get median image from Sentinel-2 or Landsat
+      const s2Size = await s2Collection.size().getInfo();
 
-      const medianImage = s2Size > 0 ? s2.median() : landsat.median();
+      const medianImage = s2Size > 0 ? s2Collection.median() : landsatCollection.median();
       const img = medianImage.clip(geometry);
 
-      const bandNames = await img.bandNames().getInfo();
+      // Determine bands dynamically for indices
+      const bands = await img.bandNames().getInfo();
+      const nirBand = bands.includes('B8') ? 'B8' : (bands.includes('SR_B5') ? 'SR_B5' : null);
+      const redBand = bands.includes('B4') ? 'B4' : (bands.includes('SR_B4') ? 'SR_B4' : null);
+      const swirBand = bands.includes('B11') ? 'B11' : (bands.includes('SR_B7') ? 'SR_B7' : null);
 
-      const nirBand = bandNames.includes('B8') ? 'B8' : 'SR_B5';
-      const redBand = bandNames.includes('B4') ? 'B4' : 'SR_B4';
-      const swirBand = bandNames.includes('B11') ? 'B11' : 'SR_B7';
+      if (!nirBand || !redBand || !swirBand) {
+        console.warn(`Skipping year ${year} due to missing bands`);
+        // Push zero values or nulls to keep data length consistent
+        trend.push({ year, ndvi: null, tree_pct: null, built_pct: null });
+        continue;
+      }
 
+      // Calculate NDVI and NDBI
       const nir = img.select(nirBand);
       const red = img.select(redBand);
       const swir = img.select(swirBand);
@@ -1075,64 +1100,78 @@ app.get('/ward-trend', async (req, res) => {
       const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
       const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
 
+      // Built-up mask and area
       const builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
       const builtArea = builtMask.multiply(pixelArea).rename('built_m2');
 
-      const treeMask = treeCollection
-        .filterDate(start, end)
+      // Tree cover mask and area from Dynamic World mode
+      const treeMode = treeCollection
+        .filterDate(startDate, endDate)
         .mode()
-        .eq(1)
+        .eq(1) // 1 = tree class in Dynamic World
         .selfMask();
-      const treeArea = treeMask.multiply(pixelArea).rename('tree_m2');
+      const treeArea = treeMode.multiply(pixelArea).rename('tree_m2');
 
-      const totalArea = pixelArea.clip(geometry).reduceRegion({
+      // Total area of ward polygon in m2
+      const totalArea = pixelArea.clip(geometry);
+
+      // Use reduceRegion for NDVI mean and sums for built and tree
+      const reducers = ee.Reducer.mean().combine({
+        reducer2: ee.Reducer.sum(),
+        sharedInputs: true
+      });
+
+      const ndviMean = await ndvi.reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry,
+        scale: 10,
+        maxPixels: 1e13
+      }).getInfo();
+
+      const builtSum = await builtArea.reduceRegion({
         reducer: ee.Reducer.sum(),
         geometry,
         scale: 10,
         maxPixels: 1e13
-      });
+      }).getInfo();
 
-      const [ndviMean, builtStats, treeStats, totalStats] = await Promise.all([
-        ndvi.reduceRegion({
-          reducer: ee.Reducer.mean(),
-          geometry,
-          scale: 10,
-          maxPixels: 1e13
-        }).getInfo(),
-        builtArea.reduceRegion({
-          reducer: ee.Reducer.sum(),
-          geometry,
-          scale: 10,
-          maxPixels: 1e13
-        }).getInfo(),
-        treeArea.reduceRegion({
-          reducer: ee.Reducer.sum(),
-          geometry,
-          scale: 10,
-          maxPixels: 1e13
-        }).getInfo(),
-        totalArea.getInfo()
-      ]);
+      const treeSum = await treeArea.reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry,
+        scale: 10,
+        maxPixels: 1e13
+      }).getInfo();
 
-      const total_m2 = totalStats['area'] || totalStats['sum'] || 1; // check keys here!
+      const totalSum = await totalArea.reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry,
+        scale: 10,
+        maxPixels: 1e13
+      }).getInfo();
+
+      const totalM2 = totalSum.area || totalSum.sum || 1;
 
       trend.push({
-        year: y,
-        ndvi: ndviMean.NDVI || 0,
-        tree_pct: ((treeStats.tree_m2 || 0) / total_m2) * 100,
-        built_pct: ((builtStats.built_m2 || 0) / total_m2) * 100
+        year,
+        ndvi: ndviMean.NDVI ?? null,
+        tree_pct: (treeSum.tree_m2 ?? 0) / totalM2 * 100,
+        built_pct: (builtSum.built_m2 ?? 0) / totalM2 * 100
       });
     }
 
     res.setHeader('Cache-Control', 'public, max-age=86400');
     res.json({
-      ward: wardName,
+      ward: wardNameRaw,
       trend,
       updated: new Date().toISOString()
     });
-  } catch (err) {
-    console.error('❌ /ward-trend error:', err);
-    res.status(500).json({ error: 'Ward trend error', details: err.message });
+
+  } catch (error) {
+    console.error('❌ /ward-trend error:', error);
+    res.status(500).json({
+      error: 'Internal server error while processing ward trend',
+      details: error.message
+    });
   }
 });
 
