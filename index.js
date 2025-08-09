@@ -74,9 +74,10 @@ async function withRetry(eeObject, retries = 3, delayMs = 2000) {
 function startServer() {
   const wards = ee.FeatureCollection("projects/greenmap-backend/assets/nairobi_wards_filtered");
   function getWardGeometryByName(wardName) {
-  const normalized = wardName.trim().toLowerCase();
-  return wards.filter(ee.Filter.eq('NAME_3', ee.String(normalized).capitalize())).first().geometry();
-}
+    if (!wardName) return null;
+    const normalized = wardName.trim();
+    return wards.filter(ee.Filter.eq('NAME_3', normalized)).first().geometry();
+  }
   function getNDVI(start, end) {
   // Sentinel-2 collection
   const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
@@ -516,70 +517,70 @@ app.get('/wards', async (req, res) => {
 
  const pixelArea = ee.Image.pixelArea();
 
-// Reduce NDVI and other stats per ward
-const results = wards.map(function (ward) {
-  const geom = ward.geometry();
+ // Reduce NDVI and other stats per ward
+ const results = wards.map(function (ward) {
+   const geom = ward.geometry();
 
-  const ndvi_now_mean = ndvi_now.reduceRegion({
-    reducer: ee.Reducer.mean(),
-    geometry: geom,
-    scale: 10,
-    maxPixels: 1e13
-  }).get('NDVI_NOW');
+   const ndvi_now_mean = ndvi_now.reduceRegion({
+     reducer: ee.Reducer.mean(),
+     geometry: geom,
+     scale: 10,
+     maxPixels: 1e13
+   }).get('NDVI_NOW');
 
-  const ndvi_past_mean = ndvi_past.reduceRegion({
-    reducer: ee.Reducer.mean(),
-    geometry: geom,
-    scale: 10,
-    maxPixels: 1e13
-  }).get('NDVI_PAST');
+   const ndvi_past_mean = ndvi_past.reduceRegion({
+     reducer: ee.Reducer.mean(),
+     geometry: geom,
+     scale: 10,
+     maxPixels: 1e13
+   }).get('NDVI_PAST');
 
-  const lst_mean = lst.reduceRegion({
-    reducer: ee.Reducer.mean(),
-    geometry: geom,
-    scale: 1000,
-    maxPixels: 1e13
-  }).get('LST_C');
+   const lst_mean = lst.reduceRegion({
+     reducer: ee.Reducer.mean(),
+     geometry: geom,
+     scale: 1000,
+     maxPixels: 1e13
+   }).get('LST_C');
 
-  const rain_now_total = rain_now.reduceRegion({
-    reducer: ee.Reducer.sum(),
-    geometry: geom,
-    scale: 5000,
-    maxPixels: 1e13
-  }).get('Rain_Current');
+   const rain_now_total = rain_now.reduceRegion({
+     reducer: ee.Reducer.sum(),
+     geometry: geom,
+     scale: 5000,
+     maxPixels: 1e13
+   }).get('Rain_Current');
 
-  const rain_past_total = rain_past.reduceRegion({
-    reducer: ee.Reducer.sum(),
-    geometry: geom,
-    scale: 5000,
-    maxPixels: 1e13
-  }).get('Rain_Past');
+   const rain_past_total = rain_past.reduceRegion({
+     reducer: ee.Reducer.sum(),
+     geometry: geom,
+     scale: 5000,
+     maxPixels: 1e13
+   }).get('Rain_Past');
 
-  const rain_anomaly_val = rain_anomaly.reduceRegion({
-    reducer: ee.Reducer.mean(),
-    geometry: geom,
-    scale: 5000,
-    maxPixels: 1e13
-  }).get('Rain_Anomaly');
+   const rain_anomaly_val = rain_anomaly.reduceRegion({
+     reducer: ee.Reducer.mean(),
+     geometry: geom,
+     scale: 5000,
+     maxPixels: 1e13
+   }).get('Rain_Anomaly');
 
-  return ward.set({
-    'NDVI_NOW': ndvi_now_mean,
-    'NDVI_PAST': ndvi_past_mean,
-    'LST_C': lst_mean,
-    'Rain_Current': rain_now_total,
-    'Rain_Past': rain_past_total,
-    'Rain_Anomaly': rain_anomaly_val
-  });
-});
-try {
-  const data = await withRetry(results, 3, 2000); // Retry up to 3 times with 2s delay
-  console.log("✅ /wards returned features:", data?.features?.length);
-  res.setHeader('Cache-Control', 'public, max-age=900');
-  res.json(data);
-} catch (err) {
-  console.error("❌ /wards error:", err);
-  res.status(500).json({ error: 'Failed to compute ward stats', details: err.message });
-}
+   return ward.set({
+     'NDVI_NOW': ndvi_now_mean,
+     'NDVI_PAST': ndvi_past_mean,
+     'LST_C': lst_mean,
+     'Rain_Current': rain_now_total,
+     'Rain_Past': rain_past_total,
+     'Rain_Anomaly': rain_anomaly_val
+   });
+ });
+ try {
+   const data = await withRetry(results, 3, 2000); // Retry up to 3 times with 2s delay
+   console.log("✅ /wards returned features:", data?.features?.length);
+   res.setHeader('Cache-Control', 'public, max-age=900');
+   res.json(data);
+ } catch (err) {
+   console.error("❌ /wards error:", err);
+   res.status(500).json({ error: 'Failed to compute ward stats', details: err.message });
+ }
 
 });
 app.get('/greencoverage', (req, res) => {
@@ -896,7 +897,7 @@ app.get('/charttrend', async (req, res) => {
         hasS2,
         s2median.select('B11').subtract(s2median.select('B8')).divide(s2median.select('B11').add(s2median.select('B8'))),
         ee.Image.constant(-1)
-      ));
+      )) ;
 
       // Built mask
       const builtMask = ndbiS2.gt(0).and(ndviS2.lt(0.3)).selfMask();
@@ -1125,4 +1126,3 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Backend running on http://localhost:${PORT}`);
 });
-}
