@@ -777,8 +777,7 @@ app.get('/treecanopy-stats', async (req, res) => {
     res.status(500).json({ error: 'Tree canopy trend stats failed', details: err.message });
   }
 });
-// Chart trend route - robust version with detailed logging and error detection
-// Chart trend route - optimized for Render speed
+// charttrend route - per-year evaluation to avoid long EE evaluate timeout
 app.get('/charttrend', async (req, res) => {
   const log = {
     info: (...args) => console.info('[charttrend][INFO]', ...args),
@@ -789,203 +788,172 @@ app.get('/charttrend', async (req, res) => {
   try {
     log.info('Request received for /charttrend');
 
-    // --- Early check: make sure asset exists ---
-    let wardsFC;
-    try {
-      wardsFC = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered');
-      await new Promise((resolve, reject) => {
-        wardsFC.limit(1).evaluate((res, err) => {
-          if (err) return reject(err);
-          resolve(res);
-        });
-      });
-    } catch (assetErr) {
-      log.error('Nairobi wards asset missing or inaccessible:', assetErr);
-      return res.status(404).json({ error: 'Nairobi wards asset not found' });
-    }
-
-    const nairobi = wardsFC.union().geometry();
-
-    // Last 5 years (lighter load)
-    const startYear = new Date().getFullYear() - 4;
+    // ---- Config ----
+    const wardsAsset = 'projects/greenmap-backend/assets/nairobi_wards_filtered'; // your wards asset
+    const perYearTimeoutMs = 16000; // 16s per year (tweak if needed)
+    const startYear = new Date().getFullYear() - 6; // last 7 years
     const endYear = new Date().getFullYear();
 
-    // --- Metric functions ---
+    // ---- load and union wards into one geometry ----
+    let nairobi;
+    try {
+      const wardsFc = ee.FeatureCollection(wardsAsset);
+      // union() merges features; keep it to avoid missing geometry errors
+      nairobi = wardsFc.union().geometry();
+      log.info('Loaded and unioned wards asset:', wardsAsset);
+    } catch (err) {
+      log.error('Failed to load/union wards asset:', String(err));
+      return res.status(500).json({ error: 'Failed to load wards asset', details: String(err) });
+    }
+
+    // ---- EE helper functions that return ee.Number/ee.Image results ----
     function getYearlyNDVI(year) {
       const start = ee.Date.fromYMD(year, 1, 1);
       const end = start.advance(1, 'year');
-      const img = ee.ImageCollection('MODIS/061/MOD13Q1')
+      const ndvi = ee.ImageCollection('MODIS/061/MOD13Q1')
         .filterDate(start, end)
         .select('NDVI')
         .mean()
         .multiply(0.0001);
-      return img.reduceRegion({
-        reducer: ee.Reducer.mean(),
-        geometry: nairobi,
-        scale: 500, // Was 250
-        bestEffort: true
-      }).get('NDVI');
+      return ndvi.reduceRegion({ reducer: ee.Reducer.mean(), geometry: nairobi, scale: 250, bestEffort: true }).get('NDVI');
     }
 
     function getYearlyTree(year) {
       const start = ee.Date.fromYMD(year, 1, 1);
       const end = start.advance(1, 'year');
-      const img = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+      const dw = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
         .filterDate(start, end)
         .select('label')
-        .map(i => i.eq(1))
+        .map(img => img.eq(1))
         .mean();
-      return img.reduceRegion({
-        reducer: ee.Reducer.mean(),
-        geometry: nairobi,
-        scale: 10,
-        bestEffort: true
-      }).get('label');
+      return dw.reduceRegion({ reducer: ee.Reducer.mean(), geometry: nairobi, scale: 10, bestEffort: true }).get('label');
     }
 
     function getYearlyBuiltup(year) {
       const start = ee.Date.fromYMD(year, 1, 1);
       const end = start.advance(1, 'year');
-      const img = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
         .filterDate(start, end)
         .filterBounds(nairobi)
-        .map(i => {
-          const ndvi = i.normalizedDifference(['B8', 'B4']);
-          const ndwi = i.normalizedDifference(['B3', 'B11']);
+        .map(img => {
+          const ndvi = img.normalizedDifference(['B8', 'B4']);
+          const ndwi = img.normalizedDifference(['B3', 'B11']);
           return ndwi.subtract(ndvi).rename('NDBI');
         })
-        .median(); // Faster
-      return img.reduceRegion({
-        reducer: ee.Reducer.mean(),
-        geometry: nairobi,
-        scale: 30, // Was 10
-        bestEffort: true
-      }).get('NDBI');
+        .mean();
+      return s2.reduceRegion({ reducer: ee.Reducer.mean(), geometry: nairobi, scale: 10, bestEffort: true }).get('NDBI');
     }
 
     function getYearlyLST(year) {
       const start = ee.Date.fromYMD(year, 1, 1);
       const end = start.advance(1, 'year');
-      const img = ee.ImageCollection('MODIS/061/MOD11A2')
+      const lst = ee.ImageCollection('MODIS/061/MOD11A2')
         .filterDate(start, end)
         .select('LST_Day_1km')
         .mean()
         .multiply(0.02)
         .subtract(273.15);
-      return img.reduceRegion({
-        reducer: ee.Reducer.mean(),
-        geometry: nairobi,
-        scale: 1000,
-        bestEffort: true
-      }).get('LST_Day_1km');
+      return lst.reduceRegion({ reducer: ee.Reducer.mean(), geometry: nairobi, scale: 1000, bestEffort: true }).get('LST_Day_1km');
     }
 
     function getYearlyRain(year) {
       const start = ee.Date.fromYMD(year, 1, 1);
       const end = start.advance(1, 'year');
-      const img = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+      const rain = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
         .filterDate(start, end)
         .select('precipitation')
         .sum();
-      return img.reduceRegion({
-        reducer: ee.Reducer.mean(),
-        geometry: nairobi,
-        scale: 5000,
-        bestEffort: true
-      }).get('precipitation');
+      return rain.reduceRegion({ reducer: ee.Reducer.mean(), geometry: nairobi, scale: 5000, bestEffort: true }).get('precipitation');
     }
 
-    // --- Collect data ---
-    const years = [];
-    const ndviVals = [];
-    const treeVals = [];
-    const builtupVals = [];
-    const lstVals = [];
-    const rainVals = [];
-
-    for (let y = startYear; y <= endYear; y++) {
-      years.push(y);
-      const t0 = Date.now();
-      ndviVals.push(getYearlyNDVI(y));
-      log.info(`NDVI ${y} queued in ${Date.now() - t0}ms`);
-      treeVals.push(getYearlyTree(y));
-      builtupVals.push(getYearlyBuiltup(y));
-      lstVals.push(getYearlyLST(y));
-      rainVals.push(getYearlyRain(y));
-    }
-
-    log.info(`Prepared EE lists for years ${startYear}..${endYear} (count=${years.length}). Calling evaluate()`);
-
-    // --- Evaluate with timeout ---
-    const evaluateAsync = (eeObject, timeoutMs = 120000) => new Promise((resolve, reject) => {
-      let finished = false;
-      eeObject.evaluate((result, err) => {
-        finished = true;
-        if (err) return reject(err);
-        resolve(result);
+    // Helper to create a per-year ee.Dictionary (keys are lower-case)
+    function makeYearDict(y) {
+      return ee.Dictionary({
+        year: y,
+        ndvi: getYearlyNDVI(y),
+        tree: getYearlyTree(y),
+        builtup: getYearlyBuiltup(y),
+        lst: getYearlyLST(y),
+        rainfall: getYearlyRain(y)
       });
+    }
+
+    // evaluate wrapper with timeout
+    const evaluateAsync = (eeObj, timeoutMs = perYearTimeoutMs) => new Promise((resolve, reject) => {
+      let finished = false;
+      try {
+        eeObj.evaluate((result, err) => {
+          finished = true;
+          if (err) {
+            return reject(err);
+          }
+          return resolve(result);
+        });
+      } catch (e) {
+        finished = true;
+        return reject(e);
+      }
       setTimeout(() => {
-        if (!finished) reject(new Error(`EE evaluate timed out after ${timeoutMs}ms`));
+        if (!finished) {
+          const msg = `EE evaluate timed out after ${timeoutMs}ms`;
+          return reject(new Error(msg));
+        }
       }, timeoutMs);
     });
 
-    const allData = ee.Dictionary({
-      years: years,
-      ndvi: ee.List(ndviVals),
-      tree: ee.List(treeVals),
-      builtup: ee.List(builtupVals),
-      lst: ee.List(lstVals),
-      rainfall: ee.List(rainVals)
-    });
+    // ---- Sequentially evaluate each year's dictionary ----
+    const years = [];
+    const ndvi = [];
+    const rainfall = [];
+    const builtup = [];
+    const tree = [];
+    const lst = [];
 
-    let rawResult;
-    try {
-      rawResult = await evaluateAsync(allData);
-    } catch (eeErr) {
-      log.error('Earth Engine evaluation failed:', eeErr);
-      return res.status(502).json({ error: 'Earth Engine evaluation failed', details: String(eeErr) });
-    }
+    log.info(`Preparing per-year evaluations for ${startYear}..${endYear} (count=${endYear - startYear + 1})`);
 
-    if (!rawResult) {
-      log.error('Empty result from EE');
-      return res.status(502).json({ error: 'Empty result from Earth Engine' });
-    }
-
-    // --- Normalize arrays ---
-    const normalizeArray = (arr, expectedLen) => {
-      if (!Array.isArray(arr)) {
-        return Array.from({ length: expectedLen }, () => arr ?? null);
+    for (let y = startYear; y <= endYear; y++) {
+      years.push(y);
+      const eeDict = makeYearDict(y);
+      try {
+        log.info(`Queuing evaluate for year ${y}`);
+        const r = await evaluateAsync(eeDict, perYearTimeoutMs);
+        // r is an object like { year: 2021, ndvi: <num or null>, ... } or may contain string values
+        const toNumOrNull = v => {
+          if (v === null || v === undefined || v === '') return null;
+          const n = Number(v);
+          return Number.isFinite(n) ? n : null;
+        };
+        ndvi.push(toNumOrNull(r.ndvi ?? r.NDVI));
+        rainfall.push(toNumOrNull(r.rainfall ?? r.rain));
+        builtup.push(toNumOrNull(r.builtup ?? r.NDBI));
+        tree.push(toNumOrNull(r.tree ?? r.trees ?? r.tree_vals));
+        lst.push(toNumOrNull(r.lst ?? r.LST));
+        log.info(`Year ${y} result: ndvi=${ndvi[ndvi.length-1]}, rain=${rainfall[rainfall.length-1]}`);
+      } catch (err) {
+        // log and insert nulls for this year (do not abort entire request)
+        log.error(`Year ${y} evaluation failed:`, String(err));
+        ndvi.push(null);
+        rainfall.push(null);
+        builtup.push(null);
+        tree.push(null);
+        lst.push(null);
       }
-      return arr.map(v => {
-        const n = Number(v);
-        return Number.isFinite(n) ? n : null;
-      });
-    };
+    }
 
-    const n = years.length;
-    const payload = {
-      years,
-      ndvi: normalizeArray(rawResult.ndvi, n),
-      tree: normalizeArray(rawResult.tree, n),
-      builtup: normalizeArray(rawResult.builtup, n),
-      lst: normalizeArray(rawResult.lst, n),
-      rainfall: normalizeArray(rawResult.rainfall, n)
-    };
+    const payload = { years, ndvi, rainfall, builtup, tree, lst };
 
+    // quick payload summary for logs (small)
     log.info('Returning charttrend payload summary:', {
       years_count: payload.years.length,
-      ndvi_sample: payload.ndvi.slice(0, 2),
-      tree_sample: payload.tree.slice(0, 2),
-      builtup_sample: payload.builtup.slice(0, 2),
-      lst_sample: payload.lst.slice(0, 2),
-      rainfall_sample: payload.rainfall.slice(0, 2)
+      ndvi_sample: payload.ndvi.slice(0, 3),
+      rainfall_sample: payload.rainfall.slice(0, 3),
+      builtup_sample: payload.builtup.slice(0, 3)
     });
 
-    res.json(payload);
-
+    return res.json(payload);
   } catch (error) {
-    console.error('[charttrend][FATAL] Uncaught error:', error);
-    res.status(500).json({ error: 'Internal server error generating charttrend', details: String(error) });
+    console.error('[charttrend][FATAL] Uncaught error:', error && error.stack ? error.stack : error);
+    return res.status(500).json({ error: 'Internal server error generating charttrend', details: String(error) });
   }
 });
 
