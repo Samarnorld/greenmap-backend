@@ -1047,26 +1047,35 @@ app.get('/ward-trend', async (req, res) => {
       // Prepare NDVI and built-up images with fallbacks
       let ndviImg;
       let builtMaskImg;
+      let ndviScale = 10;
+      let builtScale = 10;
 
       if (s2Size > 0) {
         // Use Sentinel-2 median (preferred)
         const median = s2.median().clip(geometry);
-        ndviImg = median.normalizedDifference(['B8', 'B4']).rename('NDVI');
+        // compute NDVI and mask extreme invalid NDVI (< -0.2)
+        ndviImg = median.normalizedDifference(['B8', 'B4']).rename('NDVI').updateMask(median.select('B8').add(median.select('B4')).neq(0));
+        ndviImg = ndviImg.updateMask(ndviImg.gte(-0.2));
+        // NDBI for built-up
         const swir = median.select('B11');
         const nir = median.select('B8');
         const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
         builtMaskImg = ndbi.gt(0).and(ndviImg.lt(0.3)).selfMask();
+        ndviScale = 10;
+        builtScale = 10;
       } else if (lsSize > 0) {
         // Use Landsat-7 median (fallback)
         const median = landsat.median().clip(geometry);
-        ndviImg = median.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+        ndviImg = median.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI').updateMask(median.select('SR_B5').add(median.select('SR_B4')).neq(0));
+        ndviImg = ndviImg.updateMask(ndviImg.gte(-0.2));
         const swir = median.select('SR_B7');
         const nir = median.select('SR_B5');
         const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
         builtMaskImg = ndbi.gt(0).and(ndviImg.lt(0.3)).selfMask();
+        ndviScale = 10;
+        builtScale = 10;
       } else {
-        // No S2 or Landsat for this ward/year:
-        // 1) Use MODIS NDVI as a reliable NDVI fallback (MODIS exists historically)
+        // No S2 or Landsat for this ward/year: use MODIS NDVI as a fallback (with scaling & masking)
         ndviImg = ee.ImageCollection('MODIS/061/MOD13Q1')
           .filterDate(start, end)
           .select('NDVI')
@@ -1074,10 +1083,12 @@ app.get('/ward-trend', async (req, res) => {
           .multiply(0.0001)
           .rename('NDVI')
           .clip(geometry);
-
-        // 2) Use an NDVI-threshold proxy for built-up where SWIR not available.
-        //    Tune this threshold (0.12) to your data/expectation: lower -> fewer built pixels.
-        builtMaskImg = ndviImg.lt(0.12).selfMask();
+        // mask obviously-invalid low values in MODIS (these can be artifacts / fill)
+        ndviImg = ndviImg.updateMask(ndviImg.gte(-0.2));
+        // conservative built-proxy from NDVI when SWIR not available; exclude extreme negatives
+        builtMaskImg = ndviImg.lt(0.12).and(ndviImg.gte(-0.2)).selfMask();
+        ndviScale = 250;   // MODIS resolution
+        builtScale = 250;
       }
 
       // Tree mask (Dynamic World) — unchanged
@@ -1097,42 +1108,107 @@ app.get('/ward-trend', async (req, res) => {
         maxPixels: 1e13
       });
 
-      // Reduce the stats for this year in parallel
-      const [ndviMean, builtStats, treeStats, totalStats] = await Promise.all([
-        ndviImg.reduceRegion({
-          reducer: ee.Reducer.mean(),
-          geometry,
-          scale: 10,
-          maxPixels: 1e13
-        }).getInfo(),
-        builtArea.reduceRegion({
-          reducer: ee.Reducer.sum(),
-          geometry,
-          scale: 10,
-          maxPixels: 1e13
-        }).getInfo(),
-        treeArea.reduceRegion({
-          reducer: ee.Reducer.sum(),
-          geometry,
-          scale: 10,
-          maxPixels: 1e13
-        }).getInfo(),
-        totalArea.getInfo()
+      // Use your withRetry helper for robustness on getInfo calls
+      const [
+        ndviMeanObj,
+        builtStats,
+        treeStats,
+        totalStats
+      ] = await Promise.all([
+        // run NDVI reduce with the correct scale (and tolerate null)
+        (async () => {
+          try {
+            return await withRetry(ndviImg.reduceRegion({
+              reducer: ee.Reducer.mean(),
+              geometry,
+              scale: ndviScale,
+              maxPixels: 1e13
+            }));
+          } catch (e) {
+            return null;
+          }
+        })(),
+        (async () => {
+          try {
+            return await withRetry(builtArea.reduceRegion({
+              reducer: ee.Reducer.sum(),
+              geometry,
+              scale: builtScale,
+              maxPixels: 1e13
+            }));
+          } catch (e) {
+            return null;
+          }
+        })(),
+        (async () => {
+          try {
+            return await withRetry(treeArea.reduceRegion({
+              reducer: ee.Reducer.sum(),
+              geometry,
+              scale: 10,
+              maxPixels: 1e13
+            }));
+          } catch (e) {
+            return null;
+          }
+        })(),
+        (async () => {
+          try {
+            return await withRetry(totalArea);
+          } catch (e) {
+            return null;
+          }
+        })()
       ]);
 
-      const total_m2 = (totalStats && (totalStats['area'] || totalStats['sum'])) ? (totalStats['area'] || totalStats['sum']) : 1;
+      // extract & sanitize numbers
+      let ndviValue = (ndviMeanObj && typeof ndviMeanObj.NDVI !== 'undefined') ? Number(ndviMeanObj.NDVI) : null;
 
-      // Safely pull NDVI value (may be null if reduction failed)
-      const ndviValue = (ndviMean && (ndviMean.NDVI !== undefined && ndviMean.NDVI !== null)) ? ndviMean.NDVI : null;
-      const tree_m2 = (treeStats && treeStats.tree_m2) ? treeStats.tree_m2 : 0;
-      const built_m2 = (builtStats && builtStats.built_m2) ? builtStats.built_m2 : 0;
+      // If NDVI is missing or hugely negative (artifact), attempt a MODIS fallback (only if we didn't already use it)
+      if ((ndviValue === null || ndviValue < -0.2) && (s2Size > 0 || lsSize > 0)) {
+        try {
+          const modisFallback = ee.ImageCollection('MODIS/061/MOD13Q1')
+            .filterDate(start, end)
+            .select('NDVI')
+            .mean()
+            .multiply(0.0001)
+            .rename('NDVI')
+            .clip(geometry);
+
+          const modisObj = await withRetry(modisFallback.reduceRegion({
+            reducer: ee.Reducer.mean(),
+            geometry,
+            scale: 250,
+            maxPixels: 1e13
+          }));
+
+          if (modisObj && typeof modisObj.NDVI !== 'undefined' && modisObj.NDVI !== null && Number(modisObj.NDVI) >= -0.2) {
+            ndviValue = Number(modisObj.NDVI);
+          }
+        } catch (e) {
+          // ignore fallback error — keep original ndviValue (null or low)
+        }
+      }
+
+      // built & tree numbers
+      const tree_m2 = treeStats && treeStats.tree_m2 ? Number(treeStats.tree_m2) : 0;
+      const built_m2 = builtStats && builtStats.built_m2 ? Number(builtStats.built_m2) : 0;
+      const total_m2 = totalStats && (totalStats.area || totalStats.sum) ? Number(totalStats.area || totalStats.sum) : 1;
+
+      // compute percentages safely and clamp into 0..100
+      let tree_pct = total_m2 > 0 ? (tree_m2 / total_m2) * 100 : 0;
+      let built_pct = total_m2 > 0 ? (built_m2 / total_m2) * 100 : 0;
+      if (!isFinite(tree_pct) || tree_pct < 0) tree_pct = 0;
+      if (!isFinite(built_pct) || built_pct < 0) built_pct = 0;
+      if (tree_pct > 100) tree_pct = 100;
+      if (built_pct > 100) built_pct = 100;
 
       trend.push({
         year: y,
-        // keep null or 0 per your UI needs — here I return null if NDVI not computed
-        ndvi: ndviValue === null ? 0 : ndviValue,
-        tree_pct: (tree_m2 / total_m2) * 100,
-        built_pct: (built_m2 / total_m2) * 100
+        // return NDVI value if available, otherwise null (or 0 if you prefer)
+        ndvi: ndviValue === null ? 0 : Number(ndviValue),
+        tree_pct,
+        built_pct
       });
     } // for years
 
