@@ -354,132 +354,150 @@ serveTile(builtClipped, {
 }, res);
 
 });
-app.get('/builtup-stats', (req, res) => {
+app.get('/builtup-stats', async (req, res) => {
   console.log("📊 /builtup-stats called");
-  let currentDate, pastDate;
 
-  if (req.query.year) {
-    const y = parseInt(req.query.year);
-    pastDate = ee.Date.fromYMD(y, 1, 1);
-    currentDate = ee.Date.fromYMD(y, 12, 31);
-  } else {
-    currentDate = ee.Date(Date.now());
-    pastDate = currentDate.advance(-1, 'year');
-  }
-
-  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-    .filterBounds(wards)
-    .filterDate(pastDate, currentDate)
-    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10));
-
-  const safeImage = ee.Algorithms.If(
-    s2.size().gt(0),
-    s2.median().clip(wards),
-    ee.Image.constant(0).updateMask(ee.Image.constant(0)).clip(wards)
-  );
-
-  const image = ee.Image(safeImage);
-  const swir = image.select('B11');
-  const nir = image.select('B8');
-  const red = image.select('B4');
-
-  const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
-  const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
-
-  const pixelArea = ee.Image.pixelArea();
-  const greenMask = ndvi.gt(0.3);
-  const builtMask = ndbi.gt(0).and(ndvi.lte(0.3)).and(greenMask.not()).selfMask();
-
-  // Overlap (built and green) area just for diagnostics
-  const overlap = greenMask.and(builtMask).selfMask();
-  const overlapAreaImage = overlap.multiply(pixelArea).rename('overlap_m2');
-  const overlapArea = overlapAreaImage.reduceRegion({
-    reducer: ee.Reducer.sum(),
-    geometry: wards.geometry(),
-    scale: 10,
-    maxPixels: 1e13
-  });
-
-  overlapArea.getInfo((overlapRes, err) => {
-    if (err) {
-      console.error("❌ Overlap check failed:", err);
-    } else {
-      const m2 = overlapRes['overlap_m2'] || 0;
-      console.log(`⚠️ Overlapping green+built area: ${(m2 / 1e6).toFixed(2)} km²`);
-    }
-  });
-
-  const builtAreaImage = builtMask.multiply(pixelArea).rename('built_m2');
-
-  const builtPerWard = builtAreaImage.reduceRegions({
-    collection: wards,
-    reducer: ee.Reducer.sum(),
-    scale: 10
-  }).map(f => {
-    const wardArea = f.geometry().area(10); // accurate ward area in m²
-    const built_m2 = ee.Number(f.get('sum'));
-    const built_pct = built_m2.divide(wardArea).multiply(100);
-    return f.set({
-      built_m2,
-      ward_area_m2: wardArea,
-      built_pct
-    });
-  });
-
-  const totalBuilt = builtAreaImage.reduceRegion({
-    reducer: ee.Reducer.sum(),
-    geometry: wards.geometry(),
-    scale: 10,
-    maxPixels: 1e13
-  });
-
-  const totalArea = pixelArea.rename('area').clip(wards).reduceRegion({
-    reducer: ee.Reducer.sum(),
-    geometry: wards.geometry(),
-    scale: 10,
-    maxPixels: 1e13
-  });
-
-  builtPerWard.getInfo((wardStats, err1) => {
-    if (err1) {
-      console.error('❌ Built-up ward stats error:', err1);
-      return res.status(500).json({ error: 'Failed to compute built-up per ward', details: err1 });
+  try {
+    if (!wards) {
+      console.error('❌ Error: `wards` FeatureCollection is undefined');
+      return res.status(500).json({ error: '`wards` FeatureCollection is not initialized' });
     }
 
-    totalBuilt.getInfo((builtRes, err2) => {
-      if (err2) {
-        console.error('❌ Built-up total error:', err2);
-        return res.status(500).json({ error: 'Failed to compute total built-up area', details: err2 });
+    // Parse year query param or default to last year
+    let currentDate, pastDate;
+    if (req.query.year) {
+      const y = parseInt(req.query.year);
+      if (isNaN(y) || y < 2000 || y > new Date().getFullYear()) {
+        return res.status(400).json({ error: 'Invalid year parameter' });
       }
+      pastDate = ee.Date.fromYMD(y, 1, 1);
+      currentDate = ee.Date.fromYMD(y, 12, 31);
+    } else {
+      currentDate = ee.Date(Date.now());
+      pastDate = currentDate.advance(-1, 'year');
+    }
 
-      totalArea.getInfo((areaRes, err3) => {
-        if (err3) {
-          console.error('❌ Total area error:', err3);
-          return res.status(500).json({ error: 'Failed to compute total Nairobi area', details: err3 });
-        }
+    // Filter Sentinel-2 imagery
+    const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      .filterBounds(wards)
+      .filterDate(pastDate, currentDate)
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10));
 
-        const built_m2 = builtRes['built_m2'];
-        const total_m2 = areaRes['area'];
-        const built_pct = (built_m2 / total_m2) * 100;
+    // Use median image or fallback empty image
+    const safeImage = ee.Algorithms.If(
+      s2.size().gt(0),
+      s2.median().clip(wards),
+      ee.Image.constant(0).updateMask(ee.Image.constant(0)).clip(wards)
+    );
 
-        if (res.headersSent) return;
+    const image = ee.Image(safeImage);
+    const swir = image.select('B11');
+    const nir = image.select('B8');
+    const red = image.select('B4');
 
-        res.setHeader('Cache-Control', 'public, max-age=3600');
-        res.json({
-          updated: new Date().toISOString(),
-          city_built_m2: built_m2,
-          city_total_m2: total_m2,
-          city_built_pct: built_pct,
-          per_ward: (wardStats.features || []).map(w => ({
-            ward: w.properties.wards || w.properties.NAME_3 || 'Unknown',
-            built_m2: w.properties.built_m2,
-            ward_area_m2: w.properties.ward_area_m2,
-            built_pct: w.properties.built_pct
-          }))
-        });
+    // Calculate indices
+    const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
+    const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+
+    // Pixel area for area calculations
+    const pixelArea = ee.Image.pixelArea();
+
+    // Define built-up mask (NDBI > 0, NDVI ≤ 0.3, excluding green)
+    const greenMask = ndvi.gt(0.3);
+    const builtMask = ndbi.gt(0).and(ndvi.lte(0.3)).and(greenMask.not()).selfMask();
+
+    // Calculate built-up area per ward
+    const builtAreaImage = builtMask.multiply(pixelArea).rename('built_m2');
+
+    const builtPerWard = builtAreaImage.reduceRegions({
+      collection: wards,
+      reducer: ee.Reducer.sum(),
+      scale: 10,
+      tileScale: 4 // help with large geometries
+    }).map(f => {
+      const wardArea = f.geometry().area(10); // ward area in m²
+      const built_m2 = ee.Number(f.get('sum')).max(0); // ensure no negative
+      const built_pct = built_m2.divide(wardArea).multiply(100);
+      return f.set({
+        built_m2,
+        ward_area_m2: wardArea,
+        built_pct
       });
     });
-  });
+
+    // Calculate total built-up and total area for all wards
+    const totalBuilt = builtAreaImage.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: wards.geometry(),
+      scale: 10,
+      maxPixels: 1e13
+    });
+
+    const totalArea = pixelArea.rename('area').reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: wards.geometry(),
+      scale: 10,
+      maxPixels: 1e13
+    });
+
+    // Wrap all EE getInfo calls in Promises for async/await
+
+    const getInfoAsync = (eeObject) =>
+      new Promise((resolve, reject) => {
+        eeObject.getInfo((result, error) => {
+          if (error) reject(error);
+          else resolve(result);
+        });
+      });
+
+    // Fetch all results concurrently
+    const [wardStats, builtRes, areaRes] = await Promise.all([
+      getInfoAsync(builtPerWard),
+      getInfoAsync(totalBuilt),
+      getInfoAsync(totalArea)
+    ]);
+
+    // Defensive checks
+    if (!wardStats || !wardStats.features) {
+      console.warn('⚠️ Warning: builtPerWard returned no features');
+      return res.status(500).json({ error: 'No ward stats features found' });
+    }
+    if (!builtRes || builtRes['built_m2'] === undefined) {
+      console.warn('⚠️ Warning: total built-up area missing');
+      return res.status(500).json({ error: 'Total built-up area missing' });
+    }
+    if (!areaRes || areaRes['area'] === undefined) {
+      console.warn('⚠️ Warning: total area missing');
+      return res.status(500).json({ error: 'Total area missing' });
+    }
+
+    // Format per-ward stats with numbers only
+    const perWard = wardStats.features.map(f => ({
+      ward: f.properties.NAME_3 || f.properties.wards || 'Unknown',
+      built_m2: Number(f.properties.built_m2) || 0,
+      ward_area_m2: Number(f.properties.ward_area_m2) || 0,
+      built_pct: Number(f.properties.built_pct) || 0
+    }));
+
+    // Calculate city built percentage
+    const cityBuiltM2 = Number(builtRes['built_m2']) || 0;
+    const cityTotalM2 = Number(areaRes['area']) || 0;
+    const cityBuiltPct = cityTotalM2 > 0 ? (cityBuiltM2 / cityTotalM2) * 100 : 0;
+
+    // Send final JSON response
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.json({
+      updated: new Date().toISOString(),
+      city_built_m2: cityBuiltM2,
+      city_total_m2: cityTotalM2,
+      city_built_pct: cityBuiltPct,
+      features: perWard // Using 'features' key for frontend GeoJSON-like structure
+    });
+
+  } catch (error) {
+    console.error('❌ /builtup-stats unexpected error:', error);
+    res.status(500).json({ error: 'Internal server error', details: error.message || error });
+  }
 });
 
 app.get('/wards', async (req, res) => {
