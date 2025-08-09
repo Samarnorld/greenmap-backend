@@ -70,8 +70,7 @@ async function withRetry(eeObject, retries = 3, delayMs = 2000) {
   }
 }
 
-// Global wards FeatureCollection used by many endpoints
-const wards = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered');
+
 
 
 // Robust async ward geometry lookup. Returns an ee.Geometry or null.
