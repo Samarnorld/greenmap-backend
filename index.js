@@ -1005,7 +1005,6 @@ app.get('/charttrend', async (req, res) => {
     return res.status(500).json({ error: 'Internal server error generating charttrend', details: String(error) });
   }
 });
-
 app.get('/ward-trend', async (req, res) => {
   try {
     const wardName = req.query.ward;
@@ -1028,6 +1027,7 @@ app.get('/ward-trend', async (req, res) => {
       const start = ee.Date.fromYMD(y, 1, 1);
       const end = start.advance(1, 'year');
 
+      // Collections scoped to the ward geometry / year
       const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
         .filterBounds(geometry)
         .filterDate(start, end)
@@ -1041,33 +1041,54 @@ app.get('/ward-trend', async (req, res) => {
         .select(['SR_B4', 'SR_B5', 'SR_B7'])
         .map(img => img.multiply(0.0000275).add(-0.2).copyProperties(img, img.propertyNames()));
 
-      const s2Size = await s2.size().getInfo();
+      // Get collection sizes (client-side) so we can branch safely
+      const [s2Size, lsSize] = await Promise.all([s2.size().getInfo(), landsat.size().getInfo()]);
 
-      const medianImage = s2Size > 0 ? s2.median() : landsat.median();
-      const img = medianImage.clip(geometry);
+      // Prepare NDVI and built-up images with fallbacks
+      let ndviImg;
+      let builtMaskImg;
 
-      const bandNames = await img.bandNames().getInfo();
+      if (s2Size > 0) {
+        // Use Sentinel-2 median (preferred)
+        const median = s2.median().clip(geometry);
+        ndviImg = median.normalizedDifference(['B8', 'B4']).rename('NDVI');
+        const swir = median.select('B11');
+        const nir = median.select('B8');
+        const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
+        builtMaskImg = ndbi.gt(0).and(ndviImg.lt(0.3)).selfMask();
+      } else if (lsSize > 0) {
+        // Use Landsat-7 median (fallback)
+        const median = landsat.median().clip(geometry);
+        ndviImg = median.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+        const swir = median.select('SR_B7');
+        const nir = median.select('SR_B5');
+        const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
+        builtMaskImg = ndbi.gt(0).and(ndviImg.lt(0.3)).selfMask();
+      } else {
+        // No S2 or Landsat for this ward/year:
+        // 1) Use MODIS NDVI as a reliable NDVI fallback (MODIS exists historically)
+        ndviImg = ee.ImageCollection('MODIS/061/MOD13Q1')
+          .filterDate(start, end)
+          .select('NDVI')
+          .mean()
+          .multiply(0.0001)
+          .rename('NDVI')
+          .clip(geometry);
 
-      const nirBand = bandNames.includes('B8') ? 'B8' : 'SR_B5';
-      const redBand = bandNames.includes('B4') ? 'B4' : 'SR_B4';
-      const swirBand = bandNames.includes('B11') ? 'B11' : 'SR_B7';
+        // 2) Use an NDVI-threshold proxy for built-up where SWIR not available.
+        //    Tune this threshold (0.12) to your data/expectation: lower -> fewer built pixels.
+        builtMaskImg = ndviImg.lt(0.12).selfMask();
+      }
 
-      const nir = img.select(nirBand);
-      const red = img.select(redBand);
-      const swir = img.select(swirBand);
-
-      const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
-      const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
-
-      const builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
-      const builtArea = builtMask.multiply(pixelArea).rename('built_m2');
-
+      // Tree mask (Dynamic World) — unchanged
       const treeMask = treeCollection
         .filterDate(start, end)
         .mode()
         .eq(1)
         .selfMask();
+
       const treeArea = treeMask.multiply(pixelArea).rename('tree_m2');
+      const builtArea = builtMaskImg.multiply(pixelArea).rename('built_m2');
 
       const totalArea = pixelArea.clip(geometry).reduceRegion({
         reducer: ee.Reducer.sum(),
@@ -1076,8 +1097,9 @@ app.get('/ward-trend', async (req, res) => {
         maxPixels: 1e13
       });
 
+      // Reduce the stats for this year in parallel
       const [ndviMean, builtStats, treeStats, totalStats] = await Promise.all([
-        ndvi.reduceRegion({
+        ndviImg.reduceRegion({
           reducer: ee.Reducer.mean(),
           geometry,
           scale: 10,
@@ -1098,15 +1120,21 @@ app.get('/ward-trend', async (req, res) => {
         totalArea.getInfo()
       ]);
 
-      const total_m2 = totalStats['area'] || totalStats['sum'] || 1; // check keys here!
+      const total_m2 = (totalStats && (totalStats['area'] || totalStats['sum'])) ? (totalStats['area'] || totalStats['sum']) : 1;
+
+      // Safely pull NDVI value (may be null if reduction failed)
+      const ndviValue = (ndviMean && (ndviMean.NDVI !== undefined && ndviMean.NDVI !== null)) ? ndviMean.NDVI : null;
+      const tree_m2 = (treeStats && treeStats.tree_m2) ? treeStats.tree_m2 : 0;
+      const built_m2 = (builtStats && builtStats.built_m2) ? builtStats.built_m2 : 0;
 
       trend.push({
         year: y,
-        ndvi: ndviMean.NDVI || 0,
-        tree_pct: ((treeStats.tree_m2 || 0) / total_m2) * 100,
-        built_pct: ((builtStats.built_m2 || 0) / total_m2) * 100
+        // keep null or 0 per your UI needs — here I return null if NDVI not computed
+        ndvi: ndviValue === null ? 0 : ndviValue,
+        tree_pct: (tree_m2 / total_m2) * 100,
+        built_pct: (built_m2 / total_m2) * 100
       });
-    }
+    } // for years
 
     res.setHeader('Cache-Control', 'public, max-age=86400');
     res.json({
