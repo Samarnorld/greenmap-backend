@@ -1017,7 +1017,7 @@ app.get('/ward-trend', async (req, res) => {
 
     const pixelArea = ee.Image.pixelArea();
     const currentYear = new Date().getFullYear();
-    const yearsList = ee.List.sequence(2017, currentYear);
+    const yearsList = ee.List.sequence(2018, currentYear);
     const treeCollection = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').select('label');
 
     const yearList = await yearsList.getInfo();
