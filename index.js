@@ -354,150 +354,132 @@ serveTile(builtClipped, {
 }, res);
 
 });
-app.get('/builtup-stats', async (req, res) => {
+app.get('/builtup-stats', (req, res) => {
   console.log("📊 /builtup-stats called");
+  let currentDate, pastDate;
 
-  try {
-    if (!wards) {
-      console.error('❌ Error: `wards` FeatureCollection is undefined');
-      return res.status(500).json({ error: '`wards` FeatureCollection is not initialized' });
-    }
+  if (req.query.year) {
+    const y = parseInt(req.query.year);
+    pastDate = ee.Date.fromYMD(y, 1, 1);
+    currentDate = ee.Date.fromYMD(y, 12, 31);
+  } else {
+    currentDate = ee.Date(Date.now());
+    pastDate = currentDate.advance(-1, 'year');
+  }
 
-    // Parse year query param or default to last year
-    let currentDate, pastDate;
-    if (req.query.year) {
-      const y = parseInt(req.query.year);
-      if (isNaN(y) || y < 2000 || y > new Date().getFullYear()) {
-        return res.status(400).json({ error: 'Invalid year parameter' });
-      }
-      pastDate = ee.Date.fromYMD(y, 1, 1);
-      currentDate = ee.Date.fromYMD(y, 12, 31);
+  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(wards)
+    .filterDate(pastDate, currentDate)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10));
+
+  const safeImage = ee.Algorithms.If(
+    s2.size().gt(0),
+    s2.median().clip(wards),
+    ee.Image.constant(0).updateMask(ee.Image.constant(0)).clip(wards)
+  );
+
+  const image = ee.Image(safeImage);
+  const swir = image.select('B11');
+  const nir = image.select('B8');
+  const red = image.select('B4');
+
+  const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
+  const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+
+  const pixelArea = ee.Image.pixelArea();
+  const greenMask = ndvi.gt(0.3);
+  const builtMask = ndbi.gt(0).and(ndvi.lte(0.3)).and(greenMask.not()).selfMask();
+
+  // Overlap (built and green) area just for diagnostics
+  const overlap = greenMask.and(builtMask).selfMask();
+  const overlapAreaImage = overlap.multiply(pixelArea).rename('overlap_m2');
+  const overlapArea = overlapAreaImage.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: wards.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
+
+  overlapArea.getInfo((overlapRes, err) => {
+    if (err) {
+      console.error("❌ Overlap check failed:", err);
     } else {
-      currentDate = ee.Date(Date.now());
-      pastDate = currentDate.advance(-1, 'year');
+      const m2 = overlapRes['overlap_m2'] || 0;
+      console.log(`⚠️ Overlapping green+built area: ${(m2 / 1e6).toFixed(2)} km²`);
+    }
+  });
+
+  const builtAreaImage = builtMask.multiply(pixelArea).rename('built_m2');
+
+  const builtPerWard = builtAreaImage.reduceRegions({
+    collection: wards,
+    reducer: ee.Reducer.sum(),
+    scale: 10
+  }).map(f => {
+    const wardArea = f.geometry().area(10); // accurate ward area in m²
+    const built_m2 = ee.Number(f.get('sum'));
+    const built_pct = built_m2.divide(wardArea).multiply(100);
+    return f.set({
+      built_m2,
+      ward_area_m2: wardArea,
+      built_pct
+    });
+  });
+
+  const totalBuilt = builtAreaImage.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: wards.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
+
+  const totalArea = pixelArea.rename('area').clip(wards).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: wards.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
+
+  builtPerWard.getInfo((wardStats, err1) => {
+    if (err1) {
+      console.error('❌ Built-up ward stats error:', err1);
+      return res.status(500).json({ error: 'Failed to compute built-up per ward', details: err1 });
     }
 
-    // Filter Sentinel-2 imagery
-    const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-      .filterBounds(wards)
-      .filterDate(pastDate, currentDate)
-      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10));
+    totalBuilt.getInfo((builtRes, err2) => {
+      if (err2) {
+        console.error('❌ Built-up total error:', err2);
+        return res.status(500).json({ error: 'Failed to compute total built-up area', details: err2 });
+      }
 
-    // Use median image or fallback empty image
-    const safeImage = ee.Algorithms.If(
-      s2.size().gt(0),
-      s2.median().clip(wards),
-      ee.Image.constant(0).updateMask(ee.Image.constant(0)).clip(wards)
-    );
+      totalArea.getInfo((areaRes, err3) => {
+        if (err3) {
+          console.error('❌ Total area error:', err3);
+          return res.status(500).json({ error: 'Failed to compute total Nairobi area', details: err3 });
+        }
 
-    const image = ee.Image(safeImage);
-    const swir = image.select('B11');
-    const nir = image.select('B8');
-    const red = image.select('B4');
+        const built_m2 = builtRes['built_m2'];
+        const total_m2 = areaRes['area'];
+        const built_pct = (built_m2 / total_m2) * 100;
 
-    // Calculate indices
-    const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
-    const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+        if (res.headersSent) return;
 
-    // Pixel area for area calculations
-    const pixelArea = ee.Image.pixelArea();
-
-    // Define built-up mask (NDBI > 0, NDVI ≤ 0.3, excluding green)
-    const greenMask = ndvi.gt(0.3);
-    const builtMask = ndbi.gt(0).and(ndvi.lte(0.3)).and(greenMask.not()).selfMask();
-
-    // Calculate built-up area per ward
-    const builtAreaImage = builtMask.multiply(pixelArea).rename('built_m2');
-
-    const builtPerWard = builtAreaImage.reduceRegions({
-      collection: wards,
-      reducer: ee.Reducer.sum(),
-      scale: 10,
-      tileScale: 4 // help with large geometries
-    }).map(f => {
-      const wardArea = f.geometry().area(10); // ward area in m²
-      const built_m2 = ee.Number(f.get('sum')).max(0); // ensure no negative
-      const built_pct = built_m2.divide(wardArea).multiply(100);
-      return f.set({
-        built_m2,
-        ward_area_m2: wardArea,
-        built_pct
-      });
-    });
-
-    // Calculate total built-up and total area for all wards
-    const totalBuilt = builtAreaImage.reduceRegion({
-      reducer: ee.Reducer.sum(),
-      geometry: wards.geometry(),
-      scale: 10,
-      maxPixels: 1e13
-    });
-
-    const totalArea = pixelArea.rename('area').reduceRegion({
-      reducer: ee.Reducer.sum(),
-      geometry: wards.geometry(),
-      scale: 10,
-      maxPixels: 1e13
-    });
-
-    // Wrap all EE getInfo calls in Promises for async/await
-
-    const getInfoAsync = (eeObject) =>
-      new Promise((resolve, reject) => {
-        eeObject.getInfo((result, error) => {
-          if (error) reject(error);
-          else resolve(result);
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+        res.json({
+          updated: new Date().toISOString(),
+          city_built_m2: built_m2,
+          city_total_m2: total_m2,
+          city_built_pct: built_pct,
+          per_ward: (wardStats.features || []).map(w => ({
+            ward: w.properties.wards || w.properties.NAME_3 || 'Unknown',
+            built_m2: w.properties.built_m2,
+            ward_area_m2: w.properties.ward_area_m2,
+            built_pct: w.properties.built_pct
+          }))
         });
       });
-
-    // Fetch all results concurrently
-    const [wardStats, builtRes, areaRes] = await Promise.all([
-      getInfoAsync(builtPerWard),
-      getInfoAsync(totalBuilt),
-      getInfoAsync(totalArea)
-    ]);
-
-    // Defensive checks
-    if (!wardStats || !wardStats.features) {
-      console.warn('⚠️ Warning: builtPerWard returned no features');
-      return res.status(500).json({ error: 'No ward stats features found' });
-    }
-    if (!builtRes || builtRes['built_m2'] === undefined) {
-      console.warn('⚠️ Warning: total built-up area missing');
-      return res.status(500).json({ error: 'Total built-up area missing' });
-    }
-    if (!areaRes || areaRes['area'] === undefined) {
-      console.warn('⚠️ Warning: total area missing');
-      return res.status(500).json({ error: 'Total area missing' });
-    }
-
-    // Format per-ward stats with numbers only
-    const perWard = wardStats.features.map(f => ({
-      ward: f.properties.NAME_3 || f.properties.wards || 'Unknown',
-      built_m2: Number(f.properties.built_m2) || 0,
-      ward_area_m2: Number(f.properties.ward_area_m2) || 0,
-      built_pct: Number(f.properties.built_pct) || 0
-    }));
-
-    // Calculate city built percentage
-    const cityBuiltM2 = Number(builtRes['built_m2']) || 0;
-    const cityTotalM2 = Number(areaRes['area']) || 0;
-    const cityBuiltPct = cityTotalM2 > 0 ? (cityBuiltM2 / cityTotalM2) * 100 : 0;
-
-    // Send final JSON response
-    res.setHeader('Cache-Control', 'public, max-age=3600');
-    res.json({
-      updated: new Date().toISOString(),
-      city_built_m2: cityBuiltM2,
-      city_total_m2: cityTotalM2,
-      city_built_pct: cityBuiltPct,
-      features: perWard // Using 'features' key for frontend GeoJSON-like structure
     });
-
-  } catch (error) {
-    console.error('❌ /builtup-stats unexpected error:', error);
-    res.status(500).json({ error: 'Internal server error', details: error.message || error });
-  }
+  });
 });
 
 app.get('/wards', async (req, res) => {
@@ -1024,75 +1006,50 @@ app.get('/charttrend', async (req, res) => {
 
 app.get('/ward-trend', async (req, res) => {
   try {
-    const wardNameRaw = req.query.ward;
-    if (!wardNameRaw) {
-      return res.status(400).json({ error: 'Missing ?ward= query parameter' });
+    const wardName = req.query.ward;
+    if (!wardName) {
+      return res.status(400).json({ error: 'Missing ?ward= name' });
     }
 
-    // Normalize ward name for matching (simple lowercase trim)
-    const wardName = wardNameRaw.trim().toLowerCase();
-
-    // Function to get ward geometry by normalized name
-    // Make sure your wards FeatureCollection is loaded globally as `wards`
-    function getWardGeometryByName(name) {
-      const filtered = wards.filter(ee.Filter.stringContains('NAME_3', name, false));
-      return filtered.size().gt(0) ? filtered.first().geometry() : null;
-    }
-
-    // Get geometry
     const geometry = getWardGeometryByName(wardName);
-    if (!geometry) {
-      return res.status(404).json({ error: `Ward geometry not found for "${wardNameRaw}"` });
-    }
+    if (!geometry) return res.status(400).json({ error: 'Ward geometry not found' });
 
     const pixelArea = ee.Image.pixelArea();
     const currentYear = new Date().getFullYear();
-    const years = Array.from({ length: currentYear - 2017 + 1 }, (_, i) => 2017 + i);
-
+    const yearsList = ee.List.sequence(2017, currentYear);
     const treeCollection = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').select('label');
 
+    const yearList = await yearsList.getInfo();
     const trend = [];
 
-    // Iterate years sequentially with await inside loop to avoid quota problems
-    for (const year of years) {
-      const startDate = ee.Date.fromYMD(year, 1, 1);
-      const endDate = startDate.advance(1, 'year');
+    for (const y of yearList) {
+      const start = ee.Date.fromYMD(y, 1, 1);
+      const end = start.advance(1, 'year');
 
-      // Sentinel-2 collection filtered
-      const s2Collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
         .filterBounds(geometry)
-        .filterDate(startDate, endDate)
+        .filterDate(start, end)
         .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
         .select(['B4', 'B8', 'B11']);
 
-      // Landsat 7 collection fallback
-      const landsatCollection = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+      const landsat = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
         .filterBounds(geometry)
-        .filterDate(startDate, endDate)
+        .filterDate(start, end)
         .filter(ee.Filter.lt('CLOUD_COVER', 10))
         .select(['SR_B4', 'SR_B5', 'SR_B7'])
         .map(img => img.multiply(0.0000275).add(-0.2).copyProperties(img, img.propertyNames()));
 
-      // Get median image from Sentinel-2 or Landsat
-      const s2Size = await s2Collection.size().getInfo();
+      const s2Size = await s2.size().getInfo();
 
-      const medianImage = s2Size > 0 ? s2Collection.median() : landsatCollection.median();
+      const medianImage = s2Size > 0 ? s2.median() : landsat.median();
       const img = medianImage.clip(geometry);
 
-      // Determine bands dynamically for indices
-      const bands = await img.bandNames().getInfo();
-      const nirBand = bands.includes('B8') ? 'B8' : (bands.includes('SR_B5') ? 'SR_B5' : null);
-      const redBand = bands.includes('B4') ? 'B4' : (bands.includes('SR_B4') ? 'SR_B4' : null);
-      const swirBand = bands.includes('B11') ? 'B11' : (bands.includes('SR_B7') ? 'SR_B7' : null);
+      const bandNames = await img.bandNames().getInfo();
 
-      if (!nirBand || !redBand || !swirBand) {
-        console.warn(`Skipping year ${year} due to missing bands`);
-        // Push zero values or nulls to keep data length consistent
-        trend.push({ year, ndvi: null, tree_pct: null, built_pct: null });
-        continue;
-      }
+      const nirBand = bandNames.includes('B8') ? 'B8' : 'SR_B5';
+      const redBand = bandNames.includes('B4') ? 'B4' : 'SR_B4';
+      const swirBand = bandNames.includes('B11') ? 'B11' : 'SR_B7';
 
-      // Calculate NDVI and NDBI
       const nir = img.select(nirBand);
       const red = img.select(redBand);
       const swir = img.select(swirBand);
@@ -1100,78 +1057,64 @@ app.get('/ward-trend', async (req, res) => {
       const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
       const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
 
-      // Built-up mask and area
       const builtMask = ndbi.gt(0).and(ndvi.lt(0.3)).selfMask();
       const builtArea = builtMask.multiply(pixelArea).rename('built_m2');
 
-      // Tree cover mask and area from Dynamic World mode
-      const treeMode = treeCollection
-        .filterDate(startDate, endDate)
+      const treeMask = treeCollection
+        .filterDate(start, end)
         .mode()
-        .eq(1) // 1 = tree class in Dynamic World
+        .eq(1)
         .selfMask();
-      const treeArea = treeMode.multiply(pixelArea).rename('tree_m2');
+      const treeArea = treeMask.multiply(pixelArea).rename('tree_m2');
 
-      // Total area of ward polygon in m2
-      const totalArea = pixelArea.clip(geometry);
-
-      // Use reduceRegion for NDVI mean and sums for built and tree
-      const reducers = ee.Reducer.mean().combine({
-        reducer2: ee.Reducer.sum(),
-        sharedInputs: true
+      const totalArea = pixelArea.clip(geometry).reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry,
+        scale: 10,
+        maxPixels: 1e13
       });
 
-      const ndviMean = await ndvi.reduceRegion({
-        reducer: ee.Reducer.mean(),
-        geometry,
-        scale: 10,
-        maxPixels: 1e13
-      }).getInfo();
+      const [ndviMean, builtStats, treeStats, totalStats] = await Promise.all([
+        ndvi.reduceRegion({
+          reducer: ee.Reducer.mean(),
+          geometry,
+          scale: 10,
+          maxPixels: 1e13
+        }).getInfo(),
+        builtArea.reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry,
+          scale: 10,
+          maxPixels: 1e13
+        }).getInfo(),
+        treeArea.reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry,
+          scale: 10,
+          maxPixels: 1e13
+        }).getInfo(),
+        totalArea.getInfo()
+      ]);
 
-      const builtSum = await builtArea.reduceRegion({
-        reducer: ee.Reducer.sum(),
-        geometry,
-        scale: 10,
-        maxPixels: 1e13
-      }).getInfo();
-
-      const treeSum = await treeArea.reduceRegion({
-        reducer: ee.Reducer.sum(),
-        geometry,
-        scale: 10,
-        maxPixels: 1e13
-      }).getInfo();
-
-      const totalSum = await totalArea.reduceRegion({
-        reducer: ee.Reducer.sum(),
-        geometry,
-        scale: 10,
-        maxPixels: 1e13
-      }).getInfo();
-
-      const totalM2 = totalSum.area || totalSum.sum || 1;
+      const total_m2 = totalStats['area'] || totalStats['sum'] || 1; // check keys here!
 
       trend.push({
-        year,
-        ndvi: ndviMean.NDVI ?? null,
-        tree_pct: (treeSum.tree_m2 ?? 0) / totalM2 * 100,
-        built_pct: (builtSum.built_m2 ?? 0) / totalM2 * 100
+        year: y,
+        ndvi: ndviMean.NDVI || 0,
+        tree_pct: ((treeStats.tree_m2 || 0) / total_m2) * 100,
+        built_pct: ((builtStats.built_m2 || 0) / total_m2) * 100
       });
     }
 
     res.setHeader('Cache-Control', 'public, max-age=86400');
     res.json({
-      ward: wardNameRaw,
+      ward: wardName,
       trend,
       updated: new Date().toISOString()
     });
-
-  } catch (error) {
-    console.error('❌ /ward-trend error:', error);
-    res.status(500).json({
-      error: 'Internal server error while processing ward trend',
-      details: error.message
-    });
+  } catch (err) {
+    console.error('❌ /ward-trend error:', err);
+    res.status(500).json({ error: 'Ward trend error', details: err.message });
   }
 });
 
