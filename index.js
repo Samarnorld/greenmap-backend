@@ -816,7 +816,7 @@ app.get('/charttrend', async (req, res) => {
   try {
     log.info('Request received for /charttrend');
 
-    // Parse params (defaults to 2021..current year)
+    // Parse params (defaults to 2021..current)
     const qStart = parseInt(req.query.startYear, 10);
     const startYear = Number.isFinite(qStart) ? qStart : 2021;
     const qEnd = parseInt(req.query.endYear, 10);
@@ -829,19 +829,23 @@ app.get('/charttrend', async (req, res) => {
     const pixelArea = ee.Image.pixelArea();
 
     const years = [];
-    const ndviVals = [];   // ee.Number objects
-    const treeVals = [];
-    const builtPctVals = [];
-    const rainVals = [];
+    const ndviVals = [];   // ee.Number objects (MODIS)
+    const treeVals = [];   // Dynamic World fraction (0..1)
+    const builtPctVals = []; // computed using ward-style logic
+    const rainVals = [];   // CHIRPS
 
     log.info(`Preparing per-year evaluations for ${startYear}..${endYear} (count=${endYear - startYear + 1})`);
 
     for (let y = startYear; y <= endYear; y++) {
       years.push(y);
 
-      // --- NDVI (MODIS, fast at 250m) ---
+      // Year window
       const start = ee.Date.fromYMD(y, 1, 1);
       const end = ee.Date.fromYMD(y, 12, 31);
+
+      // ---------------------------
+      // NDVI (UNCHANGED: MODIS annual mean, scaled)
+      // ---------------------------
       const ndviImg = ee.ImageCollection('MODIS/061/MOD13Q1')
         .filterDate(start, end)
         .select('NDVI')
@@ -860,7 +864,9 @@ app.get('/charttrend', async (req, res) => {
       ndviVals.push(ndviVal);
       log.info(`NDVI ${y} queued`);
 
-      // --- Tree coverage (Dynamic World) -> fraction 0..1 ---
+      // ---------------------------
+      // Tree coverage (UNCHANGED: Dynamic World label==1 fraction)
+      // ---------------------------
       const dw = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
         .filterDate(start, end)
         .select('label');
@@ -879,52 +885,81 @@ app.get('/charttrend', async (req, res) => {
       treeVals.push(treeFrac);
       log.info(`Tree ${y} queued`);
 
-      // --- Built-up percent: Sentinel NDBI mask (ndbi>0 && ndvi<0.3) ---
-      // We compute built-up *area* then divide by total city area to get percent.
-      const s2col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      // ---------------------------
+      // BUILT-UP: adopt ward-trend approach (S2 -> Landsat -> fallback)
+      // ---------------------------
+      const yearStart = start;
+      const yearEnd = end;
+
+      // Collections scoped to the city geometry / year
+      const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
         .filterBounds(nairobiGeom)
-        .filterDate(start, end)
-        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10));
+        .filterDate(yearStart, yearEnd)
+        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+        .select(['B4', 'B8', 'B11']);
 
-      // If Sentinel available, use median; otherwise fallback to a constant (no built-up)
-      const s2median = ee.Image(ee.Algorithms.If(s2col.size().gt(0), s2col.median(), ee.Image.constant(0)));
-      const hasS2 = s2col.size().gt(0);
+      const landsat = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+        .filterBounds(nairobiGeom)
+        .filterDate(yearStart, yearEnd)
+        .filter(ee.Filter.lt('CLOUD_COVER', 10))
+        .select(['SR_B4', 'SR_B5', 'SR_B7'])
+        .map(img => img.multiply(0.0000275).add(-0.2).copyProperties(img, img.propertyNames()));
 
-      // NDVI from S2 (fallback 0 if no S2)
-      const ndviS2 = ee.Image(ee.Algorithms.If(hasS2, s2median.normalizedDifference(['B8', 'B4']), ee.Image.constant(0)));
+      // Compute composites server-side: prefer S2 median, else Landsat median, else constant
+      const zeroImg = ee.Image.constant(0).rename('zero');
+      const s2Med = ee.Image(ee.Algorithms.If(s2.size().gt(0), s2.median(), ee.Image.constant(0)));
+      const lsMed = ee.Image(ee.Algorithms.If(landsat.size().gt(0), landsat.median(), ee.Image.constant(0)));
 
-      // NDBI = (SWIR - NIR) / (SWIR + NIR) -> B11 & B8 on S2 (fallback -1)
-      const ndbiS2 = ee.Image(ee.Algorithms.If(
+      // NDVI from composite (used only as proxy here when SWIR absent)
+      const ndviS2 = ee.Image(ee.Algorithms.If(s2.size().gt(0), s2Med.normalizedDifference(['B8', 'B4']), ee.Image.constant(0))).rename('NDVI_S2');
+
+      // NDBI: prefer S2 (B11/B8), else Landsat (SR_B7/SR_B5), else constant -1
+      const ndbiFromS2 = s2Med.select('B11').subtract(s2Med.select('B8'))
+        .divide(s2Med.select('B11').add(s2Med.select('B8')).add(1e-9)).rename('NDBI');
+      const ndbiFromLS = lsMed.select('SR_B7').subtract(lsMed.select('SR_B5'))
+        .divide(lsMed.select('SR_B7').add(lsMed.select('SR_B5')).add(1e-9)).rename('NDBI');
+
+      const hasS2 = s2.size().gt(0);
+      const hasLS = landsat.size().gt(0);
+
+      const ndbiImg = ee.Image(ee.Algorithms.If(
         hasS2,
-        s2median.select('B11').subtract(s2median.select('B8')).divide(s2median.select('B11').add(s2median.select('B8'))),
-        ee.Image.constant(-1)
-      )) ;
+        ndbiFromS2,
+        ee.Algorithms.If(hasLS, ndbiFromLS, ee.Image.constant(-1))
+      ));
 
-      // Built mask
-      const builtMask = ndbiS2.gt(0).and(ndviS2.lt(0.3)).selfMask();
-      const builtAreaImage = builtMask.multiply(pixelArea).rename('built_m2');
+      // built mask (ward method): SWIR-NDBI > 0 OR NDVI-proxy < 0.12, but require NDVI<0.3
+      // (ndbi>0 OR ndvi<0.12) AND ndvi<0.3
+      const ndviProxy = ee.Image(ee.Algorithms.If(hasS2, ndviS2, ee.Algorithms.If(hasLS,
+        lsMed.normalizedDifference(['SR_B5', 'SR_B4']), ee.Image.constant(0)
+      )));
+
+      const builtMaskImg = (ndbiImg.gt(0).or(ndviProxy.lt(0.12))).and(ndviProxy.lt(0.3)).selfMask();
+
+      // built area image and sum (use 10 m scale for consistency with ward calculation)
+      const builtAreaImage = builtMaskImg.multiply(pixelArea).rename('built_m2');
 
       const builtSum = builtAreaImage.reduceRegion({
         reducer: ee.Reducer.sum(),
         geometry: nairobiGeom,
-        scale: 100,
+        scale: 10,
         maxPixels: 1e13,
         tileScale: 2,
         bestEffort: true
       }).get('built_m2');
 
-      // built percentage (0..100)
       const builtPct = ee.Number(builtSum).divide(totalAreaM2).multiply(100);
       builtPctVals.push(builtPct);
       log.info(`Built-up ${y} queued`);
 
-      // --- Rainfall (CHIRPS) annual sum -> report as avg-mm across city ---
+      // ---------------------------
+      // Rainfall (UNCHANGED: CHIRPS annual sum -> mean across geometry)
+      // ---------------------------
       const rainSumImg = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
         .filterDate(start, end)
         .select('precipitation')
         .sum();
 
-      // We reduce by mean across geometry -> average total mm per pixel (annual mm)
       const rainMean = rainSumImg.reduceRegion({
         reducer: ee.Reducer.mean(),
         geometry: nairobiGeom,
@@ -940,6 +975,7 @@ app.get('/charttrend', async (req, res) => {
 
     log.info(`Prepared EE lists for years ${startYear}..${endYear} (count=${years.length}). Calling evaluate()`);
 
+    // Pack everything and evaluate once
     const allData = ee.Dictionary({
       years: years,
       ndvi: ee.List(ndviVals),
@@ -961,7 +997,7 @@ app.get('/charttrend', async (req, res) => {
       return res.status(502).json({ error: 'Empty result from Earth Engine' });
     }
 
-    // Normalize arrays into numbers or nulls
+    // Helper: normalize arrays into numbers or nulls
     const normalizeArray = (arr, expectedLen) => {
       if (!Array.isArray(arr)) {
         if (arr !== undefined && arr !== null && typeof arr === 'number') {
@@ -981,11 +1017,11 @@ app.get('/charttrend', async (req, res) => {
     const n = years.length;
     const payload = {
       years: rawResult.years ?? years,
-      // NDVI 0..1
+      // NDVI as returned (MODIS)
       ndvi: normalizeArray(rawResult.ndvi ?? rawResult.NDVI, n),
-      // Convert tree fraction 0..1 to percent 0..100 (if values exist)
+      // Tree coverage: convert 0..1 to percent 0..100
       tree_coverage: normalizeArray(rawResult.tree_frac, n).map(v => (v === null ? null : Number((v * 100).toFixed(3)))),
-      // built_pct already computed as percent (0..100)
+      // Built-up percent (0..100) computed using ward-trend logic
       built_up: normalizeArray(rawResult.built_pct, n),
       // rainfall mm
       rainfall: normalizeArray(rawResult.rainfall ?? rawResult.precipitation ?? rawResult.rain, n)
@@ -1005,6 +1041,7 @@ app.get('/charttrend', async (req, res) => {
     return res.status(500).json({ error: 'Internal server error generating charttrend', details: String(error) });
   }
 });
+
 app.get('/ward-trend', async (req, res) => {
   try {
     const wardName = req.query.ward;
