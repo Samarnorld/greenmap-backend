@@ -78,17 +78,6 @@ function startServer() {
     const normalized = wardName.trim();
     return wards.filter(ee.Filter.eq('NAME_3', normalized)).first().geometry();
   }
-function getAllWardNames() {
-  try {
-    if (!wardsGeoJSON || !wardsGeoJSON.features) return [];
-    return wardsGeoJSON.features.map(f =>
-      f.properties.ward || f.properties.NAME_3
-    );
-  } catch (err) {
-    console.error("Error in getAllWardNames:", err);
-    return [];
-  }
-}
 
   function getNDVI(start, end) {
   // Sentinel-2 collection
@@ -1054,78 +1043,87 @@ app.get('/charttrend', async (req, res) => {
 });
 app.get('/most-deforested', async (req, res) => {
   try {
+    console.log("[most-deforested] Calculating...");
+
     const pixelArea = ee.Image.pixelArea();
     const currentYear = new Date().getFullYear();
+    const latestYear = currentYear - 1; // last full year for stable stats
+    const prevYear = latestYear - 1;
+
+    // Load wards from EE asset
+    const wards = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered');
+
     const treeCollection = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').select('label');
 
-    let wardsList = getAllWardNames();
-    let results = [];
-
-    for (const wardName of wardsList) {
-      const geometry = getWardGeometryByName(wardName);
-      if (!geometry) continue;
-
-      const start = ee.Date.fromYMD(currentYear, 1, 1);
+    // Function to get tree percentage for a given ward and year
+    const getTreePct = (ward, year) => {
+      const geom = ward.geometry();
+      const start = ee.Date.fromYMD(year, 1, 1);
       const end = start.advance(1, 'year');
 
-      // Tree mask for latest year
       const treeMask = treeCollection
         .filterDate(start, end)
         .mode()
-        .eq(1)
+        .eq(1) // trees
         .selfMask();
 
       const treeArea = treeMask.multiply(pixelArea).rename('tree_m2');
-      const totalArea = pixelArea.clip(geometry).reduceRegion({
+      const totalArea = pixelArea.clip(geom).reduceRegion({
         reducer: ee.Reducer.sum(),
-        geometry,
+        geometry: geom,
         scale: 10,
         maxPixels: 1e13
+      }).get('area');
+
+      const treeSum = treeArea.reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry: geom,
+        scale: 10,
+        maxPixels: 1e13
+      }).get('tree_m2');
+
+      return ee.Number(treeSum).divide(ee.Number(totalArea)).multiply(100);
+    };
+
+    // Map over wards and compute loss
+    const wardsWithLoss = wards.map(ward => {
+      const latestPct = getTreePct(ward, latestYear);
+      const prevPct = getTreePct(ward, prevYear);
+      const loss = ee.Number(prevPct).subtract(latestPct);
+
+      return ward.set({
+        ward_name: ward.get('ward'),
+        tree_loss: loss
       });
+    });
 
-      const [treeStats, totalStats] = await Promise.all([
-        (async () => {
-          try {
-            return await withRetry(treeArea.reduceRegion({
-              reducer: ee.Reducer.sum(),
-              geometry,
-              scale: 10,
-              maxPixels: 1e13
-            }));
-          } catch (e) { return null; }
-        })(),
-        (async () => {
-          try {
-            return await withRetry(totalArea);
-          } catch (e) { return null; }
-        })()
-      ]);
+    // Find ward with maximum loss
+    const mostDeforested = wardsWithLoss.sort('tree_loss', false).first();
 
-      const tree_m2 = (treeStats && treeStats.tree_m2) ? Number(treeStats.tree_m2) : 0;
-      const total_m2 = (totalStats && (totalStats.area || totalStats.sum)) ? Number(totalStats.area || totalStats.sum) : 1;
+    const result = await mostDeforested.reduceColumns({
+      selectors: ['ward_name', 'tree_loss'],
+      reducer: ee.Reducer.first().combine({
+        reducer2: ee.Reducer.first(),
+        sharedInputs: false
+      })
+    }).getInfo();
 
-      let tree_pct = total_m2 > 0 ? (tree_m2 / total_m2) * 100 : 0;
-      if (!isFinite(tree_pct) || tree_pct < 0) tree_pct = 0;
-      if (tree_pct > 100) tree_pct = 100;
-
-      results.push({ ward: wardName, tree_pct });
-    }
-
-    // Find ward with smallest tree cover %
-    results.sort((a, b) => a.tree_pct - b.tree_pct);
-    const mostDeforested = results[0] || { ward: null, tree_pct: null };
+    const wardName = result.first;
+    const lossValue = result.first_1;
 
     res.json({
-      ward: mostDeforested.ward,
-      tree_pct: mostDeforested.tree_pct,
-      year: currentYear
+      ward: wardName,
+      loss_pct: Number(lossValue).toFixed(2),
+      latest_year: latestYear,
+      previous_year: prevYear
     });
 
   } catch (err) {
-    console.error('❌ /most-deforested error:', err);
-    res.status(500).json({ error: 'Most deforested ward error', details: String(err?.message || err) });
+    console.error("❌ /most-deforested error:", err);
+    res.status(500).json({ error: "Most deforested ward error", details: err.message || err });
   }
 });
+
 
 app.get('/ward-trend', async (req, res) => {
   try {
