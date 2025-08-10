@@ -781,170 +781,273 @@ app.get('/treecanopy-stats', async (req, res) => {
 });
 // GET /charttrend?startYear=2021&endYear=2025
 app.get('/charttrend', async (req, res) => {
+  const log = {
+    info: (...a) => console.info('[charttrend][INFO]', ...a),
+    warn: (...a) => console.warn('[charttrend][WARN]', ...a),
+    error: (...a) => console.error('[charttrend][ERROR]', ...a)
+  };
+
+  // Helper to evaluate EE objects with a timeout
+  const evaluateAsync = (eeObject, timeoutMs = 180000) => new Promise((resolve, reject) => {
+    let finished = false;
+    try {
+      eeObject.evaluate((result, err) => {
+        finished = true;
+        if (err) {
+          log.error('EE evaluate callback error:', err);
+          return reject(err);
+        }
+        return resolve(result);
+      });
+    } catch (e) {
+      finished = true;
+      log.error('Exception calling ee.evaluate:', e);
+      return reject(e);
+    }
+    setTimeout(() => {
+      if (!finished) {
+        const msg = `EE evaluate timed out after ${timeoutMs}ms`;
+        log.error(msg);
+        reject(new Error(msg));
+      }
+    }, timeoutMs);
+  });
+
   try {
-    const geometry = getCityGeometryByName('Nairobi'); // Replace with your actual Nairobi geometry function
-    if (!geometry) return res.status(400).json({ error: 'Nairobi geometry not found' });
+    log.info('Request received for /charttrend');
 
+    // parse params (defaults to 2021..current)
+    const qStart = parseInt(req.query.startYear, 10);
+    const startYear = Number.isFinite(qStart) ? qStart : 2021;
+    const qEnd = parseInt(req.query.endYear, 10);
+    const endYear = Number.isFinite(qEnd) ? qEnd : new Date().getFullYear();
+
+    // === Geometry: use your wards asset unioned for the full Nairobi geometry ===
+    const wards = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered');
+    const nairobiGeom = wards.union().geometry();
+    const totalAreaM2 = ee.Number(nairobiGeom.area()); // m^2
     const pixelArea = ee.Image.pixelArea();
-    const currentYear = new Date().getFullYear();
-    const startYear = 2018; // same as ward-trend
-    const yearsList = ee.List.sequence(startYear, currentYear);
-    const treeCollection = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').select('label');
 
-    const yearList = await yearsList.getInfo();
-    const trend = [];
+    // Hansen (Global Forest Change) image for tree cover (using v1_9 - change if you want newer)
+    // Available alternatives: UMD/hansen/global_forest_change_2022_v1_10, _2023_v1_11, _2024_v1_12, etc.
+    const hansen = ee.Image('UMD/hansen/global_forest_change_2021_v1_9');
 
-    for (const y of yearList) {
+    const years = [];
+    const ndviVals = [];    // MODIS NDVI mean (0..1 scaled)
+    const treePctVals = []; // Hansen-derived percent tree cover (0..100)
+    const builtPctVals = []; // built-up percent (0..100)
+    const rainVals = [];    // CHIRPS annual mm (mean across city)
+
+    log.info(`Preparing per-year evaluations for ${startYear}..${endYear} (count=${endYear - startYear + 1})`);
+
+    for (let y = startYear; y <= endYear; y++) {
+      years.push(y);
+
+      // Year window
       const start = ee.Date.fromYMD(y, 1, 1);
-      const end = start.advance(1, 'year');
+      const end = ee.Date.fromYMD(y, 12, 31);
 
-      // Sentinel-2
-      const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-        .filterBounds(geometry)
+      // ---------------------------
+      // NDVI (UNCHANGED: MODIS annual mean, scaled to 0..1)
+      // ---------------------------
+      const ndviImg = ee.ImageCollection('MODIS/061/MOD13Q1')
+        .filterDate(start, end)
+        .select('NDVI')
+        .mean()
+        .multiply(0.0001);
+
+      const ndviVal = ndviImg.reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: nairobiGeom,
+        scale: 250,
+        maxPixels: 1e13,
+        tileScale: 2,
+        bestEffort: true
+      }).get('NDVI');
+
+      ndviVals.push(ndviVal);
+      log.info(`NDVI ${y} queued`);
+
+      // ---------------------------
+      // TREE COVER (Hansen): use treecover2000 and lossyear to compute canopy remaining in year y
+      // Approach: keep treecover2000 fraction where loss did NOT occur up to year y.
+      // Note: this ignores post-2000 gains (gain band exists but is historically limited).
+      // ---------------------------
+      const tc2000 = hansen.select('treecover2000'); // 0..100
+      const lossYear = hansen.select('lossyear');    // 0 = no loss, else 1..n (year - 2000)
+      // Keep pixels that either have no loss (==0) OR have loss year > (y - 2000) (i.e. loss happens after this year)
+      const keepMask = lossYear.eq(0).or(lossYear.gt(ee.Number(y).subtract(2000)));
+      // Convert percent-to-fraction and apply keepMask
+      const treeFracImg = tc2000.divide(100).updateMask(keepMask);
+      const treeAreaImg = treeFracImg.multiply(pixelArea).rename('tree_m2');
+
+      const treeSum = treeAreaImg.reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry: nairobiGeom,
+        scale: 30, // Hansen is Landsat-derived; 30m is appropriate
+        maxPixels: 1e13,
+        tileScale: 2,
+        bestEffort: true
+      }).get('tree_m2');
+
+      // tree percent of total area (0..100)
+      const treePct = ee.Number(treeSum).divide(totalAreaM2).multiply(100);
+      treePctVals.push(treePct);
+      log.info(`Tree (Hansen) ${y} queued`);
+
+      // ---------------------------
+      // BUILT-UP (ward-trend logic): prefer S2 -> Landsat -> fallback (NDBI or NDVI-proxy)
+      // ---------------------------
+      // Collections for the year
+      const s2col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+        .filterBounds(nairobiGeom)
         .filterDate(start, end)
         .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
         .select(['B4', 'B8', 'B11']);
 
-      // Landsat-7
-      const landsat = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
-        .filterBounds(geometry)
+      const lscol = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+        .filterBounds(nairobiGeom)
         .filterDate(start, end)
         .filter(ee.Filter.lt('CLOUD_COVER', 10))
         .select(['SR_B4', 'SR_B5', 'SR_B7'])
         .map(img => img.multiply(0.0000275).add(-0.2).copyProperties(img, img.propertyNames()));
 
-      const [s2Size, lsSize] = await Promise.all([s2.size().getInfo(), landsat.size().getInfo()]);
+      // Safe composites (server-side If)
+      const s2Med = ee.Image(ee.Algorithms.If(s2col.size().gt(0), s2col.median(), ee.Image.constant(0)));
+      const lsMed = ee.Image(ee.Algorithms.If(lscol.size().gt(0), lscol.median(), ee.Image.constant(0)));
 
-      // === NDVI
-      let ndviImg, ndviScale;
-      if (s2Size > 0) {
-        const s2Med = s2.median().clip(geometry);
-        ndviImg = s2Med.normalizedDifference(['B8', 'B4']).rename('NDVI');
-        ndviScale = 10;
-      } else if (lsSize > 0) {
-        const lsMed = landsat.median().clip(geometry);
-        ndviImg = lsMed.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
-        ndviScale = 30;
-      } else {
-        ndviImg = ee.ImageCollection('MODIS/061/MOD13Q1')
-          .filterDate(start, end)
-          .select('NDVI')
-          .mean()
-          .multiply(0.0001)
-          .rename('NDVI')
-          .clip(geometry);
-        ndviScale = 250;
-      }
-      ndviImg = ndviImg.updateMask(ndviImg.gte(-1)).updateMask(ndviImg.lte(1));
+      // NDVI proxy (S2 or Landsat) for the built-up rule
+      const ndviProxy = ee.Image(ee.Algorithms.If(
+        s2col.size().gt(0),
+        s2Med.normalizedDifference(['B8', 'B4']),
+        ee.Algorithms.If(lscol.size().gt(0), lsMed.normalizedDifference(['SR_B5', 'SR_B4']), ee.Image.constant(0))
+      ));
 
-      // === Built-up mask (from ward-trend logic)
-      let ndbiImg, builtScale;
-      if (s2Size > 0) {
-        const s2Med = s2.median().clip(geometry);
-        ndbiImg = s2Med.select('B11').subtract(s2Med.select('B8'))
-          .divide(s2Med.select('B11').add(s2Med.select('B8')))
-          .rename('NDBI');
-        builtScale = 10;
-      } else if (lsSize > 0) {
-        const lsMed = landsat.median().clip(geometry);
-        ndbiImg = lsMed.select('SR_B7').subtract(lsMed.select('SR_B5'))
-          .divide(lsMed.select('SR_B7').add(lsMed.select('SR_B5')))
-          .rename('NDBI');
-        builtScale = 30;
-      } else {
-        ndbiImg = ee.Image.constant(-1).rename('NDBI');
-        builtScale = 250;
-      }
+      // NDBI: prefer S2 (B11/B8) else Landsat (SR_B7/SR_B5) else -1
+      const ndbiS2 = s2Med.select('B11').subtract(s2Med.select('B8'))
+        .divide(s2Med.select('B11').add(s2Med.select('B8')).add(1e-9));
+      const ndbiLS = lsMed.select('SR_B7').subtract(lsMed.select('SR_B5'))
+        .divide(lsMed.select('SR_B7').add(lsMed.select('SR_B5')).add(1e-9));
 
-      const builtMaskImg = (ndbiImg.gt(0).or(ndviImg.lt(0.12)))
-        .and(ndviImg.lt(0.3))
-        .selfMask();
+      const ndbiImg = ee.Image(ee.Algorithms.If(
+        s2col.size().gt(0),
+        ndbiS2,
+        ee.Algorithms.If(lscol.size().gt(0), ndbiLS, ee.Image.constant(-1))
+      ));
 
-      // === Tree mask
-      const treeMask = treeCollection
-        .filterDate(start, end)
-        .mode()
-        .eq(1)
-        .selfMask();
+      // built mask: (NDBI > 0 OR NDVI-proxy < 0.12) AND NDVI-proxy < 0.3
+      const builtMask = (ndbiImg.gt(0).or(ndviProxy.lt(0.12))).and(ndviProxy.lt(0.3)).selfMask();
+      const builtAreaImage = builtMask.multiply(pixelArea).rename('built_m2');
 
-      const treeArea = treeMask.multiply(pixelArea).rename('tree_m2');
-      const builtArea = builtMaskImg.multiply(pixelArea).rename('built_m2');
-
-      const totalArea = pixelArea.clip(geometry).reduceRegion({
+      const builtSum = builtAreaImage.reduceRegion({
         reducer: ee.Reducer.sum(),
-        geometry,
-        scale: 10,
-        maxPixels: 1e13
-      });
+        geometry: nairobiGeom,
+        scale: 10, // use fine scale where possible
+        maxPixels: 1e13,
+        tileScale: 2,
+        bestEffort: true
+      }).get('built_m2');
 
-      const [ndviMeanObj, builtStats, treeStats, totalStats] = await Promise.all([
-        withRetry(ndviImg.reduceRegion({
-          reducer: ee.Reducer.mean(),
-          geometry,
-          scale: ndviScale,
-          maxPixels: 1e13
-        })),
-        withRetry(builtArea.reduceRegion({
-          reducer: ee.Reducer.sum(),
-          geometry,
-          scale: builtScale,
-          maxPixels: 1e13
-        })),
-        withRetry(treeArea.reduceRegion({
-          reducer: ee.Reducer.sum(),
-          geometry,
-          scale: 10,
-          maxPixels: 1e13
-        })),
-        withRetry(totalArea)
-      ]);
+      const builtPct = ee.Number(builtSum).divide(totalAreaM2).multiply(100);
+      builtPctVals.push(builtPct);
+      log.info(`Built-up ${y} queued`);
 
-      const ndviValue = ndviMeanObj?.NDVI ?? null;
-      const tree_m2 = treeStats?.tree_m2 ?? 0;
-      const built_m2 = builtStats?.built_m2 ?? 0;
-      const total_m2 = totalStats?.area || totalStats?.sum || 1;
-
-      let tree_pct = (tree_m2 / total_m2) * 100;
-      let built_pct = (built_m2 / total_m2) * 100;
-      tree_pct = Math.min(Math.max(tree_pct, 0), 100);
-      built_pct = Math.min(Math.max(built_pct, 0), 100);
-
-      // === Rainfall (CHIRPS)
-      const rainImg = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
-        .filterBounds(geometry)
+      // ---------------------------
+      // RAIN (UNCHANGED: CHIRPS annual sum -> mean across geometry)
+      // ---------------------------
+      const rainSumImg = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
         .filterDate(start, end)
-        .sum()
-        .clip(geometry);
+        .select('precipitation')
+        .sum();
 
-      const rainStats = await withRetry(rainImg.reduceRegion({
+      const rainMean = rainSumImg.reduceRegion({
         reducer: ee.Reducer.mean(),
-        geometry,
+        geometry: nairobiGeom,
         scale: 5000,
-        maxPixels: 1e13
-      }));
+        maxPixels: 1e13,
+        tileScale: 2,
+        bestEffort: true
+      }).get('precipitation');
 
-      trend.push({
-        year: y,
-        ndvi: ndviValue === null ? null : Number(ndviValue.toFixed(4)),
-        tree_pct: Number(tree_pct.toFixed(4)),
-        built_pct: Number(built_pct.toFixed(4)),
-        rainfall_mm: rainStats?.precipitation ?? null
-      });
-    }
+      rainVals.push(rainMean);
+      log.info(`Rain ${y} queued`);
+    } // end for years
 
-    res.setHeader('Cache-Control', 'public, max-age=86400');
-    res.json({
-      city: 'Nairobi',
-      trend,
-      updated: new Date().toISOString()
+    log.info(`Prepared EE lists for years ${startYear}..${endYear} (count=${years.length}). Calling evaluate()`);
+
+    // Pack into dictionary and evaluate once
+    const allData = ee.Dictionary({
+      years: years,
+      ndvi: ee.List(ndviVals),
+      tree_pct: ee.List(treePctVals),   // 0..100
+      built_pct: ee.List(builtPctVals), // 0..100
+      rainfall: ee.List(rainVals)       // mm
     });
 
-  } catch (err) {
-    console.error('❌ /charttrend error:', err);
-    res.status(500).json({ error: 'Chart trend error', details: err.message });
+    let rawResult;
+    try {
+      rawResult = await evaluateAsync(allData, 180000); // 3 minutes
+    } catch (eeErr) {
+      log.error('Earth Engine evaluation failed:', eeErr && eeErr.stack ? eeErr.stack : eeErr);
+      return res.status(502).json({ error: 'Earth Engine evaluation failed', details: String(eeErr) });
+    }
+
+    if (!rawResult) {
+      log.error('EE evaluate returned empty result (null/undefined).');
+      return res.status(502).json({ error: 'Empty result from Earth Engine' });
+    }
+
+    // Normalize arrays into numbers or nulls
+    const normalizeArray = (arr, expectedLen) => {
+      if (!Array.isArray(arr)) {
+        if (arr !== undefined && arr !== null && typeof arr === 'number') {
+          return Array.from({ length: expectedLen }, () => arr);
+        }
+        return Array.from({ length: expectedLen }, () => null);
+      }
+      const out = arr.slice(0, expectedLen).map(v => {
+        if (v === null || v === undefined || v === '') return null;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : null;
+      });
+      while (out.length < expectedLen) out.push(null);
+      return out;
+    };
+
+    const n = years.length;
+
+    // NDVI: clamp to 0..1
+    const rawNdvi = normalizeArray(rawResult.ndvi ?? rawResult.NDVI, n).map(v => (v === null ? null : Math.max(0, Math.min(1, v))));
+    // tree_pct is already percent 0..100 (from Hansen)
+    const rawTreePct = normalizeArray(rawResult.tree_pct, n).map(v => (v === null ? null : Number(v)));
+    // built_pct already percent 0..100
+    const rawBuilt = normalizeArray(rawResult.built_pct, n).map(v => (v === null ? null : Number(v)));
+    // rainfall mm
+    const rawRain = normalizeArray(rawResult.rainfall ?? rawResult.precipitation ?? rawResult.rain, n);
+
+    const payload = {
+      years: rawResult.years ?? years,
+      ndvi: rawNdvi,
+      tree_coverage: rawTreePct,
+      built_up: rawBuilt,
+      rainfall: rawRain
+    };
+
+    log.info('Returning payload summary:', {
+      years_count: payload.years.length || n,
+      ndvi_sample: payload.ndvi.slice(0, 3),
+      tree_sample: payload.tree_coverage.slice(0, 3),
+      builtup_sample: payload.built_up.slice(0, 3),
+      rain_sample: payload.rainfall.slice(0, 3)
+    });
+
+    return res.json(payload);
+
+  } catch (error) {
+    console.error('[charttrend][FATAL] Uncaught error in /charttrend:', error && error.stack ? error.stack : error);
+    return res.status(500).json({ error: 'Internal server error generating charttrend', details: String(error) });
   }
 });
-
 
 app.get('/ward-trend', async (req, res) => {
   try {
