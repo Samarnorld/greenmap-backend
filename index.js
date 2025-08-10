@@ -1041,18 +1041,18 @@ app.get('/charttrend', async (req, res) => {
     return res.status(500).json({ error: 'Internal server error generating charttrend', details: String(error) });
   }
 });
+
 app.get('/most-deforested', async (req, res) => {
   try {
     console.log("[most-deforested] Calculating...");
 
     const pixelArea = ee.Image.pixelArea();
     const currentYear = new Date().getFullYear();
-    const latestYear = currentYear - 1; // last full year for stable stats
+    const latestYear = currentYear - 1; // last full year
     const prevYear = latestYear - 1;
 
     // Load wards from EE asset
     const wards = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered');
-
     const treeCollection = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').select('label');
 
     // Function to get tree percentage for a given ward and year
@@ -1100,16 +1100,10 @@ app.get('/most-deforested', async (req, res) => {
     // Find ward with maximum loss
     const mostDeforested = wardsWithLoss.sort('tree_loss', false).first();
 
-    const result = await mostDeforested.reduceColumns({
-      selectors: ['ward_name', 'tree_loss'],
-      reducer: ee.Reducer.first().combine({
-        reducer2: ee.Reducer.first(),
-        sharedInputs: false
-      })
-    }).getInfo();
-
-    const wardName = result.first;
-    const lossValue = result.first_1;
+    // Extract values directly
+    const result = await mostDeforested.getInfo();
+    const wardName = result.properties.ward_name;
+    const lossValue = result.properties.tree_loss;
 
     res.json({
       ward: wardName,
