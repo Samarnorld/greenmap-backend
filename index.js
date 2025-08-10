@@ -1046,30 +1046,30 @@ app.get('/most-deforested', async (req, res) => {
   try {
     console.log("[most-deforested] Calculating...");
 
-    // Use last *full* year (e.g., if now 2025, latestYear = 2024)
+    // Configurable thresholds (can be overridden via query params)
+    const MIN_LOSS_M2 = Number(req.query.minLossM2) || 1000;   // default 1,000 m² (~10 pixels at 10m)
+    const MIN_LOSS_PCT = Number(req.query.minLossPct) || 0.1;  // default 0.1%
+
+    // Use last *full* year
     const currentYear = new Date().getFullYear();
     const latestYear = currentYear - 1;
     const prevYear = latestYear - 1;
 
     const pixelArea = ee.Image.pixelArea();
-    // Load wards and drop features with no NAME_3 (avoid the 2 bad/empty features)
     const wards = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered')
       .filter(ee.Filter.notNull(['NAME_3']));
 
     const dw = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').select('label');
 
-    // Build yearly tree-area images using the *mode* tree label (class==1)
     const treeMaskForYear = (year) => {
       const start = ee.Date.fromYMD(year, 1, 1);
       const end = start.advance(1, 'year');
-      // mode() then eq(1) (class 1 = trees)
       return dw.filterDate(start, end).mode().eq(1);
     };
 
     const latestTreeAreaImg = treeMaskForYear(latestYear).multiply(pixelArea).rename('tree_m2');
     const prevTreeAreaImg = treeMaskForYear(prevYear).multiply(pixelArea).rename('tree_m2');
 
-    // Reduce over wards (returns a FeatureCollection where each feature has tree_m2 property)
     const latestPerWard = latestTreeAreaImg.reduceRegions({
       collection: wards,
       reducer: ee.Reducer.sum(),
@@ -1082,48 +1082,50 @@ app.get('/most-deforested', async (req, res) => {
       scale: 10
     });
 
-    // Total ward area (rename band to 'area' so property is consistent)
     const totalAreaFc = pixelArea.rename('area').reduceRegions({
       collection: wards,
       reducer: ee.Reducer.sum(),
       scale: 10
     });
 
-    // Evaluate (use your withRetry helper to avoid transient failures)
+    // Evaluate (with your existing retry wrapper)
     const [latestInfo, prevInfo, totalInfo] = await Promise.all([
       withRetry(latestPerWard),
       withRetry(prevPerWard),
       withRetry(totalAreaFc)
     ]);
 
-    // Build lookup maps keyed by normalized ward name
     const normalize = s => (s || '').toString().trim().toLowerCase();
+
     const latestMap = new Map();
     (latestInfo.features || []).forEach(f => {
       const name = f.properties.NAME_3 || f.properties.ward || f.properties.WARD || f.id;
       const key = normalize(name);
-      const tree_m2 = (f.properties && (f.properties.tree_m2 ?? f.properties.sum)) || 0;
-      latestMap.set(key, Number(tree_m2));
+      const m2 = Number((f.properties && (f.properties.tree_m2 ?? f.properties.sum)) || 0);
+      latestMap.set(key, m2);
     });
 
     const prevMap = new Map();
     (prevInfo.features || []).forEach(f => {
       const name = f.properties.NAME_3 || f.properties.ward || f.properties.WARD || f.id;
       const key = normalize(name);
-      const tree_m2 = (f.properties && (f.properties.tree_m2 ?? f.properties.sum)) || 0;
-      prevMap.set(key, Number(tree_m2));
+      const m2 = Number((f.properties && (f.properties.tree_m2 ?? f.properties.sum)) || 0);
+      prevMap.set(key, m2);
     });
 
-    // Build array of wards with computed percentages and loss
+    // Build per-ward results
     const wardResults = (totalInfo.features || []).map(f => {
       const name = f.properties.NAME_3 || f.properties.ward || f.properties.WARD || f.id;
       const key = normalize(name);
+
       const total_m2 = Number(f.properties?.area ?? f.properties?.sum ?? 0) || 0;
       const latest_m2 = latestMap.get(key) || 0;
       const prev_m2 = prevMap.get(key) || 0;
 
       const latest_pct = total_m2 > 0 ? (latest_m2 / total_m2) * 100 : null;
       const prev_pct = total_m2 > 0 ? (prev_m2 / total_m2) * 100 : null;
+
+      const loss_m2 = (prev_m2 - latest_m2);
       const loss = (prev_pct !== null && latest_pct !== null) ? (prev_pct - latest_pct) : null;
 
       return {
@@ -1133,37 +1135,74 @@ app.get('/most-deforested', async (req, res) => {
         prev_m2,
         latest_pct,
         prev_pct,
-        loss
+        loss,      // percent (prev_pct - latest_pct)
+        loss_m2    // absolute m² lost
       };
     });
 
-    // Filter out entries without a numeric loss and sort descending by loss (largest loss first)
-    const validLosses = wardResults.filter(w => typeof w.loss === 'number' && isFinite(w.loss));
-    validLosses.sort((a, b) => b.loss - a.loss);
+    // Strict candidates: previous year had trees, loss > 0, and meets at least one threshold (m2 OR pct)
+    const strictCandidates = wardResults.filter(w =>
+      typeof w.loss === 'number' && isFinite(w.loss) &&
+      w.loss > 0 &&
+      typeof w.prev_pct === 'number' && w.prev_pct > 0 &&
+      (w.loss_m2 >= MIN_LOSS_M2 || w.loss >= MIN_LOSS_PCT)
+    );
 
-    const top = validLosses[0] || null;
+    // sort by percent loss (desc), tiebreaker by absolute area lost
+    const sortDesc = arr => arr.sort((a, b) => {
+      if (b.loss !== a.loss) return b.loss - a.loss;
+      return (b.loss_m2 || 0) - (a.loss_m2 || 0);
+    });
 
-    // If nothing valid, return a safe default (so frontend doesn't crash on toFixed)
+    sortDesc(strictCandidates);
+
+    let top = strictCandidates[0] || null;
+    let note = null;
+
     if (!top) {
+      // If nothing met thresholds, try a looser filter: any positive loss with prev_pct > 0
+      const loose = wardResults.filter(w =>
+        typeof w.loss === 'number' && isFinite(w.loss) &&
+        w.loss > 0 &&
+        typeof w.prev_pct === 'number' && w.prev_pct > 0
+      );
+      sortDesc(loose);
+      if (loose.length > 0) {
+        top = loose[0];
+        note = `loss below thresholds (min ${MIN_LOSS_M2} m² or ${MIN_LOSS_PCT}% )`;
+      }
+    }
+
+    if (!top) {
+      // No deforestation detected
       res.setHeader('Cache-Control', 'public, max-age=3600');
       return res.json({
         ward: null,
         loss_pct: 0.00,
+        loss_m2: 0,
         latest_year: latestYear,
         previous_year: prevYear,
-        message: 'No valid ward tree-change data available'
+        message: 'No deforestation detected (no wards with prior tree cover lost between years)',
       });
     }
 
-    // Return nicely formatted numbers
+    // Return the winner with helpful fields & optional note. Round numbers for frontend.
     res.setHeader('Cache-Control', 'public, max-age=3600');
+    // log top 5 for diagnostics
+    const top5 = (strictCandidates.length ? strictCandidates : (wardResults.filter(w => w.loss > 0))).slice(0, 5)
+      .map(w => ({ ward: w.ward, loss_pct: Number((w.loss||0).toFixed(3)), loss_m2: Math.round(w.loss_m2||0) }));
+
+    console.log("[most-deforested] top candidates (up to 5):", top5);
+
     return res.json({
       ward: top.ward,
-      loss_pct: Number((top.loss || 0).toFixed(2)),
+      loss_pct: Number((top.loss || 0).toFixed(3)),
+      loss_m2: Math.round(top.loss_m2 || 0),
       latest_year: latestYear,
       previous_year: prevYear,
       latest_pct: top.latest_pct !== null ? Number(top.latest_pct.toFixed(3)) : null,
-      previous_pct: top.prev_pct !== null ? Number(top.prev_pct.toFixed(3)) : null
+      previous_pct: top.prev_pct !== null ? Number(top.prev_pct.toFixed(3)) : null,
+      note
     });
 
   } catch (err) {
@@ -1171,7 +1210,6 @@ app.get('/most-deforested', async (req, res) => {
     return res.status(500).json({ error: 'Most deforested ward error', details: String(err) });
   }
 });
-
 
 
 
