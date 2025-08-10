@@ -78,6 +78,17 @@ function startServer() {
     const normalized = wardName.trim();
     return wards.filter(ee.Filter.eq('NAME_3', normalized)).first().geometry();
   }
+function getAllWardNames() {
+  try {
+    if (!wardsGeoJSON || !wardsGeoJSON.features) return [];
+    return wardsGeoJSON.features.map(f =>
+      f.properties.ward || f.properties.NAME_3
+    );
+  } catch (err) {
+    console.error("Error in getAllWardNames:", err);
+    return [];
+  }
+}
 
   function getNDVI(start, end) {
   // Sentinel-2 collection
