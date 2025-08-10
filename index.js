@@ -1041,7 +1041,7 @@ app.get('/charttrend', async (req, res) => {
     return res.status(500).json({ error: 'Internal server error generating charttrend', details: String(error) });
   }
 });
-// Replace your old /most-deforested route with this one
+// Replace the old /most-deforested handler with this block
 app.get('/most-deforested', async (req, res) => {
   try {
     console.log('[most-deforested] Calculating...');
@@ -1050,26 +1050,24 @@ app.get('/most-deforested', async (req, res) => {
     const latestYear = currentYear - 1; // last full year
     const prevYear = latestYear - 1;
 
-    // Load wards asset, drop empty geometries and set a consistent name property
-    const wardsFc = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered')
-      .filter(ee.Filter.geometry()) // remove empty geometries
-      .map(function(f) {
-        // prefer NAME_3, fallback to 'ward' property if present
-        const name = ee.Algorithms.If(f.get('NAME_3'), f.get('NAME_3'), f.get('ward'));
-        return f.set('ward_name', name);
-      });
+    // Load wards, set ward_name and compute area to filter-out empty geometries
+    const wardsRaw = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered');
+    const wardsWithArea = wardsRaw.map(function(f) {
+      const name = ee.Algorithms.If(f.get('NAME_3'), f.get('NAME_3'), f.get('ward'));
+      return f.set('ward_name', name).set('area_m2', f.geometry().area());
+    });
+    const wards = wardsWithArea.filter(ee.Filter.gt('area_m2', 0)); // drop empty geometries
 
-    const pixelArea = ee.Image.pixelArea();
+    // Dynamic World tree label collection
     const dw = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').select('label');
 
-    // Build a fraction image for 'tree' class (0..1) for a given year
+    // Build fraction image for tree class (0..1) for a given year
     function treeFractionImage(year) {
       const start = ee.Date.fromYMD(year, 1, 1);
       const end = start.advance(1, 'year');
-      // eq(1) => tree class; unmask(0) ensures non-tree pixels become 0, mean() yields fraction
       return dw
         .filterDate(start, end)
-        .map(function(img) { return img.eq(1).rename('tree').unmask(0); })
+        .map(function(img) { return img.eq(1).rename('tree').unmask(0); }) // class==1 -> tree
         .mean()
         .rename('tree_frac');
     }
@@ -1077,37 +1075,41 @@ app.get('/most-deforested', async (req, res) => {
     const latestTreeFracImg = treeFractionImage(latestYear);
     const prevTreeFracImg = treeFractionImage(prevYear);
 
-    // Reduce per-ward (one call per year) — returns a FeatureCollection with per-ward fraction values
+    // Reduce per-ward (one server-side call per year)
     const latestPerWard = latestTreeFracImg.reduceRegions({
-      collection: wardsFc,
-      reducer: ee.Reducer.mean(), // yields a per-feature numeric value
-      scale: 10,
-      tileScale: 2,
-      bestEffort: true
-    });
-
-    const prevPerWard = prevTreeFracImg.reduceRegions({
-      collection: wardsFc,
+      collection: wards,
       reducer: ee.Reducer.mean(),
       scale: 10,
       tileScale: 2,
       bestEffort: true
     });
 
-    // Evaluate both server-side results once each (withRetry wraps getInfo and retries on timeout)
+    const prevPerWard = prevTreeFracImg.reduceRegions({
+      collection: wards,
+      reducer: ee.Reducer.mean(),
+      scale: 10,
+      tileScale: 2,
+      bestEffort: true
+    });
+
+    // Evaluate both server-side results (with retry wrapper)
     const latestInfo = await withRetry(latestPerWard, 3, 30000);
     const prevInfo = await withRetry(prevPerWard, 3, 30000);
 
-    // Helper: extract the numeric fraction for a feature's properties robustly
+    // Helper to find the numeric fraction (handles 'tree_frac', 'mean', etc.)
     const extractFraction = (props) => {
-      // Try the canonical property first
+      if (!props || typeof props !== 'object') return null;
+      // canonical
       if (typeof props.tree_frac === 'number' && !isNaN(props.tree_frac)) return props.tree_frac * 100;
-      // Some reduceRegions return the band name directly (e.g. 'tree' or other numeric keys) or 'mean'
-      // We'll pick the first numeric property likely to be the fraction and map 0..1 -> 0..100
+      if (typeof props.mean === 'number' && !isNaN(props.mean)) {
+        const v = props.mean;
+        if (v >= 0 && v <= 1.0001) return v * 100;
+        if (v >= 0 && v <= 100) return v;
+      }
+      // fallback: pick first numeric property that looks like a fraction or percent
       for (const k of Object.keys(props)) {
         const v = props[k];
         if (typeof v === 'number' && isFinite(v)) {
-          // Heuristics: if value is 0..1 treat as fraction, else if 0..100 treat as percent
           if (v >= 0 && v <= 1.0001) return v * 100;
           if (v >= 0 && v <= 100) return v;
         }
@@ -1115,39 +1117,39 @@ app.get('/most-deforested', async (req, res) => {
       return null;
     };
 
-    // Build lookup maps ward_name -> fraction (preserve original casing)
+    // Build maps ward_key -> fraction
     const latestMap = new Map();
     const prevMap = new Map();
-    const nameLookup = new Map(); // lowercase -> original casing name
+    const nameLookup = new Map();
 
     (latestInfo.features || []).forEach(f => {
-      const props = f.properties || {};
-      const rawName = (props.ward_name || props.NAME_3 || props.ward || '').toString();
+      const p = f.properties || {};
+      const rawName = (p.ward_name || p.NAME_3 || p.ward || '').toString();
       const key = rawName.trim().toLowerCase();
       if (!key) return;
       nameLookup.set(key, rawName);
-      const frac = extractFraction(props);
-      latestMap.set(key, (frac === null ? null : Number(frac)));
+      const frac = extractFraction(p);
+      latestMap.set(key, frac === null ? null : Number(frac));
     });
 
     (prevInfo.features || []).forEach(f => {
-      const props = f.properties || {};
-      const rawName = (props.ward_name || props.NAME_3 || props.ward || '').toString();
+      const p = f.properties || {};
+      const rawName = (p.ward_name || p.NAME_3 || p.ward || '').toString();
       const key = rawName.trim().toLowerCase();
       if (!key) return;
       nameLookup.set(key, rawName);
-      const frac = extractFraction(props);
-      prevMap.set(key, (frac === null ? null : Number(frac)));
+      const frac = extractFraction(p);
+      prevMap.set(key, frac === null ? null : Number(frac));
     });
 
-    // Combine keys and compute loss = prev - latest
+    // Combine and compute loss = prev - latest
     const keys = new Set([...latestMap.keys(), ...prevMap.keys()]);
     const results = [];
-
     keys.forEach(k => {
+      // treat missing as 0 (safe), but you can change to skip nulls if you prefer
       const latestPct = latestMap.has(k) && latestMap.get(k) !== null ? latestMap.get(k) : 0;
       const prevPct = prevMap.has(k) && prevMap.get(k) !== null ? prevMap.get(k) : 0;
-      const loss = prevPct - latestPct; // positive => lost tree cover
+      const loss = prevPct - latestPct;
       results.push({
         ward_key: k,
         ward: nameLookup.get(k) || k,
@@ -1163,7 +1165,6 @@ app.get('/most-deforested', async (req, res) => {
 
     // Sort by loss descending (largest loss first)
     results.sort((a, b) => b.loss - a.loss);
-
     const mostDeforested = results[0];
 
     res.setHeader('Cache-Control', 'public, max-age=3600');
@@ -1177,10 +1178,11 @@ app.get('/most-deforested', async (req, res) => {
     });
 
   } catch (err) {
-    console.error('❌ /most-deforested error:', err && (err.stack || err.message || err));
+    console.error('❌ /most-deforested error:', (err && (err.stack || err.message)) || err);
     return res.status(500).json({ error: 'Most deforested ward error', details: String(err && err.message ? err.message : err) });
   }
 });
+
 
 
 
