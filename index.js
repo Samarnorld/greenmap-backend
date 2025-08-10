@@ -1052,7 +1052,11 @@ app.get('/most-deforested', async (req, res) => {
     const prevYear = latestYear - 1;
 
     // Load wards from EE asset
-    const wards = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered');
+// Filter out wards with no geometry
+const wards = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered')
+  .filter(ee.Filter.notNull(['ward']))
+  .filter(ee.Filter.geometry()); // ensures valid geometry
+
     const treeCollection = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').select('label');
 
     // Function to get tree percentage for a given ward and year
