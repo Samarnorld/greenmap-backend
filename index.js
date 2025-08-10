@@ -1077,20 +1077,19 @@ app.get('/most-deforested', async (req, res) => {
 
     // Reduce per-ward (one server-side call per year)
     const latestPerWard = latestTreeFracImg.reduceRegions({
-      collection: wards,
-      reducer: ee.Reducer.mean(),
-      scale: 10,
-      tileScale: 2,
-      bestEffort: true
-    });
+  collection: wards,
+  reducer: ee.Reducer.mean(),
+  scale: 10,
+  tileScale: 2
+});
 
-    const prevPerWard = prevTreeFracImg.reduceRegions({
-      collection: wards,
-      reducer: ee.Reducer.mean(),
-      scale: 10,
-      tileScale: 2,
-      bestEffort: true
-    });
+const prevPerWard = prevTreeFracImg.reduceRegions({
+  collection: wards,
+  reducer: ee.Reducer.mean(),
+  scale: 10,
+  tileScale: 2
+});
+
 
     // Evaluate both server-side results (with retry wrapper)
     const latestInfo = await withRetry(latestPerWard, 3, 30000);
