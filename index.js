@@ -1410,6 +1410,202 @@ app.get('/ward-trend', async (req, res) => {
     res.status(500).json({ error: 'Ward trend error', details: String(err && err.message ? err.message : err) });
   }
 });
+// Add this route inside your `startServer()` function in index.js (place it near the other summary/stat endpoints)
+app.get('/indicators', async (req, res) => {
+  console.log('📡 /indicators called');
+
+  try {
+    // --- time windows ---
+    const now = ee.Date(Date.now());
+    const recentStart = now.advance(-120, 'day');      // NDVI recent window (120 days)
+    const pastRef = now.advance(-1, 'year');           // same window last year
+    const pastStart = pastRef.advance(-120, 'day');    // past NDVI window
+    const lstWindow = now.advance(-30, 'day');         // LST: last 30 days
+
+    // geometry & helpers
+    const geometry = wards.geometry();
+    const pixelArea = ee.Image.pixelArea();
+
+    // --- NDVI (recent and same period last year) ---
+    const ndviNowImg = getNDVI(recentStart, now);            // band: NDVI
+    const ndviPastImg = getNDVI(pastStart, pastRef);
+
+    const ndviNowRR = ndviNowImg.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry,
+      scale: 30,
+      maxPixels: 1e13
+    });
+    const ndviPastRR = ndviPastImg.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry,
+      scale: 30,
+      maxPixels: 1e13
+    });
+
+    // --- Tree canopy (ESA WorldCover class == 10) ---
+    const esa = ee.ImageCollection('ESA/WorldCover/v100').first().select('Map');
+    const treeMask = esa.eq(10).selfMask(); // class 10 = Trees
+    const treeAreaImg = treeMask.multiply(pixelArea).rename('tree_m2');
+    const treeAreaRR = treeAreaImg.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry,
+      scale: 10,
+      maxPixels: 1e13
+    });
+
+    const totalAreaRR = pixelArea.rename('area').clip(geometry).reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry,
+      scale: 10,
+      maxPixels: 1e13
+    });
+
+    // --- Built-up (quick S2-based approach over last year) ---
+    const s2col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      .filterBounds(geometry)
+      .filterDate(pastRef, now)
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20));
+
+    // ensure a fallback image with named bands if S2 empty
+    const s2Fallback = ee.Image.constant(0).rename(['B11', 'B8', 'B4']);
+    const s2Med = ee.Image(ee.Algorithms.If(s2col.size().gt(0), s2col.median(), s2Fallback));
+
+    const swir = s2Med.select('B11');
+    const nir = s2Med.select('B8');
+    const red = s2Med.select('B4');
+
+    const ndbi = swir.subtract(nir).divide(swir.add(nir).add(1e-9)).rename('NDBI');
+    const ndviProxy = nir.subtract(red).divide(nir.add(red).add(1e-9)).rename('NDVI_PROXY');
+
+    const builtMask = ndbi.gt(0).and(ndviProxy.lt(0.3)).selfMask();
+    const builtAreaImg = builtMask.multiply(pixelArea).rename('built_m2');
+    const builtAreaRR = builtAreaImg.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry,
+      scale: 10,
+      maxPixels: 1e13
+    });
+
+    // --- LST & UHI calculation ---
+    const lstImg = ee.ImageCollection('MODIS/061/MOD11A1')
+      .filterBounds(geometry)
+      .filterDate(lstWindow, now)
+      .select('LST_Day_1km')
+      .mean()
+      .multiply(0.02)
+      .subtract(273.15)
+      .rename('LST_C'); // Celsius
+
+    // Urban mean LST (mask by builtMask), Rural mean (inverse)
+    const urbanMeanRR = lstImg.updateMask(builtMask).reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry,
+      scale: 1000,
+      maxPixels: 1e13
+    });
+    const ruralMeanRR = lstImg.updateMask(builtMask.not()).reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry,
+      scale: 1000,
+      maxPixels: 1e13
+    });
+
+    // Hot area (pixels above threshold, here 30°C) -> area in m2
+    const hotAreaImg = lstImg.gt(30).multiply(pixelArea).rename('hot_m2');
+    const hotAreaRR = hotAreaImg.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry,
+      scale: 1000,
+      maxPixels: 1e13
+    });
+
+    // --- Evaluate (run getInfo via your withRetry helper to be robust) ---
+    const [
+      ndviNowRes,
+      ndviPastRes,
+      treeRes,
+      totalRes,
+      builtRes,
+      urbanRes,
+      ruralRes,
+      hotRes
+    ] = await Promise.all([
+      withRetry(ndviNowRR),
+      withRetry(ndviPastRR),
+      withRetry(treeAreaRR),
+      withRetry(totalAreaRR),
+      withRetry(builtAreaRR),
+      withRetry(urbanMeanRR),
+      withRetry(ruralMeanRR),
+      withRetry(hotAreaRR)
+    ]);
+
+    // --- Safely extract numeric values (defensive) ---
+    const safeNumber = (obj, keys) => {
+      if (!obj) return null;
+      for (const k of keys) {
+        if (obj.hasOwnProperty(k) && obj[k] !== null && obj[k] !== undefined) {
+          const n = Number(obj[k]);
+          return Number.isFinite(n) ? n : null;
+        }
+      }
+      return null;
+    };
+
+    const ndviNowVal = safeNumber(ndviNowRes, ['NDVI', 'NDVI_NOW', 'mean']);
+    const ndviPastVal = safeNumber(ndviPastRes, ['NDVI', 'NDVI_NOW', 'mean']);
+
+    const tree_m2 = safeNumber(treeRes, ['tree_m2', 'sum']);
+    const total_m2 = safeNumber(totalRes, ['area', 'sum']); // pixelArea was named 'area' earlier
+    const built_m2 = safeNumber(builtRes, ['built_m2', 'sum']);
+
+    const urbanLst = safeNumber(urbanRes, ['LST_C', 'mean']);
+    const ruralLst = safeNumber(ruralRes, ['LST_C', 'mean']);
+    const uhi = (urbanLst !== null && ruralLst !== null) ? (urbanLst - ruralLst) : null;
+
+    const hot_m2 = safeNumber(hotRes, ['hot_m2', 'sum']);
+    const hot_km2 = (hot_m2 !== null) ? (hot_m2 / 1e6) : null;
+
+    // --- Derived percentages / trends ---
+    const tree_pct = (tree_m2 !== null && total_m2 !== null && total_m2 > 0) ? (tree_m2 / total_m2) * 100 : null;
+    const built_pct = (built_m2 !== null && total_m2 !== null && total_m2 > 0) ? (built_m2 / total_m2) * 100 : null;
+
+    let ndvi_trend_pct = null;
+    if (ndviNowVal !== null && ndviPastVal !== null && ndviPastVal !== 0) {
+      ndvi_trend_pct = ((ndviNowVal - ndviPastVal) / Math.abs(ndviPastVal)) * 100;
+    }
+
+    // --- Respond ---
+    res.setHeader('Cache-Control', 'public, max-age=900'); // 15 minutes
+    return res.json({
+      updated: new Date().toISOString(),
+
+      // Primary indicators
+      tree_canopy_pct: tree_pct === null ? null : Number(tree_pct.toFixed(3)),
+      builtup_pct: built_pct === null ? null : Number(built_pct.toFixed(3)),
+      ndvi_avg: ndviNowVal === null ? null : Number(ndviNowVal.toFixed(4)),
+      ndvi_trend_pct: ndvi_trend_pct === null ? null : Number(ndvi_trend_pct.toFixed(3)),
+
+      // UHI / heat information
+      uhi_c: uhi === null ? null : Number(uhi.toFixed(2)),           // urban - rural mean (°C)
+      hot_area_m2: hot_m2 === null ? null : Math.round(hot_m2),     // total hot pixel area in m²
+      hot_area_km2: hot_km2 === null ? null : Number(hot_km2.toFixed(3)),
+
+      // raw intermediate numbers for diagnostics (optional)
+      _raw: {
+        tree_m2: tree_m2 === null ? null : Math.round(tree_m2),
+        built_m2: built_m2 === null ? null : Math.round(built_m2),
+        total_m2: total_m2 === null ? null : Math.round(total_m2),
+        urban_lst_mean_c: urbanLst === null ? null : Number(urbanLst.toFixed(3)),
+        rural_lst_mean_c: ruralLst === null ? null : Number(ruralLst.toFixed(3))
+      }
+    });
+  } catch (err) {
+    console.error('❌ /indicators error:', err && err.stack ? err.stack : err);
+    return res.status(500).json({ error: 'Failed to compute indicators', details: String(err && err.message ? err.message : err) });
+  }
+});
 
 
 app.get('/', (req, res) => {
