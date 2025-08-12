@@ -780,6 +780,7 @@ app.get('/treecanopy-stats', async (req, res) => {
   }
 });
 // GET /charttrend?startYear=2021&endYear=2025
+// GET /charttrend?startYear=2021&endYear=2025
 app.get('/charttrend', async (req, res) => {
   const log = {
     info: (...a) => console.info('[charttrend][INFO]', ...a),
@@ -787,7 +788,6 @@ app.get('/charttrend', async (req, res) => {
     error: (...a) => console.error('[charttrend][ERROR]', ...a)
   };
 
-  // Helper to evaluate an EE object with a timeout
   const evaluateAsync = (eeObject, timeoutMs = 180000) => new Promise((resolve, reject) => {
     let finished = false;
     try {
@@ -816,44 +816,38 @@ app.get('/charttrend', async (req, res) => {
   try {
     log.info('Request received for /charttrend');
 
-    // Parse query params with safe defaults
+    // parse query
     const qStart = parseInt(req.query.startYear, 10);
     const startYear = Number.isFinite(qStart) ? qStart : 2021;
     const qEnd = parseInt(req.query.endYear, 10);
     const endYear = Number.isFinite(qEnd) ? qEnd : new Date().getFullYear();
 
-    // Load wards asset and union into single geometry for city-wide stats
+    // city geometry and helpers
     const wards = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered');
     const nairobiGeom = wards.union().geometry();
-    const totalAreaM2 = ee.Number(nairobiGeom.area()); // ee.Number
+    const totalAreaM2 = ee.Number(nairobiGeom.area());
     const pixelArea = ee.Image.pixelArea();
 
-    // Arrays to collect EE results (ee.Number or nulls)
+    // collectors (EE objects / lists)
     const years = [];
-    const ndviVals = [];
-    const treeVals = [];        // 0..1 (probability)
-    const builtNDBIVals = [];   // legacy NDBI mask % (0..100)
-    const builtDWVals = [];     // Dynamic World built probability % (0..100)
-    const builtGHSLVals = [];   // GHSL built surface % (0..100)
-    const rainVals = [];
+    const ndviVals = [];      // MODIS mean NDVI (scaled)
+    const treeVals = [];      // DW trees probability (0..1)
+    const builtDWVals = [];   // DW built probability (converted to 0..100)
+    const rainVals = [];      // CHIRPS
 
-    log.info(`Preparing per-year evaluations for ${startYear}..${endYear} (count=${endYear - startYear + 1})`);
+    log.info(`Queueing years ${startYear}..${endYear}`);
 
     for (let y = startYear; y <= endYear; y++) {
       years.push(y);
-
-      // Year window
       const start = ee.Date.fromYMD(y, 1, 1);
       const end = ee.Date.fromYMD(y, 12, 31);
 
-      // ---------------------------
-      // NDVI (MODIS annual mean, scaled)
-      // ---------------------------
+      // NDVI (MODIS annual mean)
       const ndviImg = ee.ImageCollection('MODIS/061/MOD13Q1')
         .filterDate(start, end)
         .select('NDVI')
         .mean()
-        .multiply(0.0001); // scale factor
+        .multiply(0.0001);
 
       const ndviVal = ndviImg.reduceRegion({
         reducer: ee.Reducer.mean(),
@@ -863,26 +857,21 @@ app.get('/charttrend', async (req, res) => {
         tileScale: 4,
         bestEffort: true
       }).get('NDVI');
-
       ndviVals.push(ndviVal);
-      log.info(`NDVI ${y} queued`);
+      log.info(`NDVI queued for ${y}`);
 
-      // ---------------------------
-      // Tree coverage (Dynamic World probability => robust fractional cover)
-      // ---------------------------
+      // Tree cover (Dynamic World 'trees' probability average across city)
       const dwTreesCol = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
         .filterDate(start, end)
         .filterBounds(nairobiGeom)
         .select('trees');
 
-      // mean probability image (0..1). If no DW images, fallback to constant 0.
       const dwTreesMean = ee.Image(ee.Algorithms.If(
         dwTreesCol.size().gt(0),
         dwTreesCol.mean(),
         ee.Image.constant(0).rename('trees')
       )).clip(nairobiGeom);
 
-      // Reduce by mean probability across the city (0..1)
       const treeFrac = dwTreesMean.reduceRegion({
         reducer: ee.Reducer.mean(),
         geometry: nairobiGeom,
@@ -890,73 +879,11 @@ app.get('/charttrend', async (req, res) => {
         maxPixels: 1e13,
         tileScale: 4,
         bestEffort: true
-      }).get('trees'); // 0..1
-
+      }).get('trees');
       treeVals.push(treeFrac);
-      log.info(`Tree (DW prob) ${y} queued`);
+      log.info(`Tree (DW) queued for ${y}`);
 
-      // ---------------------------
-      // BUILT-UP: three methods
-      //  A) legacy NDBI mask (your ward method)
-      //  B) Dynamic World built probability (preferred for annual change)
-      //  C) GHSL built_surface (5-year baseline, authoritative)
-      // ---------------------------
-
-      // Prepare sensor collections (S2 preferred, Landsat as fallback)
-      const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-        .filterBounds(nairobiGeom)
-        .filterDate(start, end)
-        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
-        .select(['B4', 'B8', 'B11']);
-
-      const landsat = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
-        .filterBounds(nairobiGeom)
-        .filterDate(start, end)
-        .filter(ee.Filter.lt('CLOUD_COVER', 10))
-        .select(['SR_B4', 'SR_B5', 'SR_B7'])
-        .map(img => img.multiply(0.0000275).add(-0.2).copyProperties(img, img.propertyNames()));
-
-      // Composites: prefer S2 median, else Landsat median, else constant
-      const s2Med = ee.Image(ee.Algorithms.If(s2.size().gt(0), s2.median(), ee.Image.constant(0)));
-      const lsMed = ee.Image(ee.Algorithms.If(landsat.size().gt(0), landsat.median(), ee.Image.constant(0)));
-
-      const hasS2 = s2.size().gt(0);
-      const hasLS = landsat.size().gt(0);
-
-      // NDVI proxy (S2 or Landsat)
-      const ndviProxy = ee.Image(ee.Algorithms.If(
-        hasS2,
-        s2Med.normalizedDifference(['B8', 'B4']),
-        ee.Algorithms.If(hasLS, lsMed.normalizedDifference(['SR_B5', 'SR_B4']), ee.Image.constant(0))
-      ));
-
-      // NDBI (S2 or Landsat)
-      const ndbiFromS2 = s2Med.select('B11').subtract(s2Med.select('B8'))
-        .divide(s2Med.select('B11').add(s2Med.select('B8')).add(1e-9)).rename('NDBI');
-      const ndbiFromLS = lsMed.select('SR_B7').subtract(lsMed.select('SR_B5'))
-        .divide(lsMed.select('SR_B7').add(lsMed.select('SR_B5')).add(1e-9)).rename('NDBI');
-
-      const ndbiImg = ee.Image(ee.Algorithms.If(hasS2, ndbiFromS2, ee.Algorithms.If(hasLS, ndbiFromLS, ee.Image.constant(-1))));
-
-      // legacy built mask: (ndbi > 0 OR ndviProxy < 0.12) AND ndviProxy < 0.3
-      const builtMaskImg = (ndbiImg.gt(0).or(ndviProxy.lt(0.12))).and(ndviProxy.lt(0.3)).selfMask();
-      const builtAreaImage = builtMaskImg.multiply(pixelArea).rename('built_m2');
-
-      // legacy NDBI-based built-up percent
-      const builtSum = builtAreaImage.reduceRegion({
-        reducer: ee.Reducer.sum(),
-        geometry: nairobiGeom,
-        scale: 10,
-        maxPixels: 1e13,
-        tileScale: 4,
-        bestEffort: true
-      }).get('built_m2');
-
-      const builtPct = ee.Number(builtSum).divide(totalAreaM2).multiply(100);
-      builtNDBIVals.push(builtPct);
-      log.info(`Built (NDBI) ${y} queued`);
-
-      // ---- Dynamic World built probability (preferred) ----
+      // Built-up (Dynamic World 'built' probability)
       const dwBuiltCol = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
         .filterDate(start, end)
         .filterBounds(nairobiGeom)
@@ -968,7 +895,6 @@ app.get('/charttrend', async (req, res) => {
         ee.Image.constant(0).rename('built')
       )).clip(nairobiGeom);
 
-      // mean built probability across the city (0..1) -> convert to percent
       const builtDWMean = dwBuiltMean.reduceRegion({
         reducer: ee.Reducer.mean(),
         geometry: nairobiGeom,
@@ -976,34 +902,13 @@ app.get('/charttrend', async (req, res) => {
         maxPixels: 1e13,
         tileScale: 4,
         bestEffort: true
-      }).get('built'); // 0..1 or null
+      }).get('built'); // 0..1
 
-      const builtDWpct = ee.Number(builtDWMean).multiply(100);
-      builtDWVals.push(builtDWpct);
-      log.info(`Built (DW prob) ${y} queued`);
+      // convert to percent 0..100
+      builtDWVals.push(ee.Number(builtDWMean).multiply(100));
+      log.info(`Built (DW) queued for ${y}`);
 
-      // ---- GHSL baseline (nearest 5-year step) ----
-      // GHSL uses 100m grid; pick nearest 5-year snapshot
-      const nearest5 = Math.round((y - 1975) / 5) * 5 + 1975;
-      const ghslId = `JRC/GHSL/P2023A/GHS_BUILT_S/${nearest5}`;
-      const ghslImg = ee.Image(ghslId).select('built_surface'); // m2 per 100m cell
-
-      const ghslBuiltSum = ghslImg.reduceRegion({
-        reducer: ee.Reducer.sum(),
-        geometry: nairobiGeom,
-        scale: 100,
-        maxPixels: 1e13,
-        tileScale: 4,
-        bestEffort: true
-      }).get('built_surface');
-
-      const builtGHSLpct = ee.Number(ghslBuiltSum).divide(totalAreaM2).multiply(100);
-      builtGHSLVals.push(builtGHSLpct);
-      log.info(`Built (GHSL ${nearest5}) ${y} queued`);
-
-      // ---------------------------
-      // Rainfall (CHIRPS annual sum -> mean across geometry)
-      // ---------------------------
+      // Rainfall (CHIRPS annual sum -> mean)
       const rainSumImg = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
         .filterDate(start, end)
         .select('precipitation')
@@ -1019,36 +924,32 @@ app.get('/charttrend', async (req, res) => {
       }).get('precipitation');
 
       rainVals.push(rainMean);
-      log.info(`Rain ${y} queued`);
-    } // end for years
+      log.info(`Rain queued for ${y}`);
+    } // for years
 
-    log.info(`Prepared EE lists for years ${startYear}..${endYear} (count=${years.length}). Calling evaluate()`);
-
-    // Pack everything and evaluate once
+    log.info('Preparing ee.Dictionary and evaluating');
     const allData = ee.Dictionary({
       years: years,
       ndvi: ee.List(ndviVals),
-      tree_frac: ee.List(treeVals),         // 0..1
-      built_pct_ndbi: ee.List(builtNDBIVals), // 0..100
-      built_pct_dw: ee.List(builtDWVals),   // 0..100
-      built_pct_ghsl: ee.List(builtGHSLVals), // 0..100
-      rainfall: ee.List(rainVals)           // mm
+      tree_frac: ee.List(treeVals),        // 0..1
+      built_pct_dw: ee.List(builtDWVals), // 0..100
+      rainfall: ee.List(rainVals)
     });
 
     let rawResult;
     try {
-      rawResult = await evaluateAsync(allData, 180000); // 3 minutes
+      rawResult = await evaluateAsync(allData, 180000);
     } catch (eeErr) {
       log.error('Earth Engine evaluation failed:', eeErr && eeErr.stack ? eeErr.stack : eeErr);
       return res.status(502).json({ error: 'Earth Engine evaluation failed', details: String(eeErr) });
     }
 
     if (!rawResult) {
-      log.error('EE evaluate returned empty result (null/undefined).');
+      log.error('Empty result from Earth Engine');
       return res.status(502).json({ error: 'Empty result from Earth Engine' });
     }
 
-    // Helper: normalize arrays into numbers or nulls
+    // Normalizer
     const normalizeArray = (arr, expectedLen) => {
       if (!Array.isArray(arr)) {
         if (arr !== undefined && arr !== null && typeof arr === 'number') {
@@ -1069,30 +970,22 @@ app.get('/charttrend', async (req, res) => {
     const payload = {
       years: rawResult.years ?? years,
       ndvi: normalizeArray(rawResult.ndvi ?? rawResult.NDVI, n),
-      // convert tree_frac (0..1) to percent (0..100)
       tree_coverage: normalizeArray(rawResult.tree_frac, n).map(v => (v === null ? null : Number((v * 100).toFixed(3)))),
-      // Built-up: provide three series for comparison
-      built_nDBI: normalizeArray(rawResult.built_pct_ndbi, n).map(v => (v === null ? null : Number((v).toFixed(4)))),
-      built_dw: normalizeArray(rawResult.built_pct_dw, n).map(v => (v === null ? null : Number((v).toFixed(4)))),
-      built_ghsl: normalizeArray(rawResult.built_pct_ghsl, n).map(v => (v === null ? null : Number((v).toFixed(4)))),
+      // Built-up (Dynamic World) as percent 0..100
+      built_dw: normalizeArray(rawResult.built_pct_dw, n).map(v => (v === null ? null : Number(Number(v).toFixed(4)))),
       rainfall: normalizeArray(rawResult.rainfall ?? rawResult.precipitation ?? rawResult.rain, n)
     };
 
     log.info('Returning payload summary:', {
       years_count: payload.years.length || n,
-      ndvi_sample: payload.ndvi.slice(0, 3),
-      tree_sample: payload.tree_coverage.slice(0, 3),
-      built_sample: {
-        nDBI: payload.built_nDBI.slice(0, 3),
-        DW: payload.built_dw.slice(0, 3),
-        GHSL: payload.built_ghsl.slice(0, 3)
-      },
-      rain_sample: payload.rainfall.slice(0, 3)
+      built_sample: payload.built_dw.slice(0, 3),
+      tree_sample: payload.tree_coverage.slice(0, 3)
     });
 
     return res.json(payload);
+
   } catch (error) {
-    console.error('[charttrend][FATAL] Uncaught error in /charttrend:', error && error.stack ? error.stack : error);
+    console.error('[charttrend][FATAL] Uncaught error:', error && error.stack ? error.stack : error);
     return res.status(500).json({ error: 'Internal server error generating charttrend', details: String(error) });
   }
 });
