@@ -779,7 +779,8 @@ app.get('/treecanopy-stats', async (req, res) => {
     res.status(500).json({ error: 'Tree canopy trend stats failed', details: err.message });
   }
 });
-// Assumes `ee` (Earth Engine) is already initialized elsewhere in your server.
+// GET /charttrend?startYear=2021&endYear=2025
+// GET /charttrend?startYear=2021&endYear=2025
 app.get('/charttrend', async (req, res) => {
   const log = {
     info: (...a) => console.info('[charttrend][INFO]', ...a),
@@ -787,7 +788,6 @@ app.get('/charttrend', async (req, res) => {
     error: (...a) => console.error('[charttrend][ERROR]', ...a)
   };
 
-  // Helper to evaluate an EE object with a timeout
   const evaluateAsync = (eeObject, timeoutMs = 180000) => new Promise((resolve, reject) => {
     let finished = false;
     try {
@@ -816,86 +816,78 @@ app.get('/charttrend', async (req, res) => {
   try {
     log.info('Request received for /charttrend');
 
-    // Parse params (defaults to last 7 years if not provided)
+    // parse query
     const qStart = parseInt(req.query.startYear, 10);
+    const startYear = Number.isFinite(qStart) ? qStart : 2021;
     const qEnd = parseInt(req.query.endYear, 10);
-    const currentYear = new Date().getFullYear();
-    const defaultStart = currentYear - 6; // last 7 years inclusive
-    const startYear = Number.isFinite(qStart) ? qStart : defaultStart;
-    const endYear = Number.isFinite(qEnd) ? qEnd : currentYear;
+    const endYear = Number.isFinite(qEnd) ? qEnd : new Date().getFullYear();
 
-    // Load wards asset and union into single geometry for city-wide stats
+    // city geometry and helpers
     const wards = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered');
     const nairobiGeom = wards.union().geometry();
-    // total area (m^2) as ee.Number - useful if needed for area-weighted computations
     const totalAreaM2 = ee.Number(nairobiGeom.area());
     const pixelArea = ee.Image.pixelArea();
 
+    // collectors (EE objects / lists)
     const years = [];
-    const ndviVals = [];    // ee.Image reductions (mean NDVI)
-    const treeVals = [];    // DW 'trees' mean probability (0..1)
-    const builtVals = [];   // DW 'built' mean probability converted to % (0..100)
-    const rainVals = [];    // annual rainfall (mm, mean over geometry)
+    const ndviVals = [];      // MODIS mean NDVI (scaled)
+    const treeVals = [];      // DW trees probability (0..1)
+    const builtDWVals = [];   // DW built probability (converted to 0..100)
+    const rainVals = [];      // CHIRPS
 
     log.info(`Queueing years ${startYear}..${endYear}`);
 
-    // Loop server-side building EE objects (not evaluated yet)
     for (let y = startYear; y <= endYear; y++) {
       years.push(y);
       const start = ee.Date.fromYMD(y, 1, 1);
       const end = ee.Date.fromYMD(y, 12, 31);
 
-      // --- NDVI (MODIS annual mean) ---
+      // NDVI (MODIS annual mean)
       const ndviImg = ee.ImageCollection('MODIS/061/MOD13Q1')
         .filterDate(start, end)
         .select('NDVI')
         .mean()
-        .multiply(0.0001); // scale factor
-      const ndviMean = ndviImg.reduceRegion({
+        .multiply(0.0001);
+
+      const ndviVal = ndviImg.reduceRegion({
         reducer: ee.Reducer.mean(),
         geometry: nairobiGeom,
         scale: 250,
         maxPixels: 1e13,
-        tileScale: 2,
+        tileScale: 4,
         bestEffort: true
       }).get('NDVI');
-      ndviVals.push(ndviMean);
-      log.info(`NDVI ${y} queued`);
+      ndviVals.push(ndviVal);
+      log.info(`NDVI queued for ${y}`);
 
-      // --- Tree cover: Dynamic World fractional (PROBABILITY BAND 'trees') ---
-      // Use the per-class probability band 'trees' and compute its mean (0..1).
+      // Tree cover (Dynamic World 'trees' probability average across city)
       const dwTreesCol = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
         .filterDate(start, end)
         .filterBounds(nairobiGeom)
-        .select('trees'); // probability band (0..1) named 'trees' in DW
+        .select('trees');
 
-      // If DW images exist, compute the per-pixel mean probability, else fallback to 0 image.
       const dwTreesMean = ee.Image(ee.Algorithms.If(
         dwTreesCol.size().gt(0),
         dwTreesCol.mean(),
         ee.Image.constant(0).rename('trees')
       )).clip(nairobiGeom);
 
-      // Area-weighted or simple mean? We'll compute the mean probability across the geometry (effectively fraction)
-      // (Because pixel areas are similar at city scale, this is acceptable; if you need strict area-weighting,
-      // compute sum(probability * pixelArea) / sum(pixelArea).)
       const treeFrac = dwTreesMean.reduceRegion({
         reducer: ee.Reducer.mean(),
         geometry: nairobiGeom,
         scale: 10,
         maxPixels: 1e13,
-        tileScale: 2,
+        tileScale: 4,
         bestEffort: true
-      }).get('trees'); // 0..1
-
+      }).get('trees');
       treeVals.push(treeFrac);
-      log.info(`Tree (DW probability) ${y} queued`);
+      log.info(`Tree (DW) queued for ${y}`);
 
-      // --- Built-up: Dynamic World built probability (preferred) ---
+      // Built-up (Dynamic World 'built' probability)
       const dwBuiltCol = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
         .filterDate(start, end)
         .filterBounds(nairobiGeom)
-        .select('built'); // probability band
+        .select('built');
 
       const dwBuiltMean = ee.Image(ee.Algorithms.If(
         dwBuiltCol.size().gt(0),
@@ -903,22 +895,20 @@ app.get('/charttrend', async (req, res) => {
         ee.Image.constant(0).rename('built')
       )).clip(nairobiGeom);
 
-      // Option A: compute mean probability across geometry (gives fraction 0..1)
-      const builtMeanProb = dwBuiltMean.reduceRegion({
+      const builtDWMean = dwBuiltMean.reduceRegion({
         reducer: ee.Reducer.mean(),
         geometry: nairobiGeom,
         scale: 10,
         maxPixels: 1e13,
-        tileScale: 2,
+        tileScale: 4,
         bestEffort: true
       }).get('built'); // 0..1
 
-      // Convert to percent on the EE side (keeps precision until evaluate)
-      const builtPct = ee.Number(builtMeanProb).multiply(100);
-      builtVals.push(builtPct);
-      log.info(`Built (DW probability) ${y} queued`);
+      // convert to percent 0..100
+      builtDWVals.push(ee.Number(builtDWMean).multiply(100));
+      log.info(`Built (DW) queued for ${y}`);
 
-      // --- Rainfall: CHIRPS annual sum (mm) then mean across geometry ---
+      // Rainfall (CHIRPS annual sum -> mean)
       const rainSumImg = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
         .filterDate(start, end)
         .select('precipitation')
@@ -929,39 +919,37 @@ app.get('/charttrend', async (req, res) => {
         geometry: nairobiGeom,
         scale: 5000,
         maxPixels: 1e13,
-        tileScale: 2,
+        tileScale: 4,
         bestEffort: true
       }).get('precipitation');
 
       rainVals.push(rainMean);
-      log.info(`Rain ${y} queued`);
+      log.info(`Rain queued for ${y}`);
     } // for years
 
-    log.info('Assembling ee.Dictionary for evaluation');
-
-    // Pack everything into an EE dictionary and evaluate once (single request)
+    log.info('Preparing ee.Dictionary and evaluating');
     const allData = ee.Dictionary({
       years: years,
       ndvi: ee.List(ndviVals),
-      tree_frac: ee.List(treeVals),   // 0..1
-      built_up: ee.List(builtVals),   // percent (0..100) as ee.Number
+      tree_frac: ee.List(treeVals),        // 0..1
+      built_pct_dw: ee.List(builtDWVals), // 0..100
       rainfall: ee.List(rainVals)
     });
 
     let rawResult;
     try {
-      rawResult = await evaluateAsync(allData, 180000); // 3 minutes
+      rawResult = await evaluateAsync(allData, 180000);
     } catch (eeErr) {
       log.error('Earth Engine evaluation failed:', eeErr && eeErr.stack ? eeErr.stack : eeErr);
       return res.status(502).json({ error: 'Earth Engine evaluation failed', details: String(eeErr) });
     }
 
     if (!rawResult) {
-      log.error('EE evaluate returned empty result (null/undefined).');
+      log.error('Empty result from Earth Engine');
       return res.status(502).json({ error: 'Empty result from Earth Engine' });
     }
 
-    // Helper: normalize arrays into numbers or nulls
+    // Normalizer
     const normalizeArray = (arr, expectedLen) => {
       if (!Array.isArray(arr)) {
         if (arr !== undefined && arr !== null && typeof arr === 'number') {
@@ -979,30 +967,25 @@ app.get('/charttrend', async (req, res) => {
     };
 
     const n = years.length;
-
-    // Build final payload. NOTE:
-    // - NDVI returned by MODIS is in 0..1 (already scaled)
-    // - tree_frac is 0..1 -> convert to percent 0..100
-    // - built_up in our ee.Dictionary was stored as percent (0..100) already
     const payload = {
       years: rawResult.years ?? years,
       ndvi: normalizeArray(rawResult.ndvi ?? rawResult.NDVI, n),
       tree_coverage: normalizeArray(rawResult.tree_frac, n).map(v => (v === null ? null : Number((v * 100).toFixed(3)))),
-      built_up: normalizeArray(rawResult.built_up, n).map(v => (v === null ? null : Number(Number(v).toFixed(4)))),
+      // Built-up (Dynamic World) as percent 0..100
+      built_dw: normalizeArray(rawResult.built_pct_dw, n).map(v => (v === null ? null : Number(Number(v).toFixed(4)))),
       rainfall: normalizeArray(rawResult.rainfall ?? rawResult.precipitation ?? rawResult.rain, n)
     };
 
     log.info('Returning payload summary:', {
       years_count: payload.years.length || n,
-      ndvi_sample: payload.ndvi.slice(0, 3),
-      tree_sample: payload.tree_coverage.slice(0, 3),
-      built_sample: payload.built_up.slice(0, 3),
-      rain_sample: payload.rainfall.slice(0, 3)
+      built_sample: payload.built_dw.slice(0, 3),
+      tree_sample: payload.tree_coverage.slice(0, 3)
     });
 
     return res.json(payload);
+
   } catch (error) {
-    console.error('[charttrend][FATAL] Uncaught error in /charttrend:', error && error.stack ? error.stack : error);
+    console.error('[charttrend][FATAL] Uncaught error:', error && error.stack ? error.stack : error);
     return res.status(500).json({ error: 'Internal server error generating charttrend', details: String(error) });
   }
 });
