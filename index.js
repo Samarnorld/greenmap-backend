@@ -484,6 +484,139 @@ app.get('/builtup-stats', (req, res) => {
   });
 });
 
+// place this AFTER you initialise `ee` and after `wards` (ee.FeatureCollection) is defined.
+// Put it before app.listen(...) and after your other route handlers (e.g., /indicators).
+
+app.get(['/builtup-stats-dw', '/api/builtup-stats-dw'], async (req, res) => {
+  console.log('📡 /builtup-stats-dw called');
+  // Allow cross-origin (optionally remove if you enable cors globally)
+  res.setHeader('Access-Control-Allow-Origin', '*');
+
+  try {
+    if (typeof wards === 'undefined' || !wards) {
+      console.error('❌ /builtup-stats-dw: wards is not defined in server scope');
+      return res.status(500).json({ error: 'Server misconfiguration: wards not defined' });
+    }
+
+    // --- time window: either ?year=YYYY or last 12 months ---
+    let startDate, endDate;
+    if (req.query.year) {
+      const y = parseInt(req.query.year, 10);
+      if (Number.isFinite(y)) {
+        startDate = ee.Date.fromYMD(y, 1, 1);
+        endDate = ee.Date.fromYMD(y, 12, 31);
+      } else {
+        startDate = ee.Date(Date.now()).advance(-1, 'year');
+        endDate = ee.Date(Date.now());
+      }
+    } else {
+      endDate = ee.Date(Date.now());
+      startDate = endDate.advance(-1, 'year');
+    }
+
+    // --- Dynamic World: built probability band ---
+    const dwCol = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+      .filterBounds(wards)
+      .filterDate(startDate, endDate)
+      .select('built'); // 'built' is the fractional probability band (0..1)
+
+    // If no DW images found, fallback to constant 0 image to avoid errors
+    const safeBuiltMean = ee.Image(ee.Algorithms.If(dwCol.size().gt(0), dwCol.mean(), ee.Image.constant(0)))
+      .clip(wards)
+      .rename('built_prob_mean');
+
+    const pixelArea = ee.Image.pixelArea(); // m^2 per pixel
+
+    // expected built area per pixel (probability * pixelArea)
+    const builtAreaImg = safeBuiltMean.multiply(pixelArea).rename('built_m2');
+
+    // total built area (sum over city)
+    const builtTotalRR = builtAreaImg.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: wards.geometry(),
+      scale: 10,        // Dynamic World is Sentinel-2-based (10m)
+      maxPixels: 1e13,
+      tileScale: 4
+    });
+
+    // total city area
+    const totalAreaRR = pixelArea.rename('area').reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: wards.geometry(),
+      scale: 10,
+      maxPixels: 1e13,
+      tileScale: 4
+    });
+
+    // per-ward built-up (sum of expected built m2 inside each ward)
+    const perWardFC = builtAreaImg.reduceRegions({
+      collection: wards,
+      reducer: ee.Reducer.sum(),
+      scale: 10
+    }).map(function (f) {
+      // compute ward area accurately on server
+      const wardArea = f.geometry().area(10);
+      const built_m2 = ee.Number(f.get('sum'));
+      const built_pct = ee.Algorithms.If(wardArea.gt(0), built_m2.divide(wardArea).multiply(100), null);
+      return f.set({
+        built_m2: built_m2,
+        ward_area_m2: wardArea,
+        built_pct: built_pct
+      });
+    });
+
+    // Helper to promisify getInfo calls
+    const getInfo = (eeObj) => new Promise((resolve, reject) => {
+      eeObj.getInfo((result, err) => {
+        if (err) reject(err);
+        else resolve(result);
+      });
+    });
+
+    // retrieve results in parallel
+    const [builtRes, areaRes, perWardRes] = await Promise.all([
+      getInfo(builtTotalRR),
+      getInfo(totalAreaRR),
+      getInfo(perWardFC)
+    ]);
+
+    // Extract numeric values safely
+    const built_m2 = builtRes && (builtRes.built_m2 || builtRes.sum) ? Number(builtRes.built_m2 || builtRes.sum) : 0;
+    const total_m2 = areaRes && (areaRes.area || areaRes.sum) ? Number(areaRes.area || areaRes.sum) : null;
+    const city_built_pct = (total_m2 && total_m2 > 0) ? (built_m2 / total_m2) * 100 : null;
+
+    // Build per-ward array; field names will depend on your wards FeatureCollection properties
+    const perWardArray = (perWardRes.features || []).map(f => {
+      const p = f.properties || {};
+      return {
+        ward: (p.wards || p.NAME_3 || p.name || p.WARD || 'Unknown'),
+        built_m2: p.built_m2 ?? p.sum ?? 0,
+        ward_area_m2: p.ward_area_m2 ?? null,
+        built_pct: p.built_pct !== undefined && p.built_pct !== null ? Number(Number(p.built_pct).toFixed(3)) : null
+      };
+    });
+
+    // respond
+    res.setHeader('Cache-Control', 'public, max-age=3600'); // 1 hour
+    return res.json({
+      updated: new Date().toISOString(),
+      method: 'dynamicworld_mean_built',
+      period: {
+        start: startDate.format('YYYY-MM-dd').getInfo ? startDate.format('YYYY-MM-dd').getInfo() : null,
+        end: endDate.format('YYYY-MM-dd').getInfo ? endDate.format('YYYY-MM-dd').getInfo() : null
+      },
+      city_built_m2: Math.round(built_m2),
+      city_total_m2: total_m2 ? Math.round(total_m2) : null,
+      city_built_pct: city_built_pct !== null ? Number(city_built_pct.toFixed(3)) : null,
+      per_ward: perWardArray
+    });
+
+  } catch (err) {
+    console.error('❌ /builtup-stats-dw error:', err && err.stack ? err.stack : err);
+    return res.status(500).json({ error: 'Failed to compute built-up stats (Dynamic World)', details: String(err && err.message ? err.message : err) });
+  }
+});
+
 app.get('/wards', async (req, res) => {
 
   const now = ee.Date(Date.now()).advance(-30, 'day');
