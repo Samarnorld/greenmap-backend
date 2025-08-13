@@ -1464,8 +1464,100 @@ app.get('/ward-trend', async (req, res) => {
   }
 });
 // Add this route inside your `startServer()` function in index.js (place it near the other summary/stat endpoints)
+// Assumes: `ee` (Earth Engine) is initialized and `app` (Express) is available.
+// This is a self-contained /indicators route: includes withRetry and getNDVI helpers.
+// Place this into your index.js (or wherever you mount routes). Adjust asset path
+// for wards if you keep wards as a global variable elsewhere.
+
+// NOTE: if you already have a `withRetry` or `getNDVI` helper in your codebase,
+// remove duplicates and keep the preferred version.
+
 app.get('/indicators', async (req, res) => {
   console.log('📡 /indicators called');
+
+  // Helper: robust getInfo wrapper with retries/backoff
+  function withRetry(computedObj, retries = 4, backoff = 1000) {
+    return new Promise((resolve, reject) => {
+      let attempt = 0;
+      function tryOnce() {
+        attempt++;
+        // computedObj should be an ee.ComputedObject (ee.Dictionary from reduceRegion, etc.)
+        try {
+          computedObj.getInfo((result, err) => {
+            if (err) {
+              if (attempt <= retries) {
+                const delay = backoff * Math.pow(2, attempt - 1);
+                console.warn(`withRetry: attempt ${attempt} failed — retrying in ${delay} ms`, err && err.message ? err.message : err);
+                setTimeout(tryOnce, delay);
+              } else {
+                console.error('withRetry: all attempts failed', err && err.message ? err.message : err);
+                reject(err);
+              }
+            } else {
+              resolve(result);
+            }
+          });
+        } catch (e) {
+          // defensive fallback if getInfo throws synchronously
+          if (attempt <= retries) {
+            const delay = backoff * Math.pow(2, attempt - 1);
+            setTimeout(tryOnce, delay);
+          } else {
+            reject(e);
+          }
+        }
+      }
+      tryOnce();
+    });
+  }
+
+  // Helper: NDVI composite over a date window with Sentinel-2 > Landsat-7 > MODIS fallback
+  function getNDVI(startDate, endDate, geometryForFilter) {
+    // Start/end are ee.Date objects
+    // geometryForFilter is an ee.Geometry/FeatureCollection used in filters/clip.
+    var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+      .filterBounds(geometryForFilter)
+      .filterDate(startDate, endDate)
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+      .select(['B4', 'B8']);
+
+    var l7 = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+      .filterBounds(geometryForFilter)
+      .filterDate(startDate, endDate)
+      .filter(ee.Filter.lt('CLOUD_COVER', 20))
+      .select(['SR_B4', 'SR_B5'])
+      .map(function(img) {
+        // Apply sensor scale/offset for L7 SR bands (as in your other scripts).
+        return img.multiply(0.0000275).add(-0.2).copyProperties(img, img.propertyNames());
+      });
+
+    var modis = ee.ImageCollection('MODIS/006/MOD13Q1')
+      .filterBounds(geometryForFilter)
+      .filterDate(startDate, endDate)
+      .select('NDVI')
+      .map(function(img) { return img.multiply(0.0001); });
+
+    // median composites
+    var s2Median = s2.median();
+    var l7Median = l7.median();
+    var modisMedian = modis.median();
+
+    var s2Exists = s2.size().gt(0);
+    var l7Exists = l7.size().gt(0);
+
+    var s2NDVI = s2Median.normalizedDifference(['B8', 'B4']).rename('NDVI');
+    var l7NDVI = l7Median.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+    var modisNDVI = modisMedian.rename('NDVI');
+
+    // Prioritize S2 (if present), else Landsat-7, else MODIS fallback
+    var ndviImage = ee.Image(ee.Algorithms.If(
+      s2Exists,
+      ee.Algorithms.If(s2.size().gt(0), s2NDVI, ee.Algorithms.If(l7Exists, l7NDVI, modisNDVI)),
+      ee.Algorithms.If(l7Exists, l7NDVI, modisNDVI)
+    ));
+
+    return ndviImage.clip(geometryForFilter);
+  }
 
   try {
     // --- time windows ---
@@ -1476,42 +1568,56 @@ app.get('/indicators', async (req, res) => {
     const lstWindow = now.advance(-30, 'day');         // LST: last 30 days
 
     // geometry & helpers
-    const geometry = wards.geometry();
-    const pixelArea = ee.Image.pixelArea();
+    // If you already have `wards` as an ee.FeatureCollection in scope, it will be used.
+    // Otherwise the route falls back to this asset path — update if your asset path is different.
+    const wardsFC = (typeof wards !== 'undefined') ? wards : ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered');
+    const geometry = wardsFC.geometry();
+    const pixelArea = ee.Image.pixelArea(); // will inherit projection when multiplied with an image
 
     // --- NDVI (recent and same period last year) ---
-    const ndviNowImg = getNDVI(recentStart, now);            // band: NDVI
-    const ndviPastImg = getNDVI(pastStart, pastRef);
+    // using the getNDVI(startDate, endDate, geometry) helper
+    const ndviNowImg = getNDVI(recentStart, now, geometry);            // band: NDVI
+    const ndviPastImg = getNDVI(pastStart, pastRef, geometry);
 
     const ndviNowRR = ndviNowImg.reduceRegion({
       reducer: ee.Reducer.mean(),
-      geometry,
-      scale: 30,
-      maxPixels: 1e13
+      geometry: geometry,
+      scale: 30,           // keep a moderate scale so both Sentinel and Landsat & MODIS can be safely reduced
+      maxPixels: 1e13,
+      tileScale: 4
     });
+
     const ndviPastRR = ndviPastImg.reduceRegion({
       reducer: ee.Reducer.mean(),
-      geometry,
+      geometry: geometry,
       scale: 30,
-      maxPixels: 1e13
+      maxPixels: 1e13,
+      tileScale: 4
     });
 
     // --- Tree canopy (ESA WorldCover class == 10) ---
-    const esa = ee.ImageCollection('ESA/WorldCover/v100').first().select('Map');
-    const treeMask = esa.eq(10).selfMask(); // class 10 = Trees
-    const treeAreaImg = treeMask.multiply(pixelArea).rename('tree_m2');
-    const treeAreaRR = treeAreaImg.reduceRegion({
+    // NOTE: WorldCover is commonly available as a single image "ESA/WorldCover/v100/2020" with band "Map".
+    // Some code paths use ImageCollection('ESA/WorldCover/v100').first() — we attempt a robust approach.
+    var esaImg = ee.Image('ESA/WorldCover/v100/2020').select('Map');
+    // If your environment doesn't have that exact ID, replace above with your preferred ESA call.
+    var treeMask = esaImg.eq(10).selfMask(); // class 10 = Trees
+    var treeAreaImg = treeMask.multiply(pixelArea).rename('tree_m2');
+
+    var treeAreaRR = treeAreaImg.reduceRegion({
       reducer: ee.Reducer.sum(),
-      geometry,
+      geometry: geometry,
       scale: 10,
-      maxPixels: 1e13
+      maxPixels: 1e13,
+      tileScale: 4
     });
 
-    const totalAreaRR = pixelArea.rename('area').clip(geometry).reduceRegion({
+    // Total area (derived from pixelArea) — scale matched to 10 m
+    const totalAreaRR = ee.Image.pixelArea().rename('area').clip(geometry).reduceRegion({
       reducer: ee.Reducer.sum(),
-      geometry,
+      geometry: geometry,
       scale: 10,
-      maxPixels: 1e13
+      maxPixels: 1e13,
+      tileScale: 4
     });
 
     // --- Built-up (quick S2-based approach over last year) ---
@@ -1520,27 +1626,32 @@ app.get('/indicators', async (req, res) => {
       .filterDate(pastRef, now)
       .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20));
 
-    // ensure a fallback image with named bands if S2 empty
-    const s2Fallback = ee.Image.constant(0).rename(['B11', 'B8', 'B4']);
+    // ensure a fallback multi-band image if S2 empty
+    const s2Fallback = ee.Image.constant([0,0,0]).rename(['B11', 'B8', 'B4']);
     const s2Med = ee.Image(ee.Algorithms.If(s2col.size().gt(0), s2col.median(), s2Fallback));
 
     const swir = s2Med.select('B11');
     const nir = s2Med.select('B8');
     const red = s2Med.select('B4');
 
-    const ndbi = swir.subtract(nir).divide(swir.add(nir).add(1e-9)).rename('NDBI');
-    const ndviProxy = nir.subtract(red).divide(nir.add(red).add(1e-9)).rename('NDVI_PROXY');
+    // small epsilon to avoid division by zero
+    const eps = 1e-9;
+    const ndbi = swir.subtract(nir).divide(swir.add(nir).add(eps)).rename('NDBI');
+    const ndviProxy = nir.subtract(red).divide(nir.add(red).add(eps)).rename('NDVI_PROXY');
 
     const builtMask = ndbi.gt(0).and(ndviProxy.lt(0.3)).selfMask();
     const builtAreaImg = builtMask.multiply(pixelArea).rename('built_m2');
+
     const builtAreaRR = builtAreaImg.reduceRegion({
       reducer: ee.Reducer.sum(),
-      geometry,
+      geometry: geometry,
       scale: 10,
-      maxPixels: 1e13
+      maxPixels: 1e13,
+      tileScale: 4
     });
 
     // --- LST & UHI calculation ---
+    // Use MOD11A1 (daily LST, 1km). We average across lstWindow..now
     const lstImg = ee.ImageCollection('MODIS/061/MOD11A1')
       .filterBounds(geometry)
       .filterDate(lstWindow, now)
@@ -1551,29 +1662,34 @@ app.get('/indicators', async (req, res) => {
       .rename('LST_C'); // Celsius
 
     // Urban mean LST (mask by builtMask), Rural mean (inverse)
+    // builtMask is higher resolution than modis; using scale=1000 for reduction
     const urbanMeanRR = lstImg.updateMask(builtMask).reduceRegion({
       reducer: ee.Reducer.mean(),
-      geometry,
+      geometry: geometry,
       scale: 1000,
-      maxPixels: 1e13
+      maxPixels: 1e13,
+      tileScale: 4
     });
-    const ruralMeanRR = lstImg.updateMask(builtMask.not()).reduceRegion({
+
+    const ruralMeanRR = lstImg.updateMask(builtMask.unmask().not()).reduceRegion({
       reducer: ee.Reducer.mean(),
-      geometry,
+      geometry: geometry,
       scale: 1000,
-      maxPixels: 1e13
+      maxPixels: 1e13,
+      tileScale: 4
     });
 
     // Hot area (pixels above threshold, here 30°C) -> area in m2
-    const hotAreaImg = lstImg.gt(30).multiply(pixelArea).rename('hot_m2');
+    const hotAreaImg = lstImg.gt(30).multiply(ee.Image.pixelArea()).rename('hot_m2');
     const hotAreaRR = hotAreaImg.reduceRegion({
       reducer: ee.Reducer.sum(),
-      geometry,
+      geometry: geometry,
       scale: 1000,
-      maxPixels: 1e13
+      maxPixels: 1e13,
+      tileScale: 4
     });
 
-    // --- Evaluate (run getInfo via your withRetry helper to be robust) ---
+    // --- Evaluate (run getInfo via withRetry) ---
     const [
       ndviNowRes,
       ndviPastRes,
@@ -1598,7 +1714,7 @@ app.get('/indicators', async (req, res) => {
     const safeNumber = (obj, keys) => {
       if (!obj) return null;
       for (const k of keys) {
-        if (obj.hasOwnProperty(k) && obj[k] !== null && obj[k] !== undefined) {
+        if (Object.prototype.hasOwnProperty.call(obj, k) && obj[k] !== null && obj[k] !== undefined) {
           const n = Number(obj[k]);
           return Number.isFinite(n) ? n : null;
         }
@@ -1606,11 +1722,11 @@ app.get('/indicators', async (req, res) => {
       return null;
     };
 
-    const ndviNowVal = safeNumber(ndviNowRes, ['NDVI', 'NDVI_NOW', 'mean']);
-    const ndviPastVal = safeNumber(ndviPastRes, ['NDVI', 'NDVI_NOW', 'mean']);
+    const ndviNowVal = safeNumber(ndviNowRes, ['NDVI', 'ndvi', 'mean']);
+    const ndviPastVal = safeNumber(ndviPastRes, ['NDVI', 'ndvi', 'mean']);
 
     const tree_m2 = safeNumber(treeRes, ['tree_m2', 'sum']);
-    const total_m2 = safeNumber(totalRes, ['area', 'sum']); // pixelArea was named 'area' earlier
+    const total_m2 = safeNumber(totalRes, ['area', 'sum']); // pixelArea named 'area'
     const built_m2 = safeNumber(builtRes, ['built_m2', 'sum']);
 
     const urbanLst = safeNumber(urbanRes, ['LST_C', 'mean']);
@@ -1659,7 +1775,6 @@ app.get('/indicators', async (req, res) => {
     return res.status(500).json({ error: 'Failed to compute indicators', details: String(err && err.message ? err.message : err) });
   }
 });
-
 
 app.get('/', (req, res) => {
   res.send('✅ GreenMap Earth Engine backend is live');
