@@ -647,20 +647,17 @@ app.get('/treecoverage', (req, res) => {
   const start = ee.Date.fromYMD(year, 1, 1);
   const end = start.advance(1, 'year');
 
-  // Use the fractional 'trees' band averaged over the year (0..1)
-  const dwTreesProb = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+  const dw = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
     .filterBounds(geometry)
     .filterDate(start, end)
-    .select('trees')
-    .mean()
-    .rename('trees_prob')
-    .clip(geometry);
+    .select('label');
 
-  // Serve fractional probability (frontend can convert to percent or threshold if desired)
-  serveTile(dwTreesProb, {
+  const treeMask = dw.mode().eq(1).selfMask(); // Class 1 = Trees
+
+  serveTile(treeMask, {
     min: 0,
     max: 1,
-    palette: ['#d9f0d3', '#1a9850']
+    palette: ['#d9f0d3', '#1a9850'] // light to dark green
   }, res);
 });
 
@@ -708,40 +705,29 @@ app.get('/treecanopy-stats', async (req, res) => {
   const end = start.advance(1, 'year');
 
   try {
-     // --- Dynamic World: trees probability (fractional) for the year ---
-  const dwProbCol = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
-    .filterBounds(geometry)
-    .filterDate(start, end)
-    .select('trees');
+    const dwImg = dwCollection.filterDate(start, end).mode();
+    const treeMask = dwImg.eq(1).selfMask(); // Class 1 = Trees
+    const treeArea = treeMask.multiply(pixelArea).rename('tree_m2');
 
-  // annual mean fractional probability (0..1)
-  const treesProb = dwProbCol.mean().rename('trees_prob').clip(geometry);
+    // City-level tree coverage
+    const [cityTreeInfo, cityTotalInfo] = await Promise.all([
+      treeArea.reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry,
+        scale: 10,
+        maxPixels: 1e13
+      }).getInfo(),
+      pixelArea.clip(geometry).reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry,
+        scale: 10,
+        maxPixels: 1e13
+      }).getInfo()
+    ]);
 
-  // expected tree area = sum(trees_prob * pixelArea)
-  const treeArea = treesProb.multiply(pixelArea).rename('tree_m2');
-
-  // City-level tree coverage (expected area)
-  const [cityTreeInfo, cityTotalInfo] = await Promise.all([
-    treeArea.reduceRegion({
-      reducer: ee.Reducer.sum(),
-      geometry,
-      scale: 10,
-      maxPixels: 1e13,
-      tileScale: 4
-    }).getInfo(),
-    pixelArea.clip(geometry).reduceRegion({
-      reducer: ee.Reducer.sum(),
-      geometry,
-      scale: 10,
-      maxPixels: 1e13,
-      tileScale: 4
-    }).getInfo()
-  ]);
-
-  // robust extraction of values (handle different returned keys)
-  const city_tree_m2 = (cityTreeInfo && (cityTreeInfo.tree_m2 || cityTreeInfo.sum)) ? (cityTreeInfo.tree_m2 || cityTreeInfo.sum) : 0;
-  const city_total_m2 = (cityTotalInfo && (cityTotalInfo.area || cityTotalInfo.sum)) ? (cityTotalInfo.area || cityTotalInfo.sum) : 1;
-  const city_tree_pct = (city_tree_m2 / city_total_m2) * 100;
+    const city_tree_m2 = cityTreeInfo?.tree_m2 ?? 0;
+    const city_total_m2 = cityTotalInfo?.area ?? 1;
+    const city_tree_pct = (city_tree_m2 / city_total_m2) * 100;
 
     // === Add this ===
     const wardStatsRaw = await treeArea.reduceRegions({
@@ -1273,17 +1259,14 @@ app.get('/ward-trend', async (req, res) => {
       // built mask: SWIR-based NDBI > 0 OR conservative NDVI-proxy (NDVI < 0.12), still require NDVI<0.3
       const builtMaskImg = (ndbiImg.gt(0).or(ndviImg.lt(0.12))).and(ndviImg.lt(0.3)).selfMask();
 
-         // Use Dynamic World fractional 'trees' band mean (expected area)
-      const treesProb = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
-        .filterBounds(geometry)
+      // Tree mask (Dynamic World)
+      const treeMask = treeCollection
         .filterDate(start, end)
-        .select('trees')
-        .mean()
-        .rename('trees_prob')
-        .clip(geometry);
+        .mode()
+        .eq(1)
+        .selfMask();
 
-      const treeArea = treesProb.multiply(pixelArea).rename('tree_m2');
-
+      const treeArea = treeMask.multiply(pixelArea).rename('tree_m2');
       const builtArea = builtMaskImg.multiply(pixelArea).rename('built_m2');
 
       // Total ward area using pixelArea
