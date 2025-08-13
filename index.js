@@ -1168,6 +1168,110 @@ app.get('/most-deforested', async (req, res) => {
     return res.status(500).json({ error: 'Most deforested ward error', details: String(err) });
   }
 });
+// GET /wardsstatstree
+// Returns per-ward tree stats (tree_m2, area_m2, tree_pct) for the latest Dynamic World year.
+// Paste this route below your existing /ward-trend route.
+app.get('/wardsstatstree', async (req, res) => {
+  try {
+    // 1) Load wards asset (same as in your other code)
+    const wardsFc = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered');
+    const nairobiGeom = wardsFc.geometry();
+
+    // 2) DW collection intersecting Nairobi & count
+    const dwColAll = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').filterBounds(nairobiGeom);
+    const dwCount = await dwColAll.size().getInfo(); // number
+
+    // 3) Determine latest DW year (safe fallback)
+    let latestYear;
+    if (dwCount > 0) {
+      const maxTime = await dwColAll.aggregate_max('system:time_start').getInfo(); // epoch ms
+      // aggregate_max returns a timestamp (ms) or null; guard it
+      latestYear = maxTime ? new Date(maxTime).getUTCFullYear() : new Date().getFullYear();
+    } else {
+      // no DW images intersecting - use current year as fallback (will yield zeros)
+      latestYear = new Date().getFullYear();
+    }
+
+    // 4) Build label collection for that year and compute modal label (mode)
+    const labelCol = dwColAll.filter(ee.Filter.calendarRange(latestYear, latestYear, 'year')).select('label');
+    const labelColSize = await labelCol.size().getInfo();
+
+    // If there are images this year, take the mode; otherwise a constant 0 image
+    const labelModeImg = (labelColSize > 0)
+      ? labelCol.mode()
+      : ee.Image.constant(0).rename('label_mode');
+
+    // 5) Binary tree mask = modal label == 1 (trees), ensure zeros where masked
+    const treeMaskBinary = labelModeImg.eq(1).rename('tree_mask').unmask(0);
+
+    // 6) Pixel area on same grid and expected tree area (m2)
+    const pixelArea = ee.Image.pixelArea();
+    const treeAreaImage = treeMaskBinary.multiply(pixelArea).rename('tree_m2');
+    const stacked = treeAreaImage.addBands(pixelArea.rename('area_m2')); // two bands: tree_m2, area_m2
+
+    // 7) Attach ward_area_m2 property (geometry area) to each ward to keep a safe fallback
+    const wardsWithGeomArea = wardsFc.map(function(f) {
+      return f.set('ward_area_m2', f.geometry().area());
+    });
+
+    // 8) Reduce sums to wards (sum of tree_m2 and area_m2) - use scale=10 and tileScale for robustness
+    const perWardFc = stacked.reduceRegions({
+      collection: wardsWithGeomArea,
+      reducer: ee.Reducer.sum(),
+      scale: 10,
+      tileScale: 4
+    });
+
+    // 9) Fetch results to the Node side
+    const perWardInfo = await perWardFc.getInfo(); // returns FeatureCollection JSON
+
+    // 10) Build tidy array of ward stats (handle different possible property names returned by EE)
+    const wardsOut = (perWardInfo.features || []).map(function(feat) {
+      const p = feat.properties || {};
+
+      // Ward name (try common fields)
+      const wardName = p.NAME_3 || p.NAME || p.ward || p.WARD || 'Unknown';
+
+      // tree_m2: prefer explicit property, else 'sum' fallback (first band's sum)
+      let tree_m2 = 0;
+      if (typeof p.tree_m2 !== 'undefined') tree_m2 = Number(p.tree_m2);
+      else if (typeof p.sum !== 'undefined' && typeof p.sum_1 !== 'undefined') tree_m2 = Number(p.sum);
+      else if (typeof p.sum !== 'undefined' && typeof p.sum_1 === 'undefined') tree_m2 = Number(p.sum);
+      else tree_m2 = 0;
+
+      // area_m2: prefer explicit property, else 'sum_1' (second band's sum), else fallback to ward_area_m2
+      let area_m2 = 0;
+      if (typeof p.area_m2 !== 'undefined') area_m2 = Number(p.area_m2);
+      else if (typeof p.sum_1 !== 'undefined') area_m2 = Number(p.sum_1);
+      else if (typeof p.ward_area_m2 !== 'undefined') area_m2 = Number(p.ward_area_m2);
+      else area_m2 = 0;
+
+      // Compute percent safely
+      const tree_pct = (area_m2 > 0) ? (tree_m2 / area_m2) * 100 : 0;
+
+      return {
+        ward: wardName,
+        tree_m2,
+        area_m2,
+        tree_pct: Number(tree_pct.toFixed(6)) // high precision; adjust formatting as you want
+      };
+    });
+
+    // 11) Sort by tree_pct descending and return JSON
+    wardsOut.sort((a, b) => b.tree_pct - a.tree_pct);
+
+    res.setHeader('Cache-Control', 'public, max-age=1800');
+    res.json({
+      updated: new Date().toISOString(),
+      latestYear: latestYear,
+      count: wardsOut.length,
+      wards: wardsOut
+    });
+  } catch (err) {
+    console.error('❌ /wardsstatstree error:', err);
+    res.status(500).json({ error: 'wardsstatstree failed', details: String(err && err.message ? err.message : err) });
+  }
+});
 
 
 app.get('/ward-trend', async (req, res) => {
