@@ -199,10 +199,10 @@ app.get('/ndvi-mask', (req, res) => {
     ee.Image.constant(0).rename('NDVI').updateMask(ee.Image(0)) // fully transparent fallback
   );
 
-  const mask = ee.Image(ndvi).updateMask(ee.Image(ndvi).gt(0.3));
+  const mask = ee.Image(ndvi).updateMask(ee.Image(ndvi).gt(0.4));
 
   serveTile(mask, {
-    min: 0.3,
+    min: 0.4,
     max: 0.8,
     palette: ['yellow', 'green']
   }, res);
