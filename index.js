@@ -724,7 +724,7 @@ app.get('/greencoverage', (req, res) => {
   const start = now.advance(-120, 'day');
   const ndvi = getNDVI(start, now);
 
-  const greenMask = ndvi.gt(0.4).selfMask(); // You can tweak threshold here
+  const greenMask = ndvi.gt(0.3).selfMask(); // You can tweak threshold here
   const pixelArea = ee.Image.pixelArea();
 
   const greenArea = greenMask.multiply(pixelArea).rename('green_m2');
