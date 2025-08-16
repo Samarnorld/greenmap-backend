@@ -735,15 +735,23 @@ app.get('/greencoverage', (req, res) => {
 
   const now = ee.Date(Date.now());
   const start = now.advance(-120, 'day');
+
+  // Compute NDVI from Sentinel-2
   const ndvi = getNDVI(start, now);
 
-  const greenMask = ndvi.gt(0.3).selfMask(); // You can tweak threshold here
+  // Mask NDVI > 0.3 (considered vegetation)
+  const greenMask = ndvi.gt(0.3);
+
+  // Pixel area (m²)
   const pixelArea = ee.Image.pixelArea();
 
+  // Green area (only where NDVI > 0.3)
   const greenArea = greenMask.multiply(pixelArea).rename('green_m2');
 
-  const totalArea = pixelArea.rename('total_m2').clip(wards);
+  // Total ward area
+  const totalArea = pixelArea.clip(wards).rename('total_m2');
 
+  // Reduce to total city green area
   const greenStats = greenArea.reduceRegion({
     reducer: ee.Reducer.sum(),
     geometry: wards.geometry(),
@@ -751,6 +759,7 @@ app.get('/greencoverage', (req, res) => {
     maxPixels: 1e13
   });
 
+  // Reduce to total city area
   const totalStats = totalArea.reduceRegion({
     reducer: ee.Reducer.sum(),
     geometry: wards.geometry(),
@@ -758,6 +767,7 @@ app.get('/greencoverage', (req, res) => {
     maxPixels: 1e13
   });
 
+  // Get results
   greenStats.getInfo((greenRes, err1) => {
     if (err1) {
       console.error("❌ Green cover error:", err1);
@@ -767,14 +777,14 @@ app.get('/greencoverage', (req, res) => {
     totalStats.getInfo((areaRes, err2) => {
       if (err2) {
         console.error("❌ Total area error:", err2);
-        return res.status(500).json({ error: 'Failed to compute area' });
+        return res.status(500).json({ error: 'Failed to compute total area' });
       }
 
       const green_m2 = greenRes['green_m2'] || 0;
-      const total_m2 = areaRes['total_m2'] || 1;
+      const total_m2 = areaRes['total_m2'] || 1; // prevent divide by zero
       const green_pct = (green_m2 / total_m2) * 100;
 
-      res.setHeader('Cache-Control', 'public, max-age=1800');
+      res.setHeader('Cache-Control', 'public, max-age=1800'); // cache 30 mins
       res.json({
         updated: new Date().toISOString(),
         city_green_m2: green_m2,
@@ -784,6 +794,7 @@ app.get('/greencoverage', (req, res) => {
     });
   });
 });
+
 app.get('/treecoverage', (req, res) => {
   const geometry = req.query.ward
     ? getWardGeometryByName(req.query.ward)
