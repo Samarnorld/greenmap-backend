@@ -155,31 +155,89 @@ function serveTile(image, visParams, res) {
   });
 }
 
- app.get('/ndvi', (req, res) => {
-  const inputDate = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
-const endDate = inputDate;
-const startDate = endDate.advance(-120, 'day');
+// --- Helpers: pixel-level masking + NDVI per-image ---
+function maskS2CloudsShadows(img) {
+  // Sentinel-2 SR has Scene Classification Layer (SCL)
+  var scl = img.select('SCL');
+  // Keep valid classes; drop no-data/saturated/shadow/cloud/cirrus/snow
+  var valid =
+      scl.neq(0)   // No data
+      .and(scl.neq(1))   // Saturated/defective
+      .and(scl.neq(3))   // Cloud shadow
+      .and(scl.neq(8))   // Cloud, medium probability
+      .and(scl.neq(9))   // Cloud, high probability
+      .and(scl.neq(10))  // Thin cirrus
+      .and(scl.neq(11)); // Snow/ice
 
-  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-    .filterBounds(wards)
+  // Optional: also drop water if you don't want water boosting variability
+  // valid = valid.and(scl.neq(6)); // Water
+
+  // Scale reflectance to [0..1] (S2 SR is 0..10000). Ratio cancels, but good hygiene.
+  var scaled = img.updateMask(valid).divide(10000);
+
+  // Keep only needed bands for NDVI downstream
+  return scaled.select(['B4','B8']).copyProperties(img, ['system:time_start']);
+}
+
+function ndviPerImage(img) {
+  return img.normalizedDifference(['B8','B4']).rename('NDVI')
+            .copyProperties(img, ['system:time_start']);
+}
+
+// --- Route: robust NDVI ---
+app.get('/ndvi', (req, res) => {
+  // Inputs
+  var inputDate = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
+  var days = ee.Number.parse(req.query.days || '30'); // default to last 30 days
+  var endDate = inputDate;
+  var startDate = endDate.advance(days.multiply(-1), 'day');
+
+  // Geometry: whole city or a single ward
+  var geometry = req.query.ward ? getWardGeometryByName(req.query.ward) : wards.geometry();
+
+  // Build & mask collection
+  var s2sr = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(geometry)                 // use ward geometry for speed/precision
     .filterDate(startDate, endDate)
-    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
-    .select(['B4', 'B8']);
+    // scene-level filter is loose; pixel masking does the heavy lifting
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 80))
+    .map(maskS2CloudsShadows);
 
-  const ndvi = ee.Algorithms.If(
-    s2.size().gt(0),
-    s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
-   ee.Image.constant(0).rename('NDVI').updateMask(ee.Image(0)).clip(wards)
+  // NDVI per image
+  var ndviCol = s2sr.map(ndviPerImage);
+
+  // If no images, return an empty (masked) image gracefully
+  var hasData = ndviCol.size().gt(0);
+  var ndviImg = ee.Image(ee.Algorithms.If(
+    hasData,
+    // Choose a robust statistic for "current condition"
+    // Options: .median(), .max(), percentile
+    ndviCol.reduce(ee.Reducer.percentile([50])).rename(['NDVI']),
+    ee.Image(0).updateMask(ee.Image(0)).rename('NDVI')
+  ));
+
+  // Clip to geometry (ward/all wards)
+  var ndviClipped = ndviImg.clip(geometry);
+
+  // Visualize with a wider range so stress is visible
+  // You can tweak to min:-0.2, max:0.9, and a 5-color palette for nuance
+  serveTile(
+    ndviClipped,
+    {
+      min: -0.2,
+      max: 0.9,
+      palette: [
+        '#3b0f0f', // very low
+        '#b33636', // low
+        '#f0c419', // moderate
+        '#7fbf7b', // good
+        '#1a9641'  // very good
+      ]
+    },
+    res
   );
-
-  const geometry = req.query.ward ? getWardGeometryByName(req.query.ward) : wards.geometry();
-const ndviClipped = ee.Image(ndvi).clip(geometry);
-serveTile(ndviClipped, {
-    min: 0,
-    max: 0.8,
-    palette: ['red', 'yellow', 'green']
-  }, res);
 });
+
 app.get('/lst', (req, res) => {
   const inputDate = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
 const endDate = inputDate;
