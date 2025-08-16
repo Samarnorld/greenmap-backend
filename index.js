@@ -100,7 +100,9 @@ function startServer() {
   }
 
 function getNDVI(startDate, endDate) {
-  var s2sr = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  // Returns a single-band ee.Image named 'NDVI' computed as the 50th percentile
+  // of cloud/shadow-masked Sentinel-2 NDVI over the provided window.
+  var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
     .filterDate(startDate, endDate)
     .filterBounds(wards)
     .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 80))
@@ -111,18 +113,19 @@ function getNDVI(startDate, endDate) {
                    .and(scl.neq(9)).and(scl.neq(10))
                    .and(scl.neq(11));
       var scaled = img.updateMask(mask).divide(10000);
-      return scaled.normalizedDifference(['B8','B4']).rename('NDVI')
-                   .copyProperties(img, ['system:time_start']);
+      // produce an NDVI band named 'NDVI' for each image
+      var ndvi = scaled.normalizedDifference(['B8','B4']).rename('NDVI');
+      return ndvi.copyProperties(img, ['system:time_start']);
     });
 
-  // If no images, return a masked image
+  // Reduce using 50th percentile. The reducer will produce 'NDVI_p50' — rename to 'NDVI'.
   return ee.Image(ee.Algorithms.If(
-    s2sr.size().gt(0),
-    s2sr.reduce(ee.Reducer.percentile([50])), // median NDVI
+    s2.size().gt(0),
+    s2.reduce(ee.Reducer.percentile([50])).select(['NDVI_p50']).rename('NDVI'),
+    // fallback: a fully-masked NDVI image named 'NDVI'
     ee.Image(0).updateMask(ee.Image(0)).rename('NDVI')
   ));
 }
-
 
 
 function serveTile(image, visParams, res) {
@@ -624,19 +627,22 @@ app.get(['/builtup-stats-dw', '/api/builtup-stats-dw'], async (req, res) => {
 
 app.get('/wards', async (req, res) => {
 
+  // Define now and past windows (recent 30 days vs same period last year)
   const now = ee.Date(Date.now()).advance(-30, 'day');
   const oneYearAgo = now.advance(-1, 'year');
 
-  const startNDVI = now.advance(-30, 'day');
-  const startNDVIPast = oneYearAgo.advance(-120, 'day');
+  const startNDVI = now.advance(-30, 'day');            // last 30 days
+  const startNDVIPast = oneYearAgo.advance(-30, 'day'); // same window last year
 
   const rainRange = parseInt(req.query.range) || 30;
   const startRain = now.advance(-rainRange, 'day');
   const startRainPast = oneYearAgo.advance(-rainRange, 'day');
 
-  const ndvi_now = getNDVI(startNDVI, now).rename('NDVI_NOW');
-  const ndvi_past = getNDVI(startNDVIPast, oneYearAgo).rename('NDVI_PAST');
+  // NDVI images (each has a band named 'NDVI')
+  const ndvi_now = getNDVI(startNDVI, now);
+  const ndvi_past = getNDVI(startNDVIPast, oneYearAgo);
 
+  // LST (unchanged)
   const lst = ee.ImageCollection('MODIS/061/MOD11A1')
     .filterBounds(wards)
     .filterDate(startNDVI, now)
@@ -646,6 +652,7 @@ app.get('/wards', async (req, res) => {
     .subtract(273.15)
     .rename('LST_C');
 
+  // Rainfall (unchanged)
   const chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
     .filterBounds(wards)
     .select('precipitation');
@@ -654,74 +661,75 @@ app.get('/wards', async (req, res) => {
   const rain_past = chirps.filterDate(startRainPast, oneYearAgo).sum().rename('Rain_Past');
   const rain_anomaly = rain_now.subtract(rain_past).rename('Rain_Anomaly');
 
- const pixelArea = ee.Image.pixelArea();
+  // Per-ward reduction (use median for NDVI to avoid small green patches skewing the mean)
+  const results = wards.map(function(ward) {
+    const geom = ward.geometry();
 
- // Reduce NDVI and other stats per ward
- const results = wards.map(function (ward) {
-   const geom = ward.geometry();
+    const ndvi_now_median = ndvi_now.reduceRegion({
+      reducer: ee.Reducer.median(),
+      geometry: geom,
+      scale: 10,
+      maxPixels: 1e13
+    }).get('NDVI');
 
- const ndvi_now_median = ndvi_now.reduceRegion({
-  reducer: ee.Reducer.median(),
-     geometry: geom,
-     scale: 10,
-     maxPixels: 1e13
-   }).get('NDVI');
+    const ndvi_past_median = ndvi_past.reduceRegion({
+      reducer: ee.Reducer.median(),
+      geometry: geom,
+      scale: 10,
+      maxPixels: 1e13
+    }).get('NDVI');
 
-   const ndvi_past_mean = ndvi_past.reduceRegion({
-     reducer: ee.Reducer.mean(),
-     geometry: geom,
-     scale: 10,
-     maxPixels: 1e13
-   }).get('NDVI_PAST');
+    const lst_mean = lst.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: geom,
+      scale: 1000,
+      maxPixels: 1e13
+    }).get('LST_C');
 
-   const lst_mean = lst.reduceRegion({
-     reducer: ee.Reducer.mean(),
-     geometry: geom,
-     scale: 1000,
-     maxPixels: 1e13
-   }).get('LST_C');
+    const rain_now_total = rain_now.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: geom,
+      scale: 5000,
+      maxPixels: 1e13
+    }).get('Rain_Current');
 
-   const rain_now_total = rain_now.reduceRegion({
-     reducer: ee.Reducer.sum(),
-     geometry: geom,
-     scale: 5000,
-     maxPixels: 1e13
-   }).get('Rain_Current');
+    const rain_past_total = rain_past.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: geom,
+      scale: 5000,
+      maxPixels: 1e13
+    }).get('Rain_Past');
 
-   const rain_past_total = rain_past.reduceRegion({
-     reducer: ee.Reducer.sum(),
-     geometry: geom,
-     scale: 5000,
-     maxPixels: 1e13
-   }).get('Rain_Past');
+    const rain_anomaly_val = rain_anomaly.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: geom,
+      scale: 5000,
+      maxPixels: 1e13
+    }).get('Rain_Anomaly');
 
-   const rain_anomaly_val = rain_anomaly.reduceRegion({
-     reducer: ee.Reducer.mean(),
-     geometry: geom,
-     scale: 5000,
-     maxPixels: 1e13
-   }).get('Rain_Anomaly');
+    // Return the ward with consistent property names
+    return ward.set({
+      'NDVI_NOW': ndvi_now_median,
+      'NDVI_PAST': ndvi_past_median,
+      'LST_C': lst_mean,
+      'Rain_Current': rain_now_total,
+      'Rain_Past': rain_past_total,
+      'Rain_Anomaly': rain_anomaly_val
+    });
+  });
 
-   return ward.set({
-     'NDVI_NOW': ndvi_now_mean,
-     'NDVI_PAST': ndvi_past_mean,
-     'LST_C': lst_mean,
-     'Rain_Current': rain_now_total,
-     'Rain_Past': rain_past_total,
-     'Rain_Anomaly': rain_anomaly_val
-   });
- });
- try {
-   const data = await withRetry(results, 3, 2000); // Retry up to 3 times with 2s delay
-   console.log("✅ /wards returned features:", data?.features?.length);
-   res.setHeader('Cache-Control', 'public, max-age=900');
-   res.json(data);
- } catch (err) {
-   console.error("❌ /wards error:", err);
-   res.status(500).json({ error: 'Failed to compute ward stats', details: err.message });
- }
+  try {
+    const data = await withRetry(results, 3, 2000);
+    console.log("✅ /wards returned features:", data?.features?.length);
+    res.setHeader('Cache-Control', 'public, max-age=900');
+    res.json(data);
+  } catch (err) {
+    console.error("❌ /wards error:", err);
+    res.status(500).json({ error: 'Failed to compute ward stats', details: err.message });
+  }
 
 });
+
 app.get('/greencoverage', (req, res) => {
   console.log("🌿 /greencoverage called");
 
