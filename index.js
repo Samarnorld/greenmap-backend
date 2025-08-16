@@ -364,248 +364,190 @@ serveTile(builtClipped, {
 }, res);
 
 });
-// ---------------------------
-// 1) SENTINEL-2 / NDBI-based built-up (corrected)
-// ---------------------------
 app.get('/builtup-stats', (req, res) => {
   console.log("📊 /builtup-stats called");
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  let currentDate, pastDate;
 
-  // Time window: either ?year=YYYY OR last 12 months
-  let currentDate, pastDate, periodStartStr, periodEndStr;
   if (req.query.year) {
-    const y = parseInt(req.query.year, 10);
-    currentDate = ee.Date.fromYMD(y, 12, 31);
+    const y = parseInt(req.query.year);
     pastDate = ee.Date.fromYMD(y, 1, 1);
-    periodStartStr = `${y}-01-01`;
-    periodEndStr = `${y}-12-31`;
+    currentDate = ee.Date.fromYMD(y, 12, 31);
   } else {
     currentDate = ee.Date(Date.now());
     pastDate = currentDate.advance(-1, 'year');
-    // JS string fallbacks for readable period
-    const endJS = new Date();
-    const startJS = new Date();
-    startJS.setFullYear(endJS.getFullYear() - 1);
-    periodStartStr = startJS.toISOString().slice(0, 10);
-    periodEndStr = endJS.toISOString().slice(0, 10);
   }
 
-  // Helper to promisify getInfo
-  const getInfo = (eeObj) => new Promise((resolve, reject) => {
-    eeObj.getInfo((result, err) => {
-      if (err) reject(err);
-      else resolve(result);
+  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(wards)
+    .filterDate(pastDate, currentDate)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10));
+
+  const safeImage = ee.Algorithms.If(
+    s2.size().gt(0),
+    s2.median().clip(wards),
+    ee.Image.constant(0).updateMask(ee.Image.constant(0)).clip(wards)
+  );
+
+  const image = ee.Image(safeImage);
+  const swir = image.select('B11');
+  const nir = image.select('B8');
+  const red = image.select('B4');
+
+  const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
+  const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+
+  const pixelArea = ee.Image.pixelArea();
+  const greenMask = ndvi.gt(0.3);
+  const builtMask = ndbi.gt(0).and(ndvi.lte(0.3)).and(greenMask.not()).selfMask();
+
+  // Overlap (built and green) area just for diagnostics
+  const overlap = greenMask.and(builtMask).selfMask();
+  const overlapAreaImage = overlap.multiply(pixelArea).rename('overlap_m2');
+  const overlapArea = overlapAreaImage.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: wards.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
+
+  overlapArea.getInfo((overlapRes, err) => {
+    if (err) {
+      console.error("❌ Overlap check failed:", err);
+    } else {
+      const m2 = overlapRes['overlap_m2'] || 0;
+      console.log(`⚠️ Overlapping green+built area: ${(m2 / 1e6).toFixed(2)} km²`);
+    }
+  });
+
+  const builtAreaImage = builtMask.multiply(pixelArea).rename('built_m2');
+
+  const builtPerWard = builtAreaImage.reduceRegions({
+    collection: wards,
+    reducer: ee.Reducer.sum(),
+    scale: 10
+  }).map(f => {
+    const wardArea = f.geometry().area(10); // accurate ward area in m²
+    const built_m2 = ee.Number(f.get('sum'));
+    const built_pct = built_m2.divide(wardArea).multiply(100);
+    return f.set({
+      built_m2,
+      ward_area_m2: wardArea,
+      built_pct
     });
   });
 
-  try {
-    // Sentinel-2 SR collection (cloud/shadow masked via SCL)
-    const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-      .filterBounds(wards)
-      .filterDate(pastDate, currentDate)
-      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
-      .map(function(img) {
-        // mask bad SCL classes (0 no-data,1 saturated,3 shadow,8-10 clouds/cirrus,11 snow)
-        const scl = img.select('SCL');
-        const valid = scl.neq(0).and(scl.neq(1))
-          .and(scl.neq(3)).and(scl.neq(8)).and(scl.neq(9))
-          .and(scl.neq(10)).and(scl.neq(11));
-        // Optional: exclude water (SCL==6) if you want
-        // const valid = valid.and(scl.neq(6));
-        return img.updateMask(valid);
-      });
+  const totalBuilt = builtAreaImage.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: wards.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
 
-    // Fallback safe image (median) if no images
-    const safeImage = ee.Image(ee.Algorithms.If(
-      s2.size().gt(0),
-      s2.median().clip(wards),
-      ee.Image.constant(0).updateMask(ee.Image.constant(0)).clip(wards)
-    ));
+  const totalArea = pixelArea.rename('area').clip(wards).reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: wards.geometry(),
+    scale: 10,
+    maxPixels: 1e13
+  });
 
-    const image = ee.Image(safeImage);
-    // Bands
-    const swir = image.select('B11'); // SWIR
-    const nir = image.select('B8');   // NIR
-    const red = image.select('B4');   // Red
+  builtPerWard.getInfo((wardStats, err1) => {
+    if (err1) {
+      console.error('❌ Built-up ward stats error:', err1);
+      return res.status(500).json({ error: 'Failed to compute built-up per ward', details: err1 });
+    }
 
-    // Indices
-    const ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI');
-    const ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
-
-    const pixelArea = ee.Image.pixelArea();
-
-    // Masks
-    const greenMask = ndvi.gt(0.3); // vegetation
-    // built = positive NDBI AND not vegetation (NDVI <= 0.3)
-    const builtMask = ndbi.gt(0).and(ndvi.lte(0.3));
-
-    // built mask as 1/0 image, then multiplied by pixel area -> built m2 per pixel
-    const builtAreaImage = builtMask.multiply(1).multiply(pixelArea).rename('built_m2');
-
-    // Overlap diagnostic (green & built) - keep for logs, but not required for response
-    const overlap = greenMask.and(builtMask);
-    const overlapAreaImage = overlap.multiply(pixelArea).rename('overlap_m2');
-    // compute overlap (async, non-blocking log)
-    overlapAreaImage.reduceRegion({
-      reducer: ee.Reducer.sum(),
-      geometry: wards.geometry(),
-      scale: 10,
-      maxPixels: 1e13,
-      tileScale: 4
-    }).getInfo((ov, errOv) => {
-      if (errOv) {
-        console.warn('⚠️ overlap reduceRegion failed:', errOv);
-      } else {
-        const m2 = ov && (ov.overlap_m2 || ov.sum) ? Number(ov.overlap_m2 || ov.sum) : 0;
-        console.log(`⚠️ Overlapping green+built area: ${(m2 / 1e6).toFixed(3)} km²`);
+    totalBuilt.getInfo((builtRes, err2) => {
+      if (err2) {
+        console.error('❌ Built-up total error:', err2);
+        return res.status(500).json({ error: 'Failed to compute total built-up area', details: err2 });
       }
-    });
 
-    // Per-ward built area (sum), then compute ward area and percent
-    const builtPerWard = builtAreaImage.reduceRegions({
-      collection: wards,
-      reducer: ee.Reducer.sum(),
-      scale: 10,
-      tileScale: 4
-    }).map(function(f) {
-      const wardArea = f.geometry().area(10);
-      // The reduceRegions sum lands in property 'sum'
-      const built_m2 = ee.Number(f.get('sum'));
-      const built_pct = ee.Algorithms.If(ee.Number(wardArea).gt(0), built_m2.divide(ee.Number(wardArea)).multiply(100), null);
-      return f.set({
-        built_m2: built_m2,
-        ward_area_m2: wardArea,
-        built_pct: built_pct
-      });
-    });
+      totalArea.getInfo((areaRes, err3) => {
+        if (err3) {
+          console.error('❌ Total area error:', err3);
+          return res.status(500).json({ error: 'Failed to compute total Nairobi area', details: err3 });
+        }
 
-    // City totals
-    const totalBuilt = builtAreaImage.reduceRegion({
-      reducer: ee.Reducer.sum(),
-      geometry: wards.geometry(),
-      scale: 10,
-      maxPixels: 1e13,
-      tileScale: 4
-    });
+        const built_m2 = builtRes['built_m2'];
+        const total_m2 = areaRes['area'];
+        const built_pct = (built_m2 / total_m2) * 100;
 
-    const totalArea = pixelArea.rename('area').reduceRegion({
-      reducer: ee.Reducer.sum(),
-      geometry: wards.geometry(),
-      scale: 10,
-      maxPixels: 1e13,
-      tileScale: 4
-    });
-
-    // Fetch results in parallel
-    Promise.all([
-      getInfo(builtPerWard),
-      getInfo(totalBuilt),
-      getInfo(totalArea)
-    ]).then(([wardStats, builtRes, areaRes]) => {
-      try {
-        const built_m2 = Number(builtRes.built_m2 || builtRes.sum || 0);
-        const total_m2 = Number(areaRes.area || areaRes.sum || 0);
-        const built_pct = total_m2 > 0 ? (built_m2 / total_m2) * 100 : null;
-
-        // Build per-ward array
-        const per_ward = (wardStats.features || []).map(w => {
-          const p = w.properties || {};
-          return {
-            ward: p.wards || p.NAME_3 || p.name || p.WARD || p.WARD_NAME || 'Unknown',
-            built_m2: p.built_m2 ?? Number(p.sum ?? 0),
-            ward_area_m2: p.ward_area_m2 ? Number(p.ward_area_m2) : null,
-            built_pct: p.built_pct !== undefined && p.built_pct !== null ? Number(Number(p.built_pct).toFixed(4)) : null
-          };
-        });
+        if (res.headersSent) return;
 
         res.setHeader('Cache-Control', 'public, max-age=3600');
-        return res.json({
+        res.json({
           updated: new Date().toISOString(),
-          method: 'ndbi_masked_s2',
-          period: { start: periodStartStr, end: periodEndStr },
-          city_built_m2: Math.round(built_m2),
-          city_total_m2: Math.round(total_m2),
-          city_built_pct: built_pct !== null ? Number(built_pct.toFixed(4)) : null,
-          per_ward: per_ward
+          city_built_m2: built_m2,
+          city_total_m2: total_m2,
+          city_built_pct: built_pct,
+          per_ward: (wardStats.features || []).map(w => ({
+            ward: w.properties.wards || w.properties.NAME_3 || 'Unknown',
+            built_m2: w.properties.built_m2,
+            ward_area_m2: w.properties.ward_area_m2,
+            built_pct: w.properties.built_pct
+          }))
         });
-      } catch (ex) {
-        console.error('❌ /builtup-stats post-processing error:', ex);
-        return res.status(500).json({ error: 'Failed to post-process built-up stats', details: String(ex) });
-      }
-    }).catch(errAll => {
-      console.error('❌ /builtup-stats getInfo failed:', errAll);
-      return res.status(500).json({ error: 'Failed to retrieve built-up stats', details: String(errAll) });
+      });
     });
-
-  } catch (err) {
-    console.error('❌ /builtup-stats error:', err && err.stack ? err.stack : err);
-    return res.status(500).json({ error: 'Failed to compute built-up (ndbi)', details: String(err) });
-  }
+  });
 });
 
+// place this AFTER you initialise `ee` and after `wards` (ee.FeatureCollection) is defined.
+// Put it before app.listen(...) and after your other route handlers (e.g., /indicators).
 
-// ---------------------------
-// 2) DYNAMIC WORLD (probabilistic) built-up — recommended & corrected
-// ---------------------------
 app.get(['/builtup-stats-dw', '/api/builtup-stats-dw'], async (req, res) => {
   console.log('📡 /builtup-stats-dw called');
+  // Allow cross-origin (optionally remove if you enable cors globally)
   res.setHeader('Access-Control-Allow-Origin', '*');
 
   try {
+    if (typeof wards === 'undefined' || !wards) {
+      console.error('❌ /builtup-stats-dw: wards is not defined in server scope');
+      return res.status(500).json({ error: 'Server misconfiguration: wards not defined' });
+    }
+
     // --- time window: either ?year=YYYY or last 12 months ---
-    let startDateEE, endDateEE, periodStartStr, periodEndStr;
+    let startDate, endDate;
     if (req.query.year) {
       const y = parseInt(req.query.year, 10);
       if (Number.isFinite(y)) {
-        startDateEE = ee.Date.fromYMD(y, 1, 1);
-        endDateEE = ee.Date.fromYMD(y, 12, 31);
-        periodStartStr = `${y}-01-01`;
-        periodEndStr = `${y}-12-31`;
+        startDate = ee.Date.fromYMD(y, 1, 1);
+        endDate = ee.Date.fromYMD(y, 12, 31);
       } else {
-        endDateEE = ee.Date(Date.now());
-        startDateEE = endDateEE.advance(-1, 'year');
-        const endJS = new Date();
-        const startJS = new Date(); startJS.setFullYear(endJS.getFullYear()-1);
-        periodStartStr = startJS.toISOString().slice(0,10);
-        periodEndStr = endJS.toISOString().slice(0,10);
+        startDate = ee.Date(Date.now()).advance(-1, 'year');
+        endDate = ee.Date(Date.now());
       }
     } else {
-      endDateEE = ee.Date(Date.now());
-      startDateEE = endDateEE.advance(-1, 'year');
-      const endJS = new Date();
-      const startJS = new Date(); startJS.setFullYear(endJS.getFullYear()-1);
-      periodStartStr = startJS.toISOString().slice(0,10);
-      periodEndStr = endJS.toISOString().slice(0,10);
+      endDate = ee.Date(Date.now());
+      startDate = endDate.advance(-1, 'year');
     }
 
-    // --- Dynamic World: 'built' probability (0..1) ---
+    // --- Dynamic World: built probability band ---
     const dwCol = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
       .filterBounds(wards)
-      .filterDate(startDateEE, endDateEE)
-      .select('built');
+      .filterDate(startDate, endDate)
+      .select('built'); // 'built' is the fractional probability band (0..1)
 
-    // Safe mean built probability image (fallback to 0 if no images)
-    const safeBuiltMean = ee.Image(ee.Algorithms.If(
-      dwCol.size().gt(0),
-      dwCol.mean(),
-      ee.Image.constant(0)
-    )).clip(wards).rename('built_prob_mean');
+    // If no DW images found, fallback to constant 0 image to avoid errors
+    const safeBuiltMean = ee.Image(ee.Algorithms.If(dwCol.size().gt(0), dwCol.mean(), ee.Image.constant(0)))
+      .clip(wards)
+      .rename('built_prob_mean');
 
     const pixelArea = ee.Image.pixelArea(); // m^2 per pixel
 
-    // Expected built area per pixel = probability * pixel area
+    // expected built area per pixel (probability * pixelArea)
     const builtAreaImg = safeBuiltMean.multiply(pixelArea).rename('built_m2');
 
-    // City total built area
+    // total built area (sum over city)
     const builtTotalRR = builtAreaImg.reduceRegion({
       reducer: ee.Reducer.sum(),
       geometry: wards.geometry(),
-      scale: 10,
+      scale: 10,        // Dynamic World is Sentinel-2-based (10m)
       maxPixels: 1e13,
       tileScale: 4
     });
 
-    // City total area
+    // total city area
     const totalAreaRR = pixelArea.rename('area').reduceRegion({
       reducer: ee.Reducer.sum(),
       geometry: wards.geometry(),
@@ -614,16 +556,16 @@ app.get(['/builtup-stats-dw', '/api/builtup-stats-dw'], async (req, res) => {
       tileScale: 4
     });
 
-    // Per-ward expected built m2
+    // per-ward built-up (sum of expected built m2 inside each ward)
     const perWardFC = builtAreaImg.reduceRegions({
       collection: wards,
       reducer: ee.Reducer.sum(),
-      scale: 10,
-      tileScale: 4
+      scale: 10
     }).map(function (f) {
+      // compute ward area accurately on server
       const wardArea = f.geometry().area(10);
       const built_m2 = ee.Number(f.get('sum'));
-      const built_pct = ee.Algorithms.If(ee.Number(wardArea).gt(0), built_m2.divide(ee.Number(wardArea)).multiply(100), null);
+      const built_pct = ee.Algorithms.If(wardArea.gt(0), built_m2.divide(wardArea).multiply(100), null);
       return f.set({
         built_m2: built_m2,
         ward_area_m2: wardArea,
@@ -631,7 +573,7 @@ app.get(['/builtup-stats-dw', '/api/builtup-stats-dw'], async (req, res) => {
       });
     });
 
-    // Helper to promisify getInfo
+    // Helper to promisify getInfo calls
     const getInfo = (eeObj) => new Promise((resolve, reject) => {
       eeObj.getInfo((result, err) => {
         if (err) reject(err);
@@ -639,7 +581,7 @@ app.get(['/builtup-stats-dw', '/api/builtup-stats-dw'], async (req, res) => {
       });
     });
 
-    // Fetch results in parallel
+    // retrieve results in parallel
     const [builtRes, areaRes, perWardRes] = await Promise.all([
       getInfo(builtTotalRR),
       getInfo(totalAreaRR),
@@ -658,7 +600,7 @@ app.get(['/builtup-stats-dw', '/api/builtup-stats-dw'], async (req, res) => {
         ward: (p.wards || p.NAME_3 || p.name || p.WARD || 'Unknown'),
         built_m2: p.built_m2 ?? p.sum ?? 0,
         ward_area_m2: p.ward_area_m2 ?? null,
-        built_pct: p.built_pct !== undefined && p.built_pct !== null ? Number(Number(p.built_pct).toFixed(4)) : null
+        built_pct: p.built_pct !== undefined && p.built_pct !== null ? Number(Number(p.built_pct).toFixed(3)) : null
       };
     });
 
@@ -667,10 +609,13 @@ app.get(['/builtup-stats-dw', '/api/builtup-stats-dw'], async (req, res) => {
     return res.json({
       updated: new Date().toISOString(),
       method: 'dynamicworld_mean_built',
-      period: { start: periodStartStr, end: periodEndStr },
+      period: {
+        start: startDate.format('YYYY-MM-dd').getInfo ? startDate.format('YYYY-MM-dd').getInfo() : null,
+        end: endDate.format('YYYY-MM-dd').getInfo ? endDate.format('YYYY-MM-dd').getInfo() : null
+      },
       city_built_m2: Math.round(built_m2),
       city_total_m2: total_m2 ? Math.round(total_m2) : null,
-      city_built_pct: city_built_pct !== null ? Number(city_built_pct.toFixed(4)) : null,
+      city_built_pct: city_built_pct !== null ? Number(city_built_pct.toFixed(3)) : null,
       per_ward: perWardArray
     });
 
@@ -679,7 +624,6 @@ app.get(['/builtup-stats-dw', '/api/builtup-stats-dw'], async (req, res) => {
     return res.status(500).json({ error: 'Failed to compute built-up stats (Dynamic World)', details: String(err && err.message ? err.message : err) });
   }
 });
-
 
 app.get('/wards', async (req, res) => {
 
