@@ -8,6 +8,26 @@ app.use(cors({
   origin: '*'
 }));
 const PORT = process.env.PORT || 3000;
+process.env.TZ = 'Africa/Nairobi';
+
+// ---------- PRECOMPUTE SCHEDULER + CACHE (paste here) ----------
+const cron = require('node-cron');
+
+// endpoints we want to precompute (keep leading slashes)
+const PRECOMP_ENDPOINTS = [
+  '/wards',
+  '/indicators',
+  '/greencoverage',
+  '/treecanopy-stats',
+  '/wardsstatstree',
+  '/builtup-stats',
+  '/builtup-stats-dw',
+  '/most-deforested',
+  `/charttrend?startYear=2020&endYear=${new Date().getFullYear()}`
+];
+
+const precomputed = {}; // in-memory cache for JSON results
+// ----------------------------------------------------------------
 
 
 // ✅ Use the secret file from Render
@@ -915,11 +935,12 @@ app.get('/treecanopy-stats', async (req, res) => {
 // GET /charttrend?startYear=2021&endYear=2025
 // GET /charttrend?startYear=2021&endYear=2025
 app.get('/charttrend', async (req, res) => {
-  const log = {
-    info: (...a) => console.info('[charttrend][INFO]', ...a),
-    warn: (...a) => console.warn('[charttrend][WARN]', ...a),
-    error: (...a) => console.error('[charttrend][ERROR]', ...a)
-  };
+const log = {
+  info: (...a) => console.info('[charttrend][INFO]', ...a),
+  warn: (...a) => console.warn('[charttrend][WARN]', ...a),
+  error: (...a) => console.error('[charttrend][ERROR]', ...a),
+};
+
 
   const evaluateAsync = (eeObject, timeoutMs = 180000) => new Promise((resolve, reject) => {
     let finished = false;
@@ -1946,8 +1967,84 @@ app.get('/indicators', async (req, res) => {
 app.get('/', (req, res) => {
   res.send('✅ GreenMap Earth Engine backend is live');
 });
+// ---------- PRECOMPUTE HELPERS & CACHED ROUTES (paste before app.listen) ----------
+async function precomputeAll() {
+  const base = `http://127.0.0.1:${PORT}`;
+  console.log('🕛 precomputeAll starting for endpoints:', PRECOMP_ENDPOINTS);
+
+  for (const ep of PRECOMP_ENDPOINTS) {
+    const url = base + ep;
+    try {
+      console.log('🔁 Precomputing', url);
+      const resp = await fetch(url);
+      if (!resp.ok) {
+        console.warn(`⚠️ ${url} returned status ${resp.status}`);
+        continue;
+      }
+      const json = await resp.json();
+      precomputed[ep] = json;
+      console.log(`✅ Cached ${ep}`);
+    } catch (err) {
+      console.error(`❌ Error precomputing ${url}:`, err && err.message ? err.message : err);
+    }
+    // small pause between heavy EE hits
+    await new Promise(r => setTimeout(r, 3000));
+  }
+
+  console.log('✅ precomputeAll complete');
+}
+
+// Create cached endpoints automatically, e.g. /indicators-cached -> uses precomputed['/indicators']
+for (const ep of PRECOMP_ENDPOINTS) {
+  const basePath = ep.split('?')[0];               // strip query string for route name
+  const cachedRoute = basePath + '-cached';        // e.g. /indicators-cached
+
+  app.get(cachedRoute, async (req, res) => {
+    // 1) if we have cached JSON, return it immediately
+    if (precomputed[ep]) {
+      res.setHeader('Cache-Control', 'public, max-age=60'); // short client cache
+      return res.json(precomputed[ep]);
+    }
+    // 2) fallback: try a live fetch to the local route (and populate cache)
+    try {
+      const live = await fetch(`http://127.0.0.1:${PORT}${ep}`);
+      if (!live.ok) {
+        return res.status(502).json({ error: 'Live fetch failed', status: live.status });
+      }
+      const data = await live.json();
+      precomputed[ep] = data;
+      return res.json(data);
+    } catch (e) {
+      return res.status(503).json({ error: 'Cache not ready & live fetch failed', details: String(e) });
+    }
+  });
+}
+
+// Schedule: run every day at 00:00 server-local time
+cron.schedule('0 0 * * *', () => {
+  console.log('🕛 Scheduled precompute job (Africa/Nairobi)');
+  precomputeAll().catch(e => console.error('Precompute job error', e));
+}, { timezone: 'Africa/Nairobi' });
+
+// Note: we will call `precomputeAll()` once when the server starts listening
+// (to avoid fetch-before-listen race).
+// ---------------------------------------------------------------------------
+// Optional: manual trigger (protect with a secret)
+app.post('/admin/precompute-run', async (req, res) => {
+  if (process.env.PRECOMP_SECRET && req.headers['x-precomp-secret'] !== process.env.PRECOMP_SECRET) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  try {
+    await precomputeAll();
+    res.json({ ok: true, ran: new Date().toISOString() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`🚀 Backend running on http://localhost:${PORT}`);
+  // run once on startup
+  precomputeAll().catch(e => console.error('Precompute on startup failed:', e));
 });
 }
