@@ -99,45 +99,30 @@ function startServer() {
     return wards.filter(ee.Filter.eq('NAME_3', normalized)).first().geometry();
   }
 
-  function getNDVI(start, end) {
-  // Sentinel-2 collection
-  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+function getNDVI(startDate, endDate) {
+  var s2sr = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterDate(startDate, endDate)
     .filterBounds(wards)
-    .filterDate(start, end)
-    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
-    .select(['B4', 'B8']);
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 80))
+    .map(function(img) {
+      var scl = img.select('SCL');
+      var mask = scl.neq(0).and(scl.neq(1))
+                   .and(scl.neq(3)).and(scl.neq(8))
+                   .and(scl.neq(9)).and(scl.neq(10))
+                   .and(scl.neq(11));
+      var scaled = img.updateMask(mask).divide(10000);
+      return scaled.normalizedDifference(['B8','B4']).rename('NDVI')
+                   .copyProperties(img, ['system:time_start']);
+    });
 
-  // Landsat-7 collection
-  const landsat = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
-    .filterBounds(wards)
-    .filterDate(start, end)
-    .filter(ee.Filter.lt('CLOUD_COVER', 10))
-    .select(['SR_B4', 'SR_B5'])
-    .map(img =>
-      img
-        .multiply(0.0000275)
-        .add(-0.2)
-        .copyProperties(img, img.propertyNames())
-    );
-
-  // Compute NDVI for each
-  const sentinelNDVI = s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI');
-  const landsatNDVI = landsat.median().normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
-
-  // A zero-image *with valid pixels* as ultimate fallback
-  const fallback = ee.Image.constant(0).rename('NDVI').clip(wards).unmask(0);
-
-  // Decide which to use: Sentinel for dates ≥2015, otherwise Landsat
-  const year = end.get('year');
-  const ndviImage = ee.Algorithms.If(
-    ee.Number(year).gte(2015),
-    ee.Algorithms.If(s2.size().gt(0), sentinelNDVI, landsatNDVI),  // if Sentinel empty, try Landsat
-    ee.Algorithms.If(landsat.size().gt(0), landsatNDVI, sentinelNDVI)
-  );
-
-  // Ensure you always get a real Image
- return ee.Image(ndviImage).unmask(0).clip(wards);
+  // If no images, return a masked image
+  return ee.Image(ee.Algorithms.If(
+    s2sr.size().gt(0),
+    s2sr.reduce(ee.Reducer.percentile([50])), // median NDVI
+    ee.Image(0).updateMask(ee.Image(0)).rename('NDVI')
+  ));
 }
+
 
 
 function serveTile(image, visParams, res) {
@@ -642,7 +627,7 @@ app.get('/wards', async (req, res) => {
   const now = ee.Date(Date.now()).advance(-30, 'day');
   const oneYearAgo = now.advance(-1, 'year');
 
-  const startNDVI = now.advance(-120, 'day');
+  const startNDVI = now.advance(-30, 'day');
   const startNDVIPast = oneYearAgo.advance(-120, 'day');
 
   const rainRange = parseInt(req.query.range) || 30;
@@ -675,12 +660,12 @@ app.get('/wards', async (req, res) => {
  const results = wards.map(function (ward) {
    const geom = ward.geometry();
 
-   const ndvi_now_mean = ndvi_now.reduceRegion({
-     reducer: ee.Reducer.mean(),
+ const ndvi_now_median = ndvi_now.reduceRegion({
+  reducer: ee.Reducer.median(),
      geometry: geom,
      scale: 10,
      maxPixels: 1e13
-   }).get('NDVI_NOW');
+   }).get('NDVI');
 
    const ndvi_past_mean = ndvi_past.reduceRegion({
      reducer: ee.Reducer.mean(),
