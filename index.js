@@ -2,6 +2,19 @@ const express = require('express');
 const cors = require('cors');
 const ee = require('@google/earthengine');
 const fs = require('fs');
+// ----- fetch polyfill (make fetch available in older Node) -----
+let fetchFn = global.fetch;
+if (!fetchFn) {
+  try {
+    // node-fetch v2 syntax (CommonJS). If you use node 18+, global.fetch exists and this is skipped.
+    fetchFn = require('node-fetch'); // npm i node-fetch@2  (if your runtime is older than Node 18)
+    global.fetch = fetchFn;
+    console.log('Using node-fetch polyfill');
+  } catch (e) {
+    console.warn('Fetch is not available. Run Node 18+ or install node-fetch.');
+    // fetchFn will remain undefined — precompute/fetch will then error early; but this warns you.
+  }
+}
 
 const app = express();
 app.use(cors({
@@ -14,20 +27,65 @@ process.env.TZ = 'Africa/Nairobi';
 const cron = require('node-cron');
 
 // endpoints we want to precompute (keep leading slashes)
+// PRECOMPUTE: point to the heavy "-live" endpoints that actually compute results
 const PRECOMP_ENDPOINTS = [
-  '/wards',
-  '/indicators',
-  '/greencoverage',
-  '/treecanopy-stats',
-  '/wardsstatstree',
-  '/builtup-stats',
-  '/builtup-stats-dw',
-  '/most-deforested',
-  `/charttrend?startYear=2020&endYear=${new Date().getFullYear()}`
+  '/wards-live',
+  '/indicators-live',
+  '/greencoverage-live',
+  '/treecanopy-stats-live',
+  '/wardsstatstree-live',
+  '/builtup-stats-live',
+  '/builtup-stats-dw-live',
+  '/most-deforested-live',
+  `/charttrend-live?startYear=2020&endYear=${new Date().getFullYear()}`
 ];
+
 
 const precomputed = {}; // in-memory cache for JSON results
 // ----------------------------------------------------------------
+// ----- disk-persisted cache helpers (so precomputed survives restarts) -----
+const path = require('path');
+const CACHE_DIR = path.join(__dirname, 'cache');
+
+function safeKeyToFile(key) {
+  return Buffer.from(key).toString('base64url') + '.json';
+}
+
+async function ensureCacheDir() {
+  try { await fs.promises.mkdir(CACHE_DIR, { recursive: true }); } catch (e) {}
+}
+
+async function saveCacheToDisk(key, data) {
+  try {
+    await ensureCacheDir();
+    const tmp = path.join(CACHE_DIR, safeKeyToFile(key) + '.tmp');
+    const dest = path.join(CACHE_DIR, safeKeyToFile(key));
+    await fs.promises.writeFile(tmp, JSON.stringify(data), 'utf8');
+    await fs.promises.rename(tmp, dest);
+  } catch (e) {
+    console.warn('Failed to save cache to disk for', key, e.message || e);
+  }
+}
+
+async function loadCacheFromDisk() {
+  try {
+    await ensureCacheDir();
+    const files = await fs.promises.readdir(CACHE_DIR);
+    for (const f of files) {
+      if (!f.endsWith('.json')) continue;
+      try {
+        const buf = await fs.promises.readFile(path.join(CACHE_DIR, f), 'utf8');
+        const key = Buffer.from(f.replace(/\.json$/, ''), 'base64url').toString();
+        precomputed[key] = JSON.parse(buf);
+        console.log('Loaded cached key:', key);
+      } catch (e) {
+        console.warn('Skipping invalid cache file', f, e.message || e);
+      }
+    }
+  } catch (e) {
+    // no cache dir yet
+  }
+}
 
 
 // ✅ Use the secret file from Render
@@ -364,7 +422,8 @@ serveTile(builtClipped, {
 }, res);
 
 });
-app.get('/builtup-stats', (req, res) => {
+app.get('/builtup-stats-live', (req, res) => {
+
   console.log("📊 /builtup-stats called");
   let currentDate, pastDate;
 
@@ -494,8 +553,8 @@ app.get('/builtup-stats', (req, res) => {
 
 // place this AFTER you initialise `ee` and after `wards` (ee.FeatureCollection) is defined.
 // Put it before app.listen(...) and after your other route handlers (e.g., /indicators).
+app.get(['/builtup-stats-dw-live', '/api/builtup-stats-dw-live'], async (req, res) => {
 
-app.get(['/builtup-stats-dw', '/api/builtup-stats-dw'], async (req, res) => {
   console.log('📡 /builtup-stats-dw called');
   // Allow cross-origin (optionally remove if you enable cors globally)
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -625,7 +684,8 @@ app.get(['/builtup-stats-dw', '/api/builtup-stats-dw'], async (req, res) => {
   }
 });
 
-app.get('/wards', async (req, res) => {
+app.get('/wards-live', async (req, res) => {
+
 
   // Define now and past windows (recent 30 days vs same period last year)
   const now = ee.Date(Date.now()).advance(-30, 'day');
@@ -730,7 +790,8 @@ app.get('/wards', async (req, res) => {
 
 });
 
-app.get('/greencoverage', (req, res) => {
+app.get('/greencoverage-live', (req, res) => {
+
   console.log("🌿 /greencoverage called");
 
   const now = ee.Date(Date.now());
@@ -818,7 +879,8 @@ app.get('/treecoverage', (req, res) => {
   }, res);
 });
 
-app.get('/treecanopy-stats', async (req, res) => {
+app.get('/treecanopy-stats-live', async (req, res) => {
+
   try {
     const geometry = wards.geometry();
     const pixelArea = ee.Image.pixelArea();
@@ -938,7 +1000,8 @@ app.get('/treecanopy-stats', async (req, res) => {
 });
 // GET /charttrend?startYear=2021&endYear=2025
 // GET /charttrend?startYear=2021&endYear=2025
-app.get('/charttrend', async (req, res) => {
+app.get('/charttrend-live', async (req, res) => {
+
 const log = {
   info: (...a) => console.info('[charttrend][INFO]', ...a),
   warn: (...a) => console.warn('[charttrend][WARN]', ...a),
@@ -1149,7 +1212,8 @@ const log = {
 });
 
 // Replace the old /most-deforested handler with this block
-app.get('/most-deforested', async (req, res) => {
+app.get('/most-deforested-live', async (req, res) => {
+
   try {
     console.log("[most-deforested] Calculating...");
 
@@ -1329,7 +1393,8 @@ app.get('/most-deforested', async (req, res) => {
 // GET /wardsstatstree
 // Returns per-ward tree stats (tree_m2, area_m2, tree_pct) for the latest Dynamic World year.
 // Paste this route below your existing /ward-trend route.
-app.get('/wardsstatstree', async (req, res) => {
+app.get('/wardsstatstree-live', async (req, res) => {
+
   try {
     // 1) Load wards asset (same as in your other code)
     const wardsFc = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered');
@@ -1633,7 +1698,7 @@ app.get('/ward-trend', async (req, res) => {
 // Make sure you have ee initialized and authenticated earlier in your server
 // Also recommended: app.use(require('cors')()); at server start to allow cross-origin fetches.
 
-app.get('/indicators', async (req, res) => {
+app.get('/indicators-live', async (req, res) => {
   console.log('📡 /indicators called');
   // Optional single-route CORS header (you already have global cors middleware usually)
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -1977,49 +2042,78 @@ async function precomputeAll() {
   console.log('🕛 precomputeAll starting for endpoints:', PRECOMP_ENDPOINTS);
 
   for (const ep of PRECOMP_ENDPOINTS) {
-    const url = base + ep;
+    const url = base + ep; // ep already contains -live (we changed PRECOMP_ENDPOINTS)
     try {
       console.log('🔁 Precomputing', url);
-      const resp = await fetch(url);
+      if (!fetchFn) throw new Error('fetch not available (install node-fetch or run Node 18+)');
+      const resp = await fetchFn(url, { timeout: 120000 });
       if (!resp.ok) {
         console.warn(`⚠️ ${url} returned status ${resp.status}`);
         continue;
       }
       const json = await resp.json();
       precomputed[ep] = json;
+      try { await saveCacheToDisk?.(ep, json); } catch (e) { /* ignore disk errors */ }
       console.log(`✅ Cached ${ep}`);
     } catch (err) {
       console.error(`❌ Error precomputing ${url}:`, err && err.message ? err.message : err);
     }
-    // small pause between heavy EE hits
+    // pause between heavy EE hits
     await new Promise(r => setTimeout(r, 3000));
   }
 
   console.log('✅ precomputeAll complete');
 }
 
-// Create cached endpoints automatically, e.g. /indicators-cached -> uses precomputed['/indicators']
+// ----------------- Cache-first wrapper routes (original paths) -----------------
+// For each PRECOMP_ENDPOINTS entry (which now points at -live), create a wrapper
+// that serves precomputed if available, otherwise forwards to the -live route.
 for (const ep of PRECOMP_ENDPOINTS) {
-  const basePath = ep.split('?')[0];               // strip query string for route name
-  const cachedRoute = basePath + '-cached';        // e.g. /indicators-cached
-
-  app.get(cachedRoute, async (req, res) => {
-    // 1) if we have cached JSON, return it immediately
-    if (precomputed[ep]) {
-      res.setHeader('Cache-Control', 'public, max-age=60'); // short client cache
-      return res.json(precomputed[ep]);
-    }
-    // 2) fallback: try a live fetch to the local route (and populate cache)
+  const basePath = ep.split('?')[0].replace(/-live$/, ''); // e.g. '/indicators-live' -> '/indicators'
+  app.get(basePath, async (req, res) => {
     try {
-      const live = await fetch(`http://127.0.0.1:${PORT}${ep}`);
-      if (!live.ok) {
-        return res.status(502).json({ error: 'Live fetch failed', status: live.status });
+      // build querystring if exists
+      const qs = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
+
+      // 1) Exact cache key (path + qs)
+      const exactKey = basePath + qs;
+
+      // 2) The precompute default key (the ep from PRECOMP_ENDPOINTS)
+      const defaultKey = ep;
+
+      // 3) Serve exact cache hit
+      if (precomputed[exactKey]) {
+        console.log(`✅ cache hit exact: ${exactKey}`);
+        res.setHeader('Cache-Control', 'public, max-age=60');
+        return res.json(precomputed[exactKey]);
       }
-      const data = await live.json();
-      precomputed[ep] = data;
+      // 4) Serve default precompute hit
+      if (precomputed[defaultKey]) {
+        console.log(`✅ cache hit default: ${defaultKey}`);
+        res.setHeader('Cache-Control', 'public, max-age=60');
+        return res.json(precomputed[defaultKey]);
+      }
+
+      // 5) Fallback: fetch live from the -live route and populate cache
+      const liveUrl = `http://127.0.0.1:${PORT}${basePath}-live${qs}`;
+      console.log(`⚡ cache miss for ${exactKey}. Fetching live: ${liveUrl}`);
+      if (!fetchFn) throw new Error('fetch not available (install node-fetch or run Node 18+)');
+
+      const liveRes = await fetchFn(liveUrl);
+      if (!liveRes.ok) {
+        const text = await liveRes.text().catch(() => '');
+        throw new Error(`Live fetch failed with status ${liveRes.status}: ${text}`);
+      }
+      const data = await liveRes.json();
+
+      // Save to in-memory cache (and disk if configured)
+      precomputed[exactKey] = data;
+      try { await saveCacheToDisk?.(exactKey, data); } catch (e) { /* ignore */ }
+
       return res.json(data);
-    } catch (e) {
-      return res.status(503).json({ error: 'Cache not ready & live fetch failed', details: String(e) });
+    } catch (err) {
+      console.error(`❌ wrapper error for ${basePath}:`, err && err.message ? err.message : err);
+      return res.status(502).json({ error: 'Failed to fetch data (live)', details: String(err) });
     }
   });
 }
@@ -2045,10 +2139,20 @@ app.post('/admin/precompute-run', async (req, res) => {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
+  // --- start listening (inside startServer so EE was initialized and routes are registered) ---
+  app.listen(PORT, async () => {
+    console.log(`🚀 Backend running on http://localhost:${PORT}`);
+    // load persisted cache (if any)
+    try {
+      await loadCacheFromDisk();
+    } catch (e) {
+      console.warn('Failed to load cache from disk at startup:', e && e.message ? e.message : e);
+    }
+    // warm-run the precompute (short delay to allow anything else to settle)
+    setTimeout(() => {
+      precomputeAll().catch(e => console.error('Precompute on startup failed:', e));
+    }, 2000);
+  });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Backend running on http://localhost:${PORT}`);
-  // run once on startup
-  precomputeAll().catch(e => console.error('Precompute on startup failed:', e));
-});
+
 }
