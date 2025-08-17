@@ -157,32 +157,79 @@ function startServer() {
     return wards.filter(ee.Filter.eq('NAME_3', normalized)).first().geometry();
   }
 
-function getNDVI(startDate, endDate) {
-  // Returns a single-band ee.Image named 'NDVI' computed as the 50th percentile
-  // of cloud/shadow-masked Sentinel-2 NDVI over the provided window.
-  var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-    .filterDate(startDate, endDate)
-    .filterBounds(wards)
-    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 80))
-    .map(function(img) {
-      var scl = img.select('SCL');
-      var mask = scl.neq(0).and(scl.neq(1))
-                   .and(scl.neq(3)).and(scl.neq(8))
-                   .and(scl.neq(9)).and(scl.neq(10))
-                   .and(scl.neq(11));
-      var scaled = img.updateMask(mask).divide(10000);
-      // produce an NDVI band named 'NDVI' for each image
-      var ndvi = scaled.normalizedDifference(['B8','B4']).rename('NDVI');
-      return ndvi.copyProperties(img, ['system:time_start']);
-    });
+// --- NDVI helpers (drop-in) ---
 
-  // Reduce using 50th percentile. The reducer will produce 'NDVI_p50' — rename to 'NDVI'.
-  return ee.Image(ee.Algorithms.If(
-    s2.size().gt(0),
-    s2.reduce(ee.Reducer.percentile([50])).select(['NDVI_p50']).rename('NDVI'),
-    // fallback: a fully-masked NDVI image named 'NDVI'
-    ee.Image(0).updateMask(ee.Image(0)).rename('NDVI')
+// Strict S2 cloud mask using Scene Classification (SCL)
+function maskS2SCL(img) {
+  const scl = img.select('SCL');
+  const good = scl.neq(0)   // NO_DATA
+    .and(scl.neq(1))        // SATURATED/DEFECTIVE
+    .and(scl.neq(3))        // CLOUD_SHADOW
+    .and(scl.neq(8))        // CLOUD_MEDIUM_PROB
+    .and(scl.neq(9))        // CLOUD_HIGH_PROB
+    .and(scl.neq(10))       // THIN_CIRRUS
+    .and(scl.neq(11));      // SNOW/ICE
+  return img.updateMask(good);
+}
+
+function getNDVI(start, end, geometry) {
+  geometry = geometry || wards.geometry();
+
+  // --- Sentinel-2 SR (preferred) ---
+  const s2col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(geometry)
+    .filterDate(start, end)
+    .map(maskS2SCL)
+    .select(['B8', 'B4']) // NIR, RED
+    .map(img => img.normalizedDifference(['B8', 'B4']).rename('NDVI'));
+  const s2Size = s2col.size();
+
+  // --- Landsat 8/9 L2 ---
+  const ls89Col = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .merge(ee.ImageCollection('LANDSAT/LC09/C02/T1_L2'))
+    .filterBounds(geometry)
+    .filterDate(start, end)
+    .map(img => img.multiply(0.0000275).add(-0.2).copyProperties(img, img.propertyNames()))
+    .select(['SR_B5', 'SR_B4']) // NIR, RED
+    .map(img => img.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI'));
+  const ls89Size = ls89Col.size();
+
+  // --- Landsat 7 L2 (NOTE: B4=NIR, B3=RED) ---
+  const ls7Col = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+    .filterBounds(geometry)
+    .filterDate(start, end)
+    .map(img => img.multiply(0.0000275).add(-0.2).copyProperties(img, img.propertyNames()))
+    .select(['SR_B4', 'SR_B3']) // NIR, RED (corrected)
+    .map(img => img.normalizedDifference(['SR_B4', 'SR_B3']).rename('NDVI'));
+  const ls7Size = ls7Col.size();
+
+  // --- MODIS fallback ---
+  const modisNDVI = ee.ImageCollection('MODIS/061/MOD13Q1')
+    .filterBounds(geometry)
+    .filterDate(start, end)
+    .select('NDVI')
+    .mean()
+    .multiply(0.0001)
+    .rename('NDVI');
+
+  // Pick best available, use p50 (percentile) to be robust vs outliers.
+  let ndvi = ee.Image(ee.Algorithms.If(
+    s2Size.gt(0),
+    s2col.reduce(ee.Reducer.percentile([50])).select('NDVI_p50').rename('NDVI'),
+    ee.Algorithms.If(
+      ls89Size.gt(0),
+      ls89Col.reduce(ee.Reducer.percentile([50])).select('NDVI_p50').rename('NDVI'),
+      ee.Algorithms.If(
+        ls7Size.gt(0),
+        ls7Col.reduce(ee.Reducer.percentile([50])).select('NDVI_p50').rename('NDVI'),
+        modisNDVI
+      )
+    )
   ));
+
+  // sanity clamp & clip
+  ndvi = ndvi.updateMask(ndvi.gte(-1)).updateMask(ndvi.lte(1)).clip(geometry);
+  return ndvi;
 }
 
 
@@ -201,31 +248,21 @@ function serveTile(image, visParams, res) {
   });
 }
 
- app.get('/ndvi', (req, res) => {
+app.get('/ndvi', (req, res) => {
   const inputDate = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
-const endDate = inputDate;
-const startDate = endDate.advance(-120, 'day');
-
-  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-    .filterBounds(wards)
-    .filterDate(startDate, endDate)
-    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
-    .select(['B4', 'B8']);
-
-  const ndvi = ee.Algorithms.If(
-    s2.size().gt(0),
-    s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
-   ee.Image.constant(0).rename('NDVI').updateMask(ee.Image(0)).clip(wards)
-  );
+  const endDate = inputDate;
+  const startDate = endDate.advance(-120, 'day');
 
   const geometry = req.query.ward ? getWardGeometryByName(req.query.ward) : wards.geometry();
-const ndviClipped = ee.Image(ndvi).clip(geometry);
-serveTile(ndviClipped, {
+  const ndvi = getNDVI(startDate, endDate, geometry);
+
+  serveTile(ndvi, {
     min: 0,
     max: 0.8,
     palette: ['red', 'yellow', 'green']
   }, res);
 });
+
 app.get('/lst', (req, res) => {
   const inputDate = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
 const endDate = inputDate;
@@ -253,89 +290,42 @@ app.get('/ndvi-mask', (req, res) => {
   const endDate = inputDate;
   const startDate = endDate.advance(-120, 'day');
 
-  const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-    .filterBounds(wards)
-    .filterDate(startDate, endDate)
-    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
-    .select(['B4', 'B8']);
+  const geometry = req.query.ward ? getWardGeometryByName(req.query.ward) : wards.geometry();
+  const threshold = Number(req.query.threshold) || 0.4;
 
-  const ndvi = ee.Algorithms.If(
-    s2.size().gt(0),
-    s2.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
-    ee.Image.constant(0).rename('NDVI').updateMask(ee.Image(0)) // fully transparent fallback
-  );
-
-  const mask = ee.Image(ndvi).updateMask(ee.Image(ndvi).gt(0.4));
+  const ndvi = getNDVI(startDate, endDate, geometry);
+  const mask = ndvi.updateMask(ndvi.gt(threshold));
 
   serveTile(mask, {
-    min: 0.4,
+    min: threshold,
     max: 0.8,
     palette: ['yellow', 'green']
   }, res);
 });
 
-app.get('/ndvi-anomaly', async (req, res) => {
+
+app.get('/ndvi-anomaly', (req, res) => {
   const currentDate = req.query.current ? ee.Date(req.query.current) : ee.Date(Date.now());
-  const pastDate = req.query.past ? ee.Date(req.query.past) : ee.Date(Date.now()).advance(-1, 'year');
-  function getNDVI(date) {
-    const start = date.advance(-120, 'day');
-    const end = date;
-    const year = date.get('year');
+  const pastDate    = req.query.past    ? ee.Date(req.query.past)    : ee.Date(Date.now()).advance(-1, 'year');
 
-    const sentinel = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-      .filterBounds(wards)
-      .filterDate(start, end)
-      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
-      .select(['B4', 'B8']);
+  // use the same 120-day windows that your previous code used
+  const currentStart = currentDate.advance(-120, 'day');
+  const pastStart    = pastDate.advance(-120, 'day');
 
-    const landsat = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
-      .filterBounds(wards)
-      .filterDate(start, end)
-      .filter(ee.Filter.lt('CLOUD_COVER', 10))
-      .select(['SR_B4', 'SR_B5'])
-      .map(img => img.multiply(0.0000275).add(-0.2).copyProperties(img, img.propertyNames()));
+  const geometry = req.query.ward ? getWardGeometryByName(req.query.ward) : wards.geometry();
 
-    const useSentinel = year.gte(2015);
+  const currentNDVI = getNDVI(currentStart, currentDate, geometry);
+  const pastNDVI    = getNDVI(pastStart, pastDate, geometry);
 
-    const ndvi = ee.Algorithms.If(
-      useSentinel,
-      ee.Algorithms.If(
-        sentinel.size().gt(0),
-        sentinel.median().normalizedDifference(['B8', 'B4']).rename('NDVI'),
-       ee.Image.constant(0).rename('NDVI').updateMask(ee.Image(0))
-
-      ),
-      ee.Algorithms.If(
-        landsat.size().gt(0),
-        landsat.median().normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI'),
-       ee.Image.constant(0).rename('NDVI').updateMask(ee.Image(0))
-
-      )
-    );
-
-    return ee.Image(ndvi);
-  }
-
-
-  const currentNDVI = getNDVI(currentDate);
-  const pastNDVI = getNDVI(pastDate);
-  const anomaly = ee.Image(currentNDVI).rename('NOW')
-  .subtract(ee.Image(pastNDVI).rename('PAST'))
-  .rename('NDVI_Anomaly');
-anomaly.getInfo((imgInfo, err) => {
-  if (err) {
-    console.error("❌ Failed to compute NDVI anomaly image:", err);
-  } else {
-    console.log("✅ NDVI anomaly computed, proceeding to tile generation.");
-  }
-});
+  const anomaly = currentNDVI.subtract(pastNDVI).rename('NDVI_Anomaly');
 
   serveTile(anomaly, {
     min: -0.4,
-    max: 0.4,
+    max:  0.4,
     palette: ['#d7191c', '#ffffbf', '#1a9641']
   }, res);
 });
+
 app.get('/rainfall', (req, res) => {
   const date = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
   const range = parseInt(req.query.range) || 90;
@@ -1779,33 +1769,10 @@ app.get('/indicators-live', async (req, res) => {
     const geometry = wards.geometry();
     const pixelArea = ee.Image.pixelArea();
 
-    // --- Helper: NDVI using Sentinel if available, fallback to MODIS ---
-    function getNDVI(start, end) {
-      const s2col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-        .filterBounds(geometry)
-        .filterDate(start, end)
-        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
-        .select(['B4', 'B8']);
-
-      const s2Available = s2col.size().gt(0);
-
-      const s2NDVI = s2col.median().normalizedDifference(['B8', 'B4']).rename('NDVI');
-
-      const modisNDVI = ee.ImageCollection('MODIS/006/MOD13Q1')
-        .filterBounds(geometry)
-        .filterDate(start, end)
-        .select('NDVI')
-        .map(img => img.multiply(0.0001))
-        .median()
-        .rename('NDVI');
-
-      // pick sentinel if available else modis; clip to geometry
-      return ee.Image(ee.Algorithms.If(s2Available, s2NDVI, modisNDVI)).clip(geometry);
-    }
-
-    // --- NDVI now & past ---
-    const ndviNowImg = getNDVI(recentStart, now);
-    const ndviPastImg = getNDVI(pastStart, pastRef);
+  
+   // --- NDVI now & past ---
+const ndviNowImg  = getNDVI(recentStart, now, geometry);
+const ndviPastImg = getNDVI(pastStart,  pastRef, geometry);
 
     const ndviNowRR = ndviNowImg.reduceRegion({
       reducer: ee.Reducer.mean(),
