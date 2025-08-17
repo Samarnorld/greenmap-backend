@@ -681,8 +681,8 @@ app.get('/wards-live', async (req, res) => {
   const now = ee.Date(Date.now()).advance(-30, 'day');
   const oneYearAgo = now.advance(-1, 'year');
 
-  const startNDVI = now.advance(-120, 'day');            // last 120 days
-  const startNDVIPast = oneYearAgo.advance(-120, 'day'); // same window last year
+  const startNDVI = now.advance(-30, 'day');            // last 30 days
+  const startNDVIPast = oneYearAgo.advance(-30, 'day'); // same window last year
 
   const rainRange = parseInt(req.query.range) || 30;
   const startRain = now.advance(-rainRange, 'day');
