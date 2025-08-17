@@ -1497,7 +1497,7 @@ app.get('/wardsstatstree-live', async (req, res) => {
 });
 
 
-app.get('/ward-trend', async (req, res) => {
+app.get('/ward-trend-live', async (req, res) => {
   try {
     const wardName = req.query.ward;
     if (!wardName) {
@@ -2032,6 +2032,48 @@ app.get('/indicators-live', async (req, res) => {
   }
 });
 
+// ----------------- Wrapper for /ward-trend (cache-aware, on-demand) -----------------
+app.get('/ward-trend', async (req, res) => {
+  try {
+    const wardName = req.query.ward;
+    if (!wardName) {
+      return res.status(400).json({ error: 'Missing ?ward= name' });
+    }
+
+    // Use query param as part of cache key (canonical encoding)
+    const cacheKey = `/ward-trend?ward=${encodeURIComponent(wardName)}`;
+
+    // 1) Serve from cache if available
+    if (precomputed[cacheKey]) {
+      console.log(`✅ cache hit for ${cacheKey}`);
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      return res.json(precomputed[cacheKey]);
+    }
+
+    // 2) Otherwise fetch the live handler and cache
+    const liveUrl = `http://127.0.0.1:${PORT}/ward-trend-live?ward=${encodeURIComponent(wardName)}`;
+    console.log(`⚡ cache miss for ${cacheKey}, fetching live: ${liveUrl}`);
+
+    if (!fetchFn) throw new Error('fetch not available (install node-fetch or use Node 18+)');
+
+    const resp = await fetchFn(liveUrl);
+    if (!resp.ok) {
+      const t = await resp.text().catch(()=>'');
+      throw new Error(`Live fetch failed ${resp.status}: ${t}`);
+    }
+    const data = await resp.json();
+
+    // Save to in-memory cache + disk
+    precomputed[cacheKey] = data;
+    try { await saveCacheToDisk?.(cacheKey, data); } catch (e) {/* ignore */}
+
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    return res.json(data);
+  } catch (err) {
+    console.error('❌ /ward-trend wrapper error:', err && (err.message || err));
+    return res.status(502).json({ error: 'Ward trend wrapper error', details: String(err && err.message ? err.message : err) });
+  }
+});
 
 app.get('/', (req, res) => {
   res.send('✅ GreenMap Earth Engine backend is live');
