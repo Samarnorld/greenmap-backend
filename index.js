@@ -251,7 +251,7 @@ function serveTile(image, visParams, res) {
 app.get('/ndvi', (req, res) => {
   const inputDate = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
   const endDate = inputDate;
-  const startDate = endDate.advance(-120, 'day');
+  const startDate = endDate.advance(-30, 'day');
 
   const geometry = req.query.ward ? getWardGeometryByName(req.query.ward) : wards.geometry();
   const ndvi = getNDVI(startDate, endDate, geometry);
@@ -288,7 +288,7 @@ const startDate = endDate.advance(-120, 'day');
 app.get('/ndvi-mask', (req, res) => {
   const inputDate = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
   const endDate = inputDate;
-  const startDate = endDate.advance(-120, 'day');
+  const startDate = endDate.advance(-30, 'day');
 
   const geometry = req.query.ward ? getWardGeometryByName(req.query.ward) : wards.geometry();
   const threshold = Number(req.query.threshold) || 0.4;
@@ -308,9 +308,9 @@ app.get('/ndvi-anomaly', (req, res) => {
   const currentDate = req.query.current ? ee.Date(req.query.current) : ee.Date(Date.now());
   const pastDate    = req.query.past    ? ee.Date(req.query.past)    : ee.Date(Date.now()).advance(-1, 'year');
 
-  // use the same 120-day windows that your previous code used
-  const currentStart = currentDate.advance(-120, 'day');
-  const pastStart    = pastDate.advance(-120, 'day');
+  // use the same 30-day windows that your previous code used
+  const currentStart = currentDate.advance(-30, 'day');
+  const pastStart    = pastDate.advance(-30, 'day');
 
   const geometry = req.query.ward ? getWardGeometryByName(req.query.ward) : wards.geometry();
 
