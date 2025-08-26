@@ -785,7 +785,7 @@ app.get('/greencoverage-live', (req, res) => {
   console.log("🌿 /greencoverage called");
 
   const now = ee.Date(Date.now());
-  const start = now.advance(-30, 'day');
+  const start = now.advance(-120, 'day');
 
   // Compute NDVI from Sentinel-2
   const ndvi = getNDVI(start, now);
