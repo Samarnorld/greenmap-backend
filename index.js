@@ -1761,9 +1761,9 @@ app.get('/indicators-live', async (req, res) => {
 
     // --- time windows ---
     const now = ee.Date(Date.now());
-    const recentStart = now.advance(-30, 'day');   // NDVI recent window (30 days)
+    const recentStart = now.advance(-120, 'day');   // NDVI recent window (30 days)
     const pastRef = now.advance(-1, 'year');        // same window last year
-    const pastStart = pastRef.advance(-30, 'day');
+    const pastStart = pastRef.advance(-200, 'day');
     const lstWindow = now.advance(-30, 'day');      // LST last 30 days
 
     const geometry = wards.geometry();
