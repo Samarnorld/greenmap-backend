@@ -592,7 +592,7 @@ app.get(['/builtup-stats-dw-live', '/api/builtup-stats-dw-live'], async (req, re
     const builtTotalRR = builtAreaImg.reduceRegion({
       reducer: ee.Reducer.sum(),
       geometry: wards.geometry(),
-      scale: 10,        // Dynamic World is Sentinel-2-based (10m)
+      scale: 10,       
       maxPixels: 1e13,
       tileScale: 4
     });
@@ -655,7 +655,7 @@ app.get(['/builtup-stats-dw-live', '/api/builtup-stats-dw-live'], async (req, re
     });
 
     // respond
-    res.setHeader('Cache-Control', 'public, max-age=3600'); // 1 hour
+    res.setHeader('Cache-Control', 'public, max-age=3600'); 
     return res.json({
       updated: new Date().toISOString(),
       method: 'dynamicworld_mean_built',
@@ -682,8 +682,8 @@ app.get('/wards-live', async (req, res) => {
   const now = ee.Date(Date.now()).advance(-30, 'day');
   const oneYearAgo = now.advance(-1, 'year');
 
-  const startNDVI = now.advance(-30, 'day');            // last 30 days
-  const startNDVIPast = oneYearAgo.advance(-30, 'day'); // same window last year
+  const startNDVI = now.advance(-30, 'day');           
+  const startNDVIPast = oneYearAgo.advance(-30, 'day'); 
 
   const rainRange = parseInt(req.query.range) || 30;
   const startRain = now.advance(-rainRange, 'day');
@@ -833,10 +833,10 @@ app.get('/greencoverage-live', (req, res) => {
       }
 
       const green_m2 = greenRes['green_m2'] || 0;
-      const total_m2 = areaRes['total_m2'] || 1; // prevent divide by zero
+      const total_m2 = areaRes['total_m2'] || 1;
       const green_pct = (green_m2 / total_m2) * 100;
 
-      res.setHeader('Cache-Control', 'public, max-age=1800'); // cache 30 mins
+      res.setHeader('Cache-Control', 'public, max-age=1800');
       res.json({
         updated: new Date().toISOString(),
         city_green_m2: green_m2,
@@ -861,12 +861,12 @@ app.get('/treecoverage', (req, res) => {
     .filterDate(start, end)
     .select('label');
 
-  const treeMask = dw.mode().eq(1).selfMask(); // Class 1 = Trees
+  const treeMask = dw.mode().eq(1).selfMask();
 
   serveTile(treeMask, {
     min: 0,
     max: 1,
-    palette: ['#d9f0d3', '#1a9850'] // light to dark green
+    palette: ['#d9f0d3', '#1a9850']
   }, res);
 });
 
@@ -989,19 +989,20 @@ app.get('/treecanopy-stats-live', async (req, res) => {
     res.status(500).json({ error: 'Tree canopy trend stats failed', details: err.message });
   }
 });
-// === TREE LOSS (per ward + city, yearly % change) ===
+/**** 🌳 Tree Loss Layer + Stats (Dynamic World + EE) ****/
 app.get('/treeloss-stats-live', async (req, res) => {
   try {
     const pixelArea = ee.Image.pixelArea();
-    const wardsFc = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered');
-    const nairobiGeom = wardsFc.geometry();
+    const wards = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered');
+    const nairobiGeom = wards.geometry();
 
-    // Determine year range
+    // Define year range
+    const startYear = 2020;
     const currentYear = new Date().getFullYear();
-    const startYear = 2020; // first year available for Dynamic World
     const dw = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').select('label');
 
     const yearlyStats = [];
+
     for (let y = startYear; y < currentYear; y++) {
       const next = y + 1;
       const start = ee.Date.fromYMD(y, 1, 1);
@@ -1013,76 +1014,64 @@ app.get('/treeloss-stats-live', async (req, res) => {
       const treeMaskStart = dwStart.eq(1).selfMask();
       const treeMaskNext = dwNext.eq(1).selfMask();
 
-      // Convert to area (m²)
-      const treeAreaStart = treeMaskStart.multiply(pixelArea).rename('tree_m2');
-      const treeAreaNext = treeMaskNext.multiply(pixelArea).rename('tree_m2');
+      const treeAreaStart = treeMaskStart.multiply(pixelArea);
+      const treeAreaNext = treeMaskNext.multiply(pixelArea);
 
-      // --- city-level stats ---
       const [startInfo, nextInfo, totalInfo] = await Promise.all([
         treeAreaStart.reduceRegion({ reducer: ee.Reducer.sum(), geometry: nairobiGeom, scale: 10, maxPixels: 1e13 }).getInfo(),
         treeAreaNext.reduceRegion({ reducer: ee.Reducer.sum(), geometry: nairobiGeom, scale: 10, maxPixels: 1e13 }).getInfo(),
         pixelArea.reduceRegion({ reducer: ee.Reducer.sum(), geometry: nairobiGeom, scale: 10, maxPixels: 1e13 }).getInfo()
       ]);
 
-      const start_m2 = startInfo.tree_m2 || 0;
-      const next_m2 = nextInfo.tree_m2 || 0;
+      const start_m2 = startInfo.area || startInfo.tree_m2 || 0;
+      const next_m2 = nextInfo.area || nextInfo.tree_m2 || 0;
       const total_m2 = totalInfo.area || 1;
-      const start_pct = (start_m2 / total_m2) * 100;
-      const next_pct = (next_m2 / total_m2) * 100;
-      const loss_pct = start_pct - next_pct;
+
       const loss_m2 = start_m2 - next_m2;
-
-      // --- per-ward stats ---
-      const perWardStart = await treeAreaStart.reduceRegions({
-        collection: wardsFc,
-        reducer: ee.Reducer.sum(),
-        scale: 10,
-        tileScale: 4
-      }).getInfo();
-
-      const perWardNext = await treeAreaNext.reduceRegions({
-        collection: wardsFc,
-        reducer: ee.Reducer.sum(),
-        scale: 10,
-        tileScale: 4
-      }).getInfo();
-
-      const perWardArray = (perWardStart.features || []).map((f, i) => {
-        const name = f.properties.NAME_3 || f.properties.ward || 'Unknown';
-        const treeStart = f.properties.sum || 0;
-        const treeNext = perWardNext.features[i]?.properties.sum || 0;
-        const wardArea = f.geometry?.coordinates ? ee.Feature(f).geometry().area(10) : total_m2;
-        const startPct = (treeStart / wardArea) * 100;
-        const nextPct = (treeNext / wardArea) * 100;
-        return {
-          ward: name,
-          year_start: y,
-          year_end: next,
-          loss_m2: treeStart - treeNext,
-          loss_pct: startPct - nextPct
-        };
-      });
+      const loss_pct = ((loss_m2 / total_m2) * 100);
 
       yearlyStats.push({
         year_start: y,
         year_end: next,
         city_loss_m2: loss_m2,
-        city_loss_pct: loss_pct,
-        per_ward: perWardArray
+        city_loss_pct: loss_pct
       });
     }
+
+    // Compute cumulative loss & latest year
+    const totalLoss_m2 = yearlyStats.reduce((sum, yr) => sum + yr.city_loss_m2, 0);
+    const latest = yearlyStats[yearlyStats.length - 1];
+
+    // --- Generate live tile layer for latest loss ---
+    const dwLatest = dw.filterDate(
+      ee.Date.fromYMD(latest.year_start, 1, 1),
+      ee.Date.fromYMD(latest.year_end, 1, 1)
+    ).mode();
+
+    const dwPrev = dw.filterDate(
+      ee.Date.fromYMD(latest.year_start - 1, 1, 1),
+      ee.Date.fromYMD(latest.year_start, 1, 1)
+    ).mode();
+
+    // Mask lost tree pixels
+    const lossMask = dwPrev.eq(1).and(dwLatest.neq(1)).selfMask();
+    const lossVis = { palette: ['#ff0000'], min: 0, max: 1 };
+    const map = lossMask.visualize(lossVis).getMap({ maxPixels: 1e13 });
 
     res.setHeader('Cache-Control', 'public, max-age=1800');
     res.json({
       updated: new Date().toISOString(),
-      yearlyStats
+      urlFormat: map.urlFormat,
+      yearlyStats,
+      totalLoss_m2,
+      latest
     });
-
   } catch (err) {
     console.error('❌ /treeloss-stats-live error:', err);
     res.status(500).json({ error: 'Failed to compute tree loss stats', details: err.message });
   }
 });
+
 
 // GET /charttrend?startYear=2021&endYear=2025
 // GET /charttrend?startYear=2021&endYear=2025
