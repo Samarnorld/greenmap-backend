@@ -1005,7 +1005,7 @@ app.get('/treeloss-stats-live', async (req, res) => {
     const wardStats = {};
 
     // Hansen GFC for 2015-2019
-    const hansen = ee.Image('UMD/hansen/global_forest_change_2023_v1_10m');
+    const hansen = ee.Image('UMD/hansen/global_forest_change_2024_v1_12');
     const tree2000 = hansen.select('treecover2000');
     const lossYear = hansen.select('lossyear');
 
