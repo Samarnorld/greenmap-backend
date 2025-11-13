@@ -989,9 +989,10 @@ app.get('/treecanopy-stats-live', async (req, res) => {
     res.status(500).json({ error: 'Tree canopy trend stats failed', details: err.message });
   }
 });
-/**** 🌳 Tree Loss Layer + Stats (Dynamic World + EE) ****/
 app.get('/treeloss-stats-live', async (req, res) => {
   try {
+    console.log("▶️ Starting Tree Loss Stats Live...");
+
     const pixelArea = ee.Image.pixelArea();
     const wards = ee.FeatureCollection('projects/greenmap-backend/assets/nairobi_wards_filtered');
     const nairobiGeom = wards.geometry();
@@ -999,9 +1000,18 @@ app.get('/treeloss-stats-live', async (req, res) => {
     // Define year range
     const startYear = 2020;
     const currentYear = new Date().getFullYear();
+
     const dw = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').select('label');
 
-    const yearlyStats = [];
+    let yearlyStats = [];
+    let wardStats = {};   // <-- Ward-level results stored here
+
+    const wardList = await wards.reduceColumns({
+      reducer: ee.Reducer.toList(),
+      selectors: ['ward_name']
+    }).getInfo();
+
+    const wardNames = wardList.list;
 
     for (let y = startYear; y < currentYear; y++) {
       const next = y + 1;
@@ -1017,32 +1027,93 @@ app.get('/treeloss-stats-live', async (req, res) => {
       const treeAreaStart = treeMaskStart.multiply(pixelArea);
       const treeAreaNext = treeMaskNext.multiply(pixelArea);
 
-      const [startInfo, nextInfo, totalInfo] = await Promise.all([
-        treeAreaStart.reduceRegion({ reducer: ee.Reducer.sum(), geometry: nairobiGeom, scale: 10, maxPixels: 1e13 }).getInfo(),
-        treeAreaNext.reduceRegion({ reducer: ee.Reducer.sum(), geometry: nairobiGeom, scale: 10, maxPixels: 1e13 }).getInfo(),
-        pixelArea.reduceRegion({ reducer: ee.Reducer.sum(), geometry: nairobiGeom, scale: 10, maxPixels: 1e13 }).getInfo()
+      const [cityStart, cityNext, totalCity] = await Promise.all([
+        treeAreaStart.reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry: nairobiGeom,
+          scale: 10,
+          maxPixels: 1e13
+        }).getInfo(),
+        treeAreaNext.reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry: nairobiGeom,
+          scale: 10,
+          maxPixels: 1e13
+        }).getInfo(),
+        pixelArea.reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry: nairobiGeom,
+          scale: 10,
+          maxPixels: 1e13
+        }).getInfo()
       ]);
 
-      const start_m2 = startInfo.area || startInfo.tree_m2 || 0;
-      const next_m2 = nextInfo.area || nextInfo.tree_m2 || 0;
-      const total_m2 = totalInfo.area || 1;
+      const cityStart_m2 = cityStart.area || 0;
+      const cityNext_m2 = cityNext.area || 0;
+      const totalCity_m2 = totalCity.area || 1;
 
-      const loss_m2 = start_m2 - next_m2;
-      const loss_pct = ((loss_m2 / total_m2) * 100);
+      const cityLoss_m2 = cityStart_m2 - cityNext_m2;
+      const cityLoss_pct = (cityLoss_m2 / totalCity_m2) * 100;
 
+      // Store city-level stats
       yearlyStats.push({
         year_start: y,
         year_end: next,
-        city_loss_m2: loss_m2,
-        city_loss_pct: loss_pct
+        city_loss_m2: cityLoss_m2,
+        city_loss_pct: cityLoss_pct
       });
+
+      // -----------  WARD LEVEL COMPUTATION  ----------------
+      wardStats[y] = {};
+
+      for (let w = 0; w < wardNames.length; w++) {
+        const wardName = wardNames[w];
+        
+        const wardGeom = wards
+          .filter(ee.Filter.eq("ward_name", wardName))
+          .geometry();
+
+        const [ws, wn, wtotal] = await Promise.all([
+          treeAreaStart.reduceRegion({
+            reducer: ee.Reducer.sum(),
+            geometry: wardGeom,
+            scale: 10,
+            maxPixels: 1e13
+          }).getInfo(),
+          treeAreaNext.reduceRegion({
+            reducer: ee.Reducer.sum(),
+            geometry: wardGeom,
+            scale: 10,
+            maxPixels: 1e13
+          }).getInfo(),
+          pixelArea.reduceRegion({
+            reducer: ee.Reducer.sum(),
+            geometry: wardGeom,
+            scale: 10,
+            maxPixels: 1e13
+          }).getInfo()
+        ]);
+
+        const ws_m2 = ws.area || 0;
+        const wn_m2 = wn.area || 0;
+        const wtotal_m2 = wtotal.area || 1;
+
+        const wloss_m2 = ws_m2 - wn_m2;
+        const wloss_pct = (wloss_m2 / wtotal_m2) * 100;
+
+        wardStats[y][wardName] = {
+          ward: wardName,
+          year_start: y,
+          year_end: next,
+          loss_m2: wloss_m2,
+          loss_pct: wloss_pct
+        };
+      }
     }
 
-    // Compute cumulative loss & latest year
-    const totalLoss_m2 = yearlyStats.reduce((sum, yr) => sum + yr.city_loss_m2, 0);
+    // ---------------- LATEST LOSS TILE LAYER ----------------
     const latest = yearlyStats[yearlyStats.length - 1];
 
-    // --- Generate live tile layer for latest loss ---
     const dwLatest = dw.filterDate(
       ee.Date.fromYMD(latest.year_start, 1, 1),
       ee.Date.fromYMD(latest.year_end, 1, 1)
@@ -1053,25 +1124,31 @@ app.get('/treeloss-stats-live', async (req, res) => {
       ee.Date.fromYMD(latest.year_start, 1, 1)
     ).mode();
 
-    // Mask lost tree pixels
     const lossMask = dwPrev.eq(1).and(dwLatest.neq(1)).selfMask();
     const lossVis = { palette: ['#ff0000'], min: 0, max: 1 };
     const map = lossMask.visualize(lossVis).getMap({ maxPixels: 1e13 });
 
+    const totalLoss_m2 = yearlyStats.reduce((sum, yr) => sum + yr.city_loss_m2, 0);
+
     res.setHeader('Cache-Control', 'public, max-age=1800');
+
     res.json({
       updated: new Date().toISOString(),
       urlFormat: map.urlFormat,
       yearlyStats,
+      wardStats,
       totalLoss_m2,
       latest
     });
+
   } catch (err) {
-    console.error('❌ /treeloss-stats-live error:', err);
-    res.status(500).json({ error: 'Failed to compute tree loss stats', details: err.message });
+    console.error("❌ /treeloss-stats-live FAILED:", err);
+    res.status(500).json({
+      error: "Failed to compute tree loss stats",
+      details: err.message
+    });
   }
 });
-
 
 // GET /charttrend?startYear=2021&endYear=2025
 // GET /charttrend?startYear=2021&endYear=2025
