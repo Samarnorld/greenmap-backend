@@ -1111,7 +1111,7 @@ app.get('/treeloss-combined', async (req, res) => {
         reducer: ee.Reducer.sum().group({ groupField: 1, groupName: 'lossyear' }),
         geometry: wards.geometry(),
         scale: 30,
-        maxPixels: 1e13
+        
       });
       const cityGroups = await ee.List(cityLoss.get('groups')).getInfo();
       const cityTrend = (cityGroups || []).map(g => ({ year: g.lossyear + 2000, loss_m2: g.sum || 0 }));
@@ -1121,7 +1121,7 @@ app.get('/treeloss-combined', async (req, res) => {
         reducer: ee.Reducer.sum(),
         geometry: wards.geometry(),
         scale: 30,
-        maxPixels: 1e13
+    
       }).getInfo();
       const baselineAreaCity = (baseCity && (baseCity.treecover2000 || baseCity['treecover2000'])) ? baseCity.treecover2000 : 0;
 
@@ -1135,11 +1135,12 @@ app.get('/treeloss-combined', async (req, res) => {
 
       // --- Ward-level loss grouped by year (one call) ---
       const wardsLoss = pixelArea.addBands(loss).reduceRegions({
-        collection: wards,
-        reducer: ee.Reducer.sum().group({ groupField: 1, groupName: 'lossyear' }),
-        scale: 30,
-        maxPixels: 1e13
-      });
+  collection: wards,
+  reducer: ee.Reducer.sum().group({ groupField: 1, groupName: 'lossyear' }),
+  scale: 30,
+  tileScale: 2
+});
+
       const wardData = await wardsLoss.getInfo();
 
       // build baseline map
@@ -1154,7 +1155,7 @@ app.get('/treeloss-combined', async (req, res) => {
         reducer: ee.Reducer.sum(),
         geometry: wards.geometry(),
         scale: 30,
-        maxPixels: 1e13
+       
       }).getInfo();
       const cityGain_m2 = cityGainObj && cityGainObj.gain ? cityGainObj.gain : 0;
 
@@ -1162,7 +1163,7 @@ app.get('/treeloss-combined', async (req, res) => {
         collection: wards,
         reducer: ee.Reducer.sum(),
         scale: 30,
-        maxPixels: 1e13
+        
       });
       const wardsGainInfo = await wardsGain.getInfo();
       const wardGainMap = {};
