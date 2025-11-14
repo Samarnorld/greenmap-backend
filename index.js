@@ -990,143 +990,164 @@ app.get('/treecanopy-stats-live', async (req, res) => {
   }
 });
 
-// ======================================================================
-//  OPTIMIZED COMBINED TREE LOSS ENDPOINT (FAST)
-//  GET /treeloss-combined
+// ----------------------
+// Helper: simple cache wrapper for heavy endpoints
+// ----------------------
+async function getOrComputeCache(key, ttlSeconds, computeFn) {
+  // check in-memory cache first
+  if (precomputed && precomputed[key]) {
+    // check TTL if you store updated timestamp
+    return precomputed[key];
+  }
+  // check disk (we already load disk cache on startup into `precomputed`)
+  try {
+    const result = await computeFn();
+    precomputed[key] = result;
+    // persist to disk (non-blocking)
+    saveCacheToDisk(key, result).catch(e => console.warn("saveCacheToDisk failed:", e.message));
+    return result;
+  } catch (err) {
+    throw err;
+  }
+}
+
+// ----------------------
+// 1) Tile endpoint (single year)
+//    GET /treeloss-tile?year=YYYY&ward=WardName
+// ----------------------
+app.get('/treeloss-tile', (req, res) => {
+  try {
+    const year = parseInt(req.query.year, 10) || new Date().getFullYear();
+    const ward = req.query.ward;
+    const hansen = ee.Image("UMD/hansen/global_forest_change_2023_v1_11");
+    const lossyear = hansen.select('lossyear');
+
+    const bandVal = year - 2000; // 2001 => 1
+
+    const geometry = ward ? getWardGeometryByName(ward) : wards.geometry();
+
+    // mask pixels where lossyear == bandVal
+    const mask = lossyear.eq(bandVal).selfMask().clip(geometry);
+
+    // style & serve using your serveTile helper
+    serveTile(mask, {
+      min: 1,
+      max: 1,
+      palette: ['#ffeda0', '#f03b20'] // light->red for visibility
+    }, res);
+
+  } catch (err) {
+    console.error('/treeloss-tile error', err);
+    res.status(500).json({ error: String(err && err.message ? err.message : err) });
+  }
+});
+
+// ----------------------
+// 2) Available years for frontend autoplay
+//    GET /treeloss-years
+// ----------------------
+app.get('/treeloss-years', (req, res) => {
+  // Hansen lossyear starts at 2001 (1) through 2023 (23) for this product
+  const start = 2001;
+  const end = 2023; // update manually if you replace dataset
+  const years = [];
+  for (let y = start; y <= end; y++) years.push(y);
+  res.json({ start, end, years });
+});
+
+// ----------------------
+// 3) Cached treeloss combined wrapper
+//    GET /treeloss-combined?refresh=1  (optional query to force recompute)
+// ----------------------
 app.get('/treeloss-combined', async (req, res) => {
   try {
-    const hansen = ee.Image("UMD/hansen/global_forest_change_2023_v1_11");
-    const loss = hansen.select("lossyear");              // grouping band
-    const cover2000 = hansen.select("treecover2000");
-    const pixelArea = ee.Image.pixelArea();              // weight band
+    const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
+    const cacheKey = '/treeloss-combined:v1';
 
-    const wardsFC = wards;
+    if (!forceRefresh && precomputed[cacheKey]) {
+      // return cached copy if present
+      res.setHeader('X-Cache', 'HIT');
+      return res.json(precomputed[cacheKey]);
+    }
 
-    // ============================================================
-    // 1. CITYWIDE LOSS — ALL YEARS IN ONE CALL
-    // ============================================================
-    const cityLoss = pixelArea.addBands(loss)             // weight FIRST, group LAST
-      .reduceRegion({
-        reducer: ee.Reducer.sum().group({
-          groupField: 1,          // band index 1 = lossyear
-          groupName: "lossyear"
-        }),
+    // compute and cache
+    res.setHeader('X-Cache', 'MISS');
+    // use your optimized logic (same as current fast implementation)
+    const computeFn = async () => {
+      const hansen = ee.Image("UMD/hansen/global_forest_change_2023_v1_11");
+      const loss = hansen.select("lossyear");
+      const cover2000 = hansen.select("treecover2000");
+      const pixelArea = ee.Image.pixelArea();
+
+      // city grouped (pixelArea first)
+      const cityLoss = pixelArea.addBands(loss).reduceRegion({
+        reducer: ee.Reducer.sum().group({ groupField: 1, groupName: 'lossyear' }),
         geometry: wards.geometry(),
         scale: 30,
         maxPixels: 1e13
       });
 
-    const cityGroups = await ee.List(cityLoss.get("groups")).getInfo();
+      const cityGroups = await ee.List(cityLoss.get('groups')).getInfo();
+      const cityTrend = (cityGroups || []).map(g => ({ year: g.lossyear + 2000, loss_m2: g.sum || 0 }));
 
-    const cityTrend = cityGroups.map(g => ({
-      year: g.lossyear + 2000,
-      loss_m2: g.sum || 0
-    }));
-
-
-    // ============================================================
-    // BASELINE CITY AREA
-    // ============================================================
-    const baseCity = await cover2000.gt(0).multiply(pixelArea)
-      .reduceRegion({
+      // baseline city treecover2000
+      const baseCity = await cover2000.gt(0).multiply(pixelArea).reduceRegion({
         reducer: ee.Reducer.sum(),
         geometry: wards.geometry(),
         scale: 30,
         maxPixels: 1e13
-      })
-      .getInfo();
+      }).getInfo();
+      const baselineAreaCity = baseCity.treecover2000 || 1;
 
-    const baselineAreaCity = baseCity.treecover2000 || 1;
-
-
-    // ============================================================
-    // 2. WARD-BY-WARD LOSS — ALL AT ONCE
-    // ============================================================
-    const wardsLoss = pixelArea.addBands(loss)     // weight first
-      .reduceRegions({
-        collection: wardsFC,
-        reducer: ee.Reducer.sum().group({
-          groupField: 1,          // lossyear band index
-          groupName: "lossyear"
-        }),
+      // ward-by-ward (one EE call for all wards)
+      const wardsLoss = pixelArea.addBands(loss).reduceRegions({
+        collection: wards,
+        reducer: ee.Reducer.sum().group({ groupField: 1, groupName: 'lossyear' }),
         scale: 30
       });
+      const wardData = await wardsLoss.getInfo();
 
-    const wardData = await wardsLoss.getInfo();
+      const wardTrendResults = (wardData.features || []).map(w => {
+        const groups = w.properties.groups || [];
+        const wardName = w.properties.NAME_3 || w.properties.ward || w.properties.WARD || 'Unknown';
+        const trend = groups.map(g => ({ year: g.lossyear + 2000, loss_m2: g.sum || 0 }));
+        const totalLoss = trend.reduce((a, b) => a + b.loss_m2, 0);
+        // optionally compute baseline per ward (weight cover2000) -- expensive if added here
+        return { ward: wardName, total_loss_m2: totalLoss, trend };
+      });
 
-   const wardTrendResults = wardData.features.map(w => {
-
-      const groups = w.properties.groups || [];
-      const wardName = w.properties.ward;
-
-      const trend = groups.map(g => ({
-        year: g.lossyear + 2000,
-        loss_m2: g.sum || 0
-      }));
-
-      const totalLoss = trend.reduce((a, b) => a + b.loss_m2, 0);
-
-      return {
-        ward: wardName,
-        total_loss_m2: totalLoss,
-        trend
-      };
-    });
-
-
-    // ============================================================
-    // 3. FOREST-ONLY LOSS — FAST
-    // ============================================================
-    const forestMask = cover2000.gte(30);
-
-    const forestLoss = pixelArea
-      .updateMask(forestMask)
-      .addBands(loss)
-      .reduceRegion({
-        reducer: ee.Reducer.sum().group({
-          groupField: 1,
-          groupName: "lossyear"
-        }),
+      // forest-only
+      const forestMask = cover2000.gte(30);
+      const forestLoss = pixelArea.updateMask(forestMask).addBands(loss).reduceRegion({
+        reducer: ee.Reducer.sum().group({ groupField: 1, groupName: 'lossyear' }),
         geometry: wards.geometry(),
         scale: 30,
         maxPixels: 1e13
       });
+      const forestGroups = await ee.List(forestLoss.get('groups')).getInfo();
+      const forestTrend = (forestGroups || []).map(g => ({ year: g.lossyear + 2000, forest_loss_m2: g.sum || 0 }));
 
-    const forestGroups = await ee.List(forestLoss.get("groups")).getInfo();
+      const ranked = wardTrendResults.slice().sort((a,b) => b.total_loss_m2 - a.total_loss_m2);
 
-    const forestTrend = forestGroups.map(g => ({
-      year: g.lossyear + 2000,
-      forest_loss_m2: g.sum || 0
-    }));
+      return {
+        updated: new Date().toISOString(),
+        city: { baseline_m2: baselineAreaCity, trend: cityTrend },
+        wards: wardTrendResults,
+        wards_ranked: ranked,
+        forest_only: forestTrend,
+        latest: cityTrend[cityTrend.length - 1] || null
+      };
+    };
 
-
-    // ============================================================
-    // SORT WARDS BY LOSS
-    // ============================================================
-    const ranked = [...wardTrendResults].sort(
-      (a, b) => b.total_loss_m2 - a.total_loss_m2
-    );
-
-
-    // ============================================================
-    // FINAL RESPONSE
-    // ============================================================
-    res.json({
-      city: {
-        baseline_m2: baselineAreaCity,
-        trend: cityTrend
-      },
-      wards: wardTrendResults,
-      wards_ranked: ranked,
-      forest_only: forestTrend,
-      latest: cityTrend[cityTrend.length - 1]
-    });
+    const result = await getOrComputeCache(cacheKey, 3600, computeFn);
+    res.json(result);
 
   } catch (err) {
-    console.error("FAST TREELOSS ERROR →", err);
-    res.status(500).json({ error: err.message });
+    console.error("treeloss-combined (cached) error", err);
+    res.status(500).json({ error: String(err && err.message ? err.message : err) });
   }
 });
+
 
 
 // GET /charttrend?startYear=2021&endYear=2025
