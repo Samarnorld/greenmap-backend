@@ -1015,7 +1015,7 @@ app.get('/treeloss-stats-live', async (req, res) => {
     // Get ward names
     const wardList = await wardsFc.reduceColumns({
       reducer: ee.Reducer.toList(),
-      selectors: ['ward_name']
+      selectors: ['ward']
     }).getInfo();
     const wardNames = wardList.list;
 
@@ -1076,7 +1076,7 @@ app.get('/treeloss-stats-live', async (req, res) => {
       }).getInfo();
 
       perWardStart.features.forEach((f, i) => {
-        const name = f.properties.ward_name || 'Unknown';
+        const name = f.properties.ward || 'Unknown';
         const treeStart = f.properties.sum || 0;
         const treeNext = perWardNext.features[i]?.properties.sum || 0;
         const warea = ee.Feature(f).geometry().area(10).getInfo(); // m²
