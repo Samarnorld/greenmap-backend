@@ -43,6 +43,53 @@ const PRECOMP_ENDPOINTS = [
 
 
 const precomputed = {}; // in-memory cache for JSON results
+// ---------- Simple in-memory + disk-backed cache helper ----------
+async function getOrComputeCache(cacheKey, ttlSeconds, computeFn) {
+  try {
+    const now = Date.now();
+
+    // Use cached value if valid (in-memory)
+    if (precomputed[cacheKey] && precomputed[cacheKey].expiry > now) {
+      // console.log('cache HIT', cacheKey);
+      return precomputed[cacheKey].value;
+    }
+
+    // Try disk load if present (you already have save/load helpers)
+    try {
+      const fileName = safeKeyToFile(cacheKey);
+      const p = path.join(CACHE_DIR, fileName);
+      if (fs.existsSync(p)) {
+        const raw = await fs.promises.readFile(p, 'utf8');
+        const parsed = JSON.parse(raw);
+        // expected shape { value, expiry }
+        if (parsed && parsed.expiry && parsed.expiry > now) {
+          precomputed[cacheKey] = parsed;
+          return parsed.value;
+        }
+      }
+    } catch (e) {
+      // ignore disk errors and compute fresh
+    }
+
+    // compute fresh value
+    const value = await computeFn();
+
+    // store in memory + disk
+    precomputed[cacheKey] = {
+      value,
+      expiry: now + ttlSeconds * 1000
+    };
+    // async disk save (don't await blocking)
+    saveCacheToDisk(cacheKey, precomputed[cacheKey]).catch(e => console.warn('saveCacheToDisk failed', e));
+
+    return value;
+  } catch (err) {
+    console.error('getOrComputeCache error', err);
+    // fallback: compute directly (don't cache)
+    return await computeFn();
+  }
+}
+
 // ----------------------------------------------------------------
 // ----- disk-persisted cache helpers (so precomputed survives restarts) -----
 const path = require('path');
@@ -1006,7 +1053,7 @@ const ALERT_CONFIG = {
 // ---------- Auto years endpoint (reads dataset to find max lossyear) ----------
 app.get('/treeloss-years', async (req, res) => {
   try {
-   const hansen = ee.Image("UMD/hansen/global_forest_change_2024_v1_12");
+    const hansen = ee.Image("UMD/hansen/global_forest_change_2024_v1_12");
     const lossyear = hansen.select('lossyear');
 
     // compute max lossyear value inside city geometry
@@ -1020,7 +1067,8 @@ app.get('/treeloss-years', async (req, res) => {
     // lossyear values are (1 => 2001). If no loss at all, max may be 0 or null
     const maxLossYearVal = (maxObj && (maxObj.lossyear || maxObj.lossyear === 0)) ? maxObj.lossyear : 0;
     const start = 2001;
-    const end = maxLossYearVal > 0 ? 2000 + maxLossYearVal : 2023; // fallback to 2023 if unknown
+    const detectedEnd = maxLossYearVal > 0 ? 2000 + maxLossYearVal : new Date().getFullYear();
+    const end = Math.min(detectedEnd, new Date().getFullYear()); // never future beyond current year
     const years = [];
     for (let y = start; y <= end; y++) years.push(y);
 
@@ -1028,34 +1076,34 @@ app.get('/treeloss-years', async (req, res) => {
   } catch (err) {
     console.error('/treeloss-years (auto) error', err);
     // fallback: return conservative range if EE fails
-    const fallbackStart = 2001, fallbackEnd = 2023;
+    const fallbackStart = 2001, fallbackEnd = new Date().getFullYear();
     const years = [];
     for (let y = fallbackStart; y <= fallbackEnd; y++) years.push(y);
     res.status(200).json({ start: fallbackStart, end: fallbackEnd, years, error: String(err && err.message ? err.message : err) });
   }
 });
 
+
 // ---------- Combined endpoint with percent, gain, net change, and per-ward baseline ----------
 app.get('/treeloss-combined', async (req, res) => {
   try {
     const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
-    // allow optional short-ttl param for near-real-time operations
     const short = req.query.short === '1' || req.query.short === 'true';
     const ttl = short ? ALERT_CONFIG.shortTtlSeconds : ALERT_CONFIG.regularTtlSeconds;
     const cacheKey = `/treeloss-combined:v2:${short ? 'short' : 'regular'}`;
 
-    if (!forceRefresh && precomputed[cacheKey]) {
+    if (!forceRefresh && precomputed[cacheKey] && precomputed[cacheKey].expiry > Date.now()) {
       res.setHeader('X-Cache', 'HIT');
-      return res.json(precomputed[cacheKey]);
+      return res.json(precomputed[cacheKey].value);
     }
 
     res.setHeader('X-Cache', 'MISS');
 
     const computeFn = async () => {
-     const hansen = ee.Image("UMD/hansen/global_forest_change_2024_v1_12");
+      const hansen = ee.Image("UMD/hansen/global_forest_change_2024_v1_12");
       const loss = hansen.select("lossyear");
       const cover2000 = hansen.select("treecover2000");
-      const gain = hansen.select("gain"); // note: single-band gain (not yearly)
+      const gain = hansen.select("gain"); // single-band gain flag
       const pixelArea = ee.Image.pixelArea();
 
       // --- City grouped yearly loss (m2) ---
@@ -1077,13 +1125,7 @@ app.get('/treeloss-combined', async (req, res) => {
       }).getInfo();
       const baselineAreaCity = (baseCity && (baseCity.treecover2000 || baseCity['treecover2000'])) ? baseCity.treecover2000 : 0;
 
-      // Build a map year -> loss_m2 for city for easier percent calculation
-      const cityLossByYear = {};
-      cityTrend.forEach(t => { cityLossByYear[t.year] = t.loss_m2; });
-
       // --- Ward-level baseline area (treecover2000 > 0) per ward (m2) ---
-      // This is expensive but needed for percent calculations per ward.
-      // We'll compute baseline per ward in one call.
       const wardsBaseline = cover2000.gt(0).multiply(pixelArea).reduceRegions({
         collection: wards,
         reducer: ee.Reducer.sum(),
@@ -1100,15 +1142,14 @@ app.get('/treeloss-combined', async (req, res) => {
       });
       const wardData = await wardsLoss.getInfo();
 
-      // merge baseline info into wardData by a common id/property
-      // construct baseline map: { wardName: baseline_m2 }
+      // build baseline map
       const baselineMap = {};
       (wardsBaselineInfo.features || []).forEach(f => {
         const name = f.properties.NAME_3 || f.properties.ward || f.properties.WARD || 'Unknown';
-        baselineMap[name] = f.properties.sum || 0; // sum is the pixelArea*cover2000>0
+        baselineMap[name] = f.properties.sum || 0;
       });
 
-      // --- Gain (TOTAL, single-band) for city and wards ---
+      // --- Gain (TOTAL)
       const cityGainObj = await gain.multiply(pixelArea).reduceRegion({
         reducer: ee.Reducer.sum(),
         geometry: wards.geometry(),
@@ -1145,8 +1186,6 @@ app.get('/treeloss-combined', async (req, res) => {
         const totalLoss = trend.reduce((acc, t) => acc + (t.loss_m2 || 0), 0);
         const baseline_m2 = baselineMap[wardName] || 0;
         const totalGain = wardGainMap[wardName] || 0;
-
-        // compute overall percent loss (totalLoss / baseline) safely
         const total_pct_loss = baseline_m2 > 0 ? (totalLoss / baseline_m2) * 100 : 0;
 
         return {
@@ -1165,18 +1204,13 @@ app.get('/treeloss-combined', async (req, res) => {
         return { year: t.year, loss_m2: t.loss_m2, pct_of_baseline: pct };
       });
 
-      // latest (most recent) year available in cityTrend
       const sortedCityTrend = cityTrendWithPct.slice().sort((a,b) => a.year - b.year);
       const latest = sortedCityTrend[sortedCityTrend.length - 1] || null;
       const prev = sortedCityTrend.length > 1 ? sortedCityTrend[sortedCityTrend.length - 2] : null;
 
-      // --- Net change calculations ---
-      // NOTE: because Hansen 'gain' is not yearly, net_yearly is not strictly accurate.
-      // We compute net_overall = total_gain_m2 - total_loss_m2 (for whole period) and include caveat.
       const cityTotalLoss = cityTrend.reduce((a,b) => a + (b.loss_m2||0), 0);
       const cityNetOverall_m2 = (cityGain_m2 || 0) - cityTotalLoss;
 
-      // prepare wards ranked by total loss (already you had this)
       const ranked = wardTrendResults.slice().sort((a,b) => b.total_loss_m2 - a.total_loss_m2);
 
       return {
@@ -1188,7 +1222,7 @@ app.get('/treeloss-combined', async (req, res) => {
         ],
         city: {
           baseline_m2: baselineAreaCity,
-          trend: cityTrendWithPct,            // includes pct_of_baseline per year
+          trend: cityTrendWithPct,
           latest: latest,
           previous: prev,
           total_loss_m2: cityTotalLoss,
@@ -1197,10 +1231,11 @@ app.get('/treeloss-combined', async (req, res) => {
         },
         wards: wardTrendResults,
         wards_ranked: ranked,
-        forest_only_note: "Forest-only yearly loss (cover2000>=30) available in older endpoint if needed",
+        forest_only_note: "Forest-only yearly loss (cover2000>=30) available in older endpoint if needed"
       };
     };
 
+    // use the cache helper (this will persist to disk via saveCacheToDisk)
     const result = await getOrComputeCache(cacheKey, ttl, computeFn);
     res.json(result);
 
@@ -1209,27 +1244,29 @@ app.get('/treeloss-combined', async (req, res) => {
     res.status(500).json({ error: String(err && err.message ? err.message : err) });
   }
 });
+
 // ---------- Tree Loss Tile Endpoint (supports per-year + per-ward) ----------
 app.get('/treeloss-tile', async (req, res) => {
   try {
     const year = parseInt(req.query.year, 10);
     const wardName = req.query.ward ? String(req.query.ward).trim() : null;
 
-    if (!year || year < 2001 || year > 2024) {
-      return res.status(400).json({ error: "Invalid year. Must be between 2001–2024" });
+    if (!year || year < 2001 || year > new Date().getFullYear()) {
+      return res.status(400).json({ error: `Invalid year. Must be between 2001–${new Date().getFullYear()}` });
     }
 
-    // Updated Hansen dataset (2024)
+    // Use 2024 product (or the latest Hansen you maintain)
     const hansen = ee.Image("UMD/hansen/global_forest_change_2024_v1_12");
     const lossyear = hansen.select('lossyear');
 
-    // Hansen lossyear band uses: 1 = 2001, 2 = 2002, ..., 24 = 2024
+    // Hansen lossyear band uses: 1 = 2001, 2 = 2002, ...
     const bandVal = year - 2000;
 
     // ---------- Determine geometry ----------
-    let geometry = wards.geometry(); // full Nairobi
+    let geometry = wards.geometry(); // default: whole Nairobi
 
     if (wardName) {
+      // try multiple property keys
       const wardFeature = wards.filter(
         ee.Filter.or(
           ee.Filter.equals("NAME_3", wardName),
@@ -1238,30 +1275,34 @@ app.get('/treeloss-tile', async (req, res) => {
         )
       ).first();
 
-      const exists = await wardFeature.evaluate(f => f);
+      // evaluate existence (safe)
+      const exists = await new Promise((resolve) => {
+        wardFeature.getInfo((f, err) => resolve(!!(f && !err)));
+      });
 
       if (exists) {
         geometry = wardFeature.geometry();
       } else {
-        console.warn(`Ward not found: ${wardName}`);
+        console.warn(`Ward not found: ${wardName} — serving full city instead`);
       }
     }
 
-    // ---------- Mask pixels equal to selected year ----------
+    // ---------- Mask pixels equal to selected year and clip ----------
     const mask = lossyear.eq(bandVal).selfMask().clip(geometry);
 
     // ---------- Serve via your tile helper ----------
     serveTile(mask, {
       min: 1,
       max: 1,
-      palette: ['#ffeda0', '#feb24c', '#f03b20']  // light yellow → red
+      palette: ['#ffeda0', '#feb24c', '#f03b20']  // light → orange → red
     }, res);
 
   } catch (err) {
-    console.error('/treeloss-tile error:', err);
-    res.status(500).json({ error: err.message });
+    console.error('/treeloss-tile error:', err && err.stack ? err.stack : err);
+    res.status(500).json({ error: String(err && err.message ? err.message : err) });
   }
 });
+
 
 // ---------- Alerts endpoint (simple, configurable rules) ----------
 app.get('/treeloss-alerts', async (req, res) => {
@@ -1276,7 +1317,8 @@ app.get('/treeloss-alerts', async (req, res) => {
         // simplified: call the compute function path - to keep example self-contained, call /treeloss-combined?short=1&refresh=1
         // but simplest for now: trigger the endpoint programmatically is environment-specific.
         // Instead, call /treeloss-combined with refresh (if your server can call itself)
-        require('node-fetch')(`${process.env.SELF_URL || 'greenmap-backend.onrender.com'}/treeloss-combined?short=1&refresh=1`)
+       const selfUrl = process.env.SELF_URL || `http://localhost:${PORT}`;
+require('node-fetch')(`${selfUrl.replace(/\/$/, '')}/treeloss-combined?short=1&refresh=1`)
           .then(r => r.json()).then(resolve).catch(reject);
       });
       return resp;
