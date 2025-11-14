@@ -1054,7 +1054,8 @@ app.get('/treeloss-combined', async (req, res) => {
 
     const wardData = await wardsLoss.getInfo();
 
-    const wardTrendResults = wardData.map(w => {
+   const wardTrendResults = wardData.features.map(w => {
+
       const groups = w.properties.groups || [];
       const wardName = w.properties.ward;
 
