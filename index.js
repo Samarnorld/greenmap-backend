@@ -993,24 +993,22 @@ app.get('/treecanopy-stats-live', async (req, res) => {
 // ======================================================================
 //  OPTIMIZED COMBINED TREE LOSS ENDPOINT (FAST)
 //  GET /treeloss-combined
-// ======================================================================
 app.get('/treeloss-combined', async (req, res) => {
   try {
     const hansen = ee.Image("UMD/hansen/global_forest_change_2023_v1_11");
-    const loss = hansen.select("lossyear");
+    const loss = hansen.select("lossyear");              // grouping band
     const cover2000 = hansen.select("treecover2000");
-    const pixelArea = ee.Image.pixelArea();
+    const pixelArea = ee.Image.pixelArea();              // weight band
 
-    const years = ee.List.sequence(1, 23); // 1=2001 … 23=2023
     const wardsFC = wards;
 
-    // =======================================================
-    // 1. CITYWIDE LOSS (ALL YEARS IN ONE GO)
-    // =======================================================
-    const cityLoss = loss.addBands(pixelArea)
+    // ============================================================
+    // 1. CITYWIDE LOSS — ALL YEARS IN ONE CALL
+    // ============================================================
+    const cityLoss = pixelArea.addBands(loss)             // weight FIRST, group LAST
       .reduceRegion({
         reducer: ee.Reducer.sum().group({
-          groupField: 0,
+          groupField: 1,          // band index 1 = lossyear
           groupName: "lossyear"
         }),
         geometry: wards.geometry(),
@@ -1018,25 +1016,18 @@ app.get('/treeloss-combined', async (req, res) => {
         maxPixels: 1e13
       });
 
-    const cityGroups = ee.List(cityLoss.get("groups"));
+    const cityGroups = await ee.List(cityLoss.get("groups")).getInfo();
 
-    // Convert to JS
-    const cityData = await cityGroups.getInfo();
-
-    const cityTrend = cityData
-      .filter(g => g.lossyear !== null)
-      .map(g => ({
-        year: g.lossyear + 2000,
-        loss_m2: g.sum || 0
-      }));
+    const cityTrend = cityGroups.map(g => ({
+      year: g.lossyear + 2000,
+      loss_m2: g.sum || 0
+    }));
 
 
-    // =======================================================
+    // ============================================================
     // BASELINE CITY AREA
-    // =======================================================
-    const baseCity = await cover2000
-      .gt(0)
-      .multiply(pixelArea)
+    // ============================================================
+    const baseCity = await cover2000.gt(0).multiply(pixelArea)
       .reduceRegion({
         reducer: ee.Reducer.sum(),
         geometry: wards.geometry(),
@@ -1048,32 +1039,29 @@ app.get('/treeloss-combined', async (req, res) => {
     const baselineAreaCity = baseCity.treecover2000 || 1;
 
 
-    // =======================================================
-    // 2. PER-WARD LOSS (ALL WARDS × ALL YEARS IN ONE CALL)
-    // =======================================================
-    const wardResultsEE = loss
-      .addBands(pixelArea)
+    // ============================================================
+    // 2. WARD-BY-WARD LOSS — ALL AT ONCE
+    // ============================================================
+    const wardsLoss = pixelArea.addBands(loss)     // weight first
       .reduceRegions({
         collection: wardsFC,
         reducer: ee.Reducer.sum().group({
-          groupField: 0,
+          groupField: 1,          // lossyear band index
           groupName: "lossyear"
         }),
         scale: 30
       });
 
-    const wardResults = await wardResultsEE.getInfo();
+    const wardData = await wardsLoss.getInfo();
 
-    const wardTrendResults = wardResults.map(w => {
+    const wardTrendResults = wardData.map(w => {
       const groups = w.properties.groups || [];
       const wardName = w.properties.ward;
 
-      const trend = groups
-        .filter(g => g.lossyear !== null)
-        .map(g => ({
-          year: g.lossyear + 2000,
-          loss_m2: g.sum || 0
-        }));
+      const trend = groups.map(g => ({
+        year: g.lossyear + 2000,
+        loss_m2: g.sum || 0
+      }));
 
       const totalLoss = trend.reduce((a, b) => a + b.loss_m2, 0);
 
@@ -1085,17 +1073,17 @@ app.get('/treeloss-combined', async (req, res) => {
     });
 
 
-    // =======================================================
-    // 3. FOREST MASK LOSS (ALL YEARS IN ONE)
-    // =======================================================
+    // ============================================================
+    // 3. FOREST-ONLY LOSS — FAST
+    // ============================================================
     const forestMask = cover2000.gte(30);
 
-    const forestLoss = loss
+    const forestLoss = pixelArea
       .updateMask(forestMask)
-      .addBands(pixelArea)
+      .addBands(loss)
       .reduceRegion({
         reducer: ee.Reducer.sum().group({
-          groupField: 0,
+          groupField: 1,
           groupName: "lossyear"
         }),
         geometry: wards.geometry(),
@@ -1105,25 +1093,23 @@ app.get('/treeloss-combined', async (req, res) => {
 
     const forestGroups = await ee.List(forestLoss.get("groups")).getInfo();
 
-    const forestTrend = forestGroups
-      .filter(g => g.lossyear !== null)
-      .map(g => ({
-        year: g.lossyear + 2000,
-        forest_loss_m2: g.sum || 0
-      }));
+    const forestTrend = forestGroups.map(g => ({
+      year: g.lossyear + 2000,
+      forest_loss_m2: g.sum || 0
+    }));
 
 
-    // =======================================================
+    // ============================================================
     // SORT WARDS BY LOSS
-    // =======================================================
+    // ============================================================
     const ranked = [...wardTrendResults].sort(
       (a, b) => b.total_loss_m2 - a.total_loss_m2
     );
 
 
-    // =======================================================
+    // ============================================================
     // FINAL RESPONSE
-    // =======================================================
+    // ============================================================
     res.json({
       city: {
         baseline_m2: baselineAreaCity,
@@ -1140,6 +1126,7 @@ app.get('/treeloss-combined', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 // GET /charttrend?startYear=2021&endYear=2025
 // GET /charttrend?startYear=2021&endYear=2025
