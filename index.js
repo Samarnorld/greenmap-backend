@@ -951,25 +951,6 @@ app.get('/soil-health-live', async (req, res) => {
 
     const soilScore = Math.max(0, Math.min(100, 50 + (ndviNowMean - ndviPastMean) * 100 - bareMean * 20));
     res.setHeader('Cache-Control', 'public, max-age=900');
-    const wardQuery = req.query.ward;
-if (wardQuery) {
-  const wardName = String(wardQuery).trim().toLowerCase();
-  const list = typeof per_ward !== 'undefined' ? per_ward : (typeof result !== 'undefined' ? result : null);
-  if (Array.isArray(list)) {
-    const match = list.find(item => {
-      const n = String(item.ward || item.WARD || item.NAME_3 || item.name).trim().toLowerCase();
-      return n === wardName;
-    });
-    return res.json(match || {});
-  }
-  // if result is single object keyed by wards, attempt lookup
-  if (result && result.wards && Array.isArray(result.wards)) {
-    const found = result.wards.find(item => String(item.ward||item.WARD||item.NAME_3||'').trim().toLowerCase() === wardName);
-    return res.json(found || {});
-  }
-  return res.status(404).json({ error: 'Soil per-ward data not available' });
-}
-
     res.json({ ward: wardName || 'city', ndvi_now: ndviNowMean, ndvi_past: ndviPastMean, bare_mean: bareMean, soil_score: Number(soilScore.toFixed(2)) });
   } catch (err) {
     console.error('/soil-health-live error', err);
@@ -1432,18 +1413,6 @@ app.get('/treeloss-combined', async (req, res) => {
         forest_only_note: "Forest-only yearly loss (cover2000>=30) available in older endpoint if needed"
       };
     };
-// --- support ?ward= to return only the requested ward ---
-const wardQuery = req.query.ward;
-if (wardQuery) {
-  const wardName = String(wardQuery).trim().toLowerCase();
-  // finalResults OR wardTrendResults may be used in your file; try both
-  const list = typeof finalResults !== 'undefined' ? finalResults : (typeof wardTrendResults !== 'undefined' ? wardTrendResults : (typeof wardTrendResults === 'undefined' ? [] : wardTrendResults));
-  const match = (list || []).filter(item => {
-    const n = String(item.ward || item.WARD || item.NAME_3 || item.name || '').trim().toLowerCase();
-    return n === wardName;
-  });
-  return res.json({ wards: match });
-}
 
     // use the cache helper (this will persist to disk via saveCacheToDisk)
     const result = await getOrComputeCache(cacheKey, ttl, computeFn);
@@ -2118,22 +2087,6 @@ app.get('/wardsstatstree-live', async (req, res) => {
 
     // 11) Sort by tree_pct descending and return JSON
     wardsOut.sort((a, b) => b.tree_pct - a.tree_pct);
-// --- if ?ward= provided, return only that ward's tree stats ---
-const wardQuery = req.query.ward;
-if (wardQuery) {
-  const wardName = String(wardQuery).trim().toLowerCase();
-  const match = (wardsOut || []).filter(item => {
-    const n = String(item.ward || item.NAME_3 || item.name || '').trim().toLowerCase();
-    return n === wardName;
-  });
-  // keep response shape similar
-  return res.json({
-    updated: new Date().toISOString(),
-    latestYear: typeof latestYear !== 'undefined' ? latestYear : null,
-    count: match.length,
-    wards: match
-  });
-}
 
     res.setHeader('Cache-Control', 'public, max-age=1800');
     res.json({
@@ -2653,35 +2606,6 @@ const ndviPastImg = getNDVI(pastStart,  pastRef, geometry);
       uhi_c: payload.uhi_c,
       uhi_hotspots_count: payload.uhi_hotspots_count
     }, null, 2));
-// --- support ?ward= to return single ward indicators ---
-const wardQuery = req.query.ward;
-if (wardQuery) {
-  const wardName = String(wardQuery).trim().toLowerCase();
-
-  // Try common per-ward arrays in this handler:
-  const list = (typeof per_ward !== 'undefined' && Array.isArray(per_ward)) ? per_ward
-              : (payload && Array.isArray(payload.per_ward)) ? payload.per_ward
-              : (payload && Array.isArray(payload.perWard)) ? payload.perWard
-              : null;
-
-  if (list) {
-    const found = list.find(item => {
-      const n = String(item.ward || item.WARD || item.NAME_3 || item.name || (item.properties && (item.properties.NAME_3 || item.properties.ward)) || '').trim().toLowerCase();
-      return n === wardName;
-    });
-    if (found) return res.json(found);
-    return res.status(404).json({ error: 'Ward not found' });
-  }
-
-  // If the handler already returned a single object structure in `payload`, try to match keys
-  if (payload && (payload.ward || payload.wardName)) {
-    const pward = String(payload.ward || payload.wardName).trim().toLowerCase();
-    if (pward === wardName) return res.json(payload);
-  }
-
-  // fallback: no per-ward list found
-  return res.status(404).json({ error: 'Per-ward data not available in this endpoint' });
-}
 
     return res.json(payload);
   } catch (err) {
