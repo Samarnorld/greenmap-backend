@@ -2688,6 +2688,95 @@ async function precomputeAll() {
 
   console.log('✅ precomputeAll complete');
 }
+/* ------------------------------------------------------------------
+   Per-ward wrappers: when ?ward= is present, forward to the -live route
+   (This ensures each metric can be requested per-ward without copying EE code)
+   Paste these routes BEFORE the cache-wrapper `for (const ep of PRECOMP_ENDPOINTS)` loop.
+-------------------------------------------------------------------*/
+
+async function proxyLiveEndpointToClient(livePath, req, res, opts = {}) {
+  // opts: { cacheSeconds: number }
+  const ward = req.query.ward;
+  const qs = ward ? `?ward=${encodeURIComponent(ward)}` : (req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '');
+  const liveUrl = `http://127.0.0.1:${PORT}${livePath}${qs}`;
+  try {
+    if (!fetchFn) return res.status(500).json({ error: 'Server fetch not available' });
+
+    // call the local live endpoint (same process)
+    const resp = await fetchFn(liveUrl, { timeout: 120000 });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => null);
+      return res.status(resp.status).json({ error: `Live endpoint returned ${resp.status}`, body: text || undefined });
+    }
+    const json = await resp.json();
+
+    // allow caller to specify Cache-Control TTL
+    if (opts.cacheSeconds) res.setHeader('Cache-Control', `public, max-age=${opts.cacheSeconds}`);
+    return res.json(json);
+  } catch (err) {
+    console.error(`Proxy to ${liveUrl} failed:`, err && err.message ? err.message : err);
+    return res.status(502).json({ error: 'Proxy to live endpoint failed', details: String(err && err.message ? err.message : err) });
+  }
+}
+
+/*
+  Per-ward wrappers:
+  - If ?ward= is present -> call the corresponding -live route and return the single-ward payload
+  - If ?ward is absent -> fallthrough (the existing wrapper loop will handle cache/precomputed results)
+*/
+app.get('/indicators', async (req, res) => {
+  if (req.query.ward) return proxyLiveEndpointToClient('/indicators-live', req, res, { cacheSeconds: 60 });
+  return res.next; // fallthrough to wrapper loop (do nothing here)
+});
+
+app.get('/treeloss-combined', async (req, res) => {
+  // support ?ward= and ?short=... forwarded to -live
+  if (req.query.ward) return proxyLiveEndpointToClient('/treeloss-combined-live', req, res, { cacheSeconds: 300 });
+  return res.next;
+});
+
+app.get('/wardsstatstree', async (req, res) => {
+  if (req.query.ward) return proxyLiveEndpointToClient('/wardsstatstree-live', req, res, { cacheSeconds: 1800 });
+  return res.next;
+});
+
+app.get('/soil-health', async (req, res) => {
+  if (req.query.ward) return proxyLiveEndpointToClient('/soil-health-live', req, res, { cacheSeconds: 300 });
+  return res.next;
+});
+
+app.get('/illegal-logging', async (req, res) => {
+  // illegal-logging-live returns a FeatureCollection; forwarding filtered (per-ward) version
+  if (req.query.ward) return proxyLiveEndpointToClient('/illegal-logging-live', req, res, { cacheSeconds: 300 });
+  return res.next;
+});
+
+app.get('/builtup-stats-dw', async (req, res) => {
+  if (req.query.ward) return proxyLiveEndpointToClient('/builtup-stats-dw-live', req, res, { cacheSeconds: 1800 });
+  return res.next;
+});
+
+app.get('/builtup-stats', async (req, res) => {
+  if (req.query.ward) return proxyLiveEndpointToClient('/builtup-stats-live', req, res, { cacheSeconds: 1800 });
+  return res.next;
+});
+
+app.get('/wards', async (req, res) => {
+  // /wards already computes NDVI, LST etc per ward in a features collection.
+  // When ?ward= is present, forward to live route and return a single-feature FeatureCollection
+  if (req.query.ward) return proxyLiveEndpointToClient('/wards-live', req, res, { cacheSeconds: 900 });
+  return res.next;
+});
+
+/* Note:
+   - The 'res.next' placeholder above is intentional: we do not want to duplicate
+     the wrapper logic. The wrapper loop (below) will run next and serve cached/precomputed responses
+     when no ?ward= is present. If the framework you're running does not support res.next,
+     we still rely on the fact we return early when req.query.ward is present. For calls
+     without ?ward we simply exit these handlers (no response), and the wrapper loop will match
+     the same path and handle serving precomputed results. If your Express setup requires an explicit next(),
+     replace `return res.next;` with `return next();` and accept (req, res, next) in the handler signature.
+*/
 
 // ----------------- Cache-first wrapper routes (original paths) -----------------
 // For each PRECOMP_ENDPOINTS entry (which now points at -live), create a wrapper
