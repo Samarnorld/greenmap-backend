@@ -951,6 +951,25 @@ app.get('/soil-health-live', async (req, res) => {
 
     const soilScore = Math.max(0, Math.min(100, 50 + (ndviNowMean - ndviPastMean) * 100 - bareMean * 20));
     res.setHeader('Cache-Control', 'public, max-age=900');
+    const wardQuery = req.query.ward;
+if (wardQuery) {
+  const wardName = String(wardQuery).trim().toLowerCase();
+  const list = typeof per_ward !== 'undefined' ? per_ward : (typeof result !== 'undefined' ? result : null);
+  if (Array.isArray(list)) {
+    const match = list.find(item => {
+      const n = String(item.ward || item.WARD || item.NAME_3 || item.name).trim().toLowerCase();
+      return n === wardName;
+    });
+    return res.json(match || {});
+  }
+  // if result is single object keyed by wards, attempt lookup
+  if (result && result.wards && Array.isArray(result.wards)) {
+    const found = result.wards.find(item => String(item.ward||item.WARD||item.NAME_3||'').trim().toLowerCase() === wardName);
+    return res.json(found || {});
+  }
+  return res.status(404).json({ error: 'Soil per-ward data not available' });
+}
+
     res.json({ ward: wardName || 'city', ndvi_now: ndviNowMean, ndvi_past: ndviPastMean, bare_mean: bareMean, soil_score: Number(soilScore.toFixed(2)) });
   } catch (err) {
     console.error('/soil-health-live error', err);
@@ -1413,6 +1432,18 @@ app.get('/treeloss-combined', async (req, res) => {
         forest_only_note: "Forest-only yearly loss (cover2000>=30) available in older endpoint if needed"
       };
     };
+// --- support ?ward= to return only the requested ward ---
+const wardQuery = req.query.ward;
+if (wardQuery) {
+  const wardName = String(wardQuery).trim().toLowerCase();
+  // finalResults OR wardTrendResults may be used in your file; try both
+  const list = typeof finalResults !== 'undefined' ? finalResults : (typeof wardTrendResults !== 'undefined' ? wardTrendResults : (typeof wardTrendResults === 'undefined' ? [] : wardTrendResults));
+  const match = (list || []).filter(item => {
+    const n = String(item.ward || item.WARD || item.NAME_3 || item.name || '').trim().toLowerCase();
+    return n === wardName;
+  });
+  return res.json({ wards: match });
+}
 
     // use the cache helper (this will persist to disk via saveCacheToDisk)
     const result = await getOrComputeCache(cacheKey, ttl, computeFn);
@@ -2087,6 +2118,22 @@ app.get('/wardsstatstree-live', async (req, res) => {
 
     // 11) Sort by tree_pct descending and return JSON
     wardsOut.sort((a, b) => b.tree_pct - a.tree_pct);
+// --- if ?ward= provided, return only that ward's tree stats ---
+const wardQuery = req.query.ward;
+if (wardQuery) {
+  const wardName = String(wardQuery).trim().toLowerCase();
+  const match = (wardsOut || []).filter(item => {
+    const n = String(item.ward || item.NAME_3 || item.name || '').trim().toLowerCase();
+    return n === wardName;
+  });
+  // keep response shape similar
+  return res.json({
+    updated: new Date().toISOString(),
+    latestYear: typeof latestYear !== 'undefined' ? latestYear : null,
+    count: match.length,
+    wards: match
+  });
+}
 
     res.setHeader('Cache-Control', 'public, max-age=1800');
     res.json({
@@ -2606,6 +2653,35 @@ const ndviPastImg = getNDVI(pastStart,  pastRef, geometry);
       uhi_c: payload.uhi_c,
       uhi_hotspots_count: payload.uhi_hotspots_count
     }, null, 2));
+// --- support ?ward= to return single ward indicators ---
+const wardQuery = req.query.ward;
+if (wardQuery) {
+  const wardName = String(wardQuery).trim().toLowerCase();
+
+  // Try common per-ward arrays in this handler:
+  const list = (typeof per_ward !== 'undefined' && Array.isArray(per_ward)) ? per_ward
+              : (payload && Array.isArray(payload.per_ward)) ? payload.per_ward
+              : (payload && Array.isArray(payload.perWard)) ? payload.perWard
+              : null;
+
+  if (list) {
+    const found = list.find(item => {
+      const n = String(item.ward || item.WARD || item.NAME_3 || item.name || (item.properties && (item.properties.NAME_3 || item.properties.ward)) || '').trim().toLowerCase();
+      return n === wardName;
+    });
+    if (found) return res.json(found);
+    return res.status(404).json({ error: 'Ward not found' });
+  }
+
+  // If the handler already returned a single object structure in `payload`, try to match keys
+  if (payload && (payload.ward || payload.wardName)) {
+    const pward = String(payload.ward || payload.wardName).trim().toLowerCase();
+    if (pward === wardName) return res.json(payload);
+  }
+
+  // fallback: no per-ward list found
+  return res.status(404).json({ error: 'Per-ward data not available in this endpoint' });
+}
 
     return res.json(payload);
   } catch (err) {
@@ -2688,95 +2764,6 @@ async function precomputeAll() {
 
   console.log('✅ precomputeAll complete');
 }
-/* ------------------------------------------------------------------
-   Per-ward wrappers: when ?ward= is present, forward to the -live route
-   (This ensures each metric can be requested per-ward without copying EE code)
-   Paste these routes BEFORE the cache-wrapper `for (const ep of PRECOMP_ENDPOINTS)` loop.
--------------------------------------------------------------------*/
-
-async function proxyLiveEndpointToClient(livePath, req, res, opts = {}) {
-  // opts: { cacheSeconds: number }
-  const ward = req.query.ward;
-  const qs = ward ? `?ward=${encodeURIComponent(ward)}` : (req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '');
-  const liveUrl = `http://127.0.0.1:${PORT}${livePath}${qs}`;
-  try {
-    if (!fetchFn) return res.status(500).json({ error: 'Server fetch not available' });
-
-    // call the local live endpoint (same process)
-    const resp = await fetchFn(liveUrl, { timeout: 120000 });
-    if (!resp.ok) {
-      const text = await resp.text().catch(() => null);
-      return res.status(resp.status).json({ error: `Live endpoint returned ${resp.status}`, body: text || undefined });
-    }
-    const json = await resp.json();
-
-    // allow caller to specify Cache-Control TTL
-    if (opts.cacheSeconds) res.setHeader('Cache-Control', `public, max-age=${opts.cacheSeconds}`);
-    return res.json(json);
-  } catch (err) {
-    console.error(`Proxy to ${liveUrl} failed:`, err && err.message ? err.message : err);
-    return res.status(502).json({ error: 'Proxy to live endpoint failed', details: String(err && err.message ? err.message : err) });
-  }
-}
-
-/*
-  Per-ward wrappers:
-  - If ?ward= is present -> call the corresponding -live route and return the single-ward payload
-  - If ?ward is absent -> fallthrough (the existing wrapper loop will handle cache/precomputed results)
-*/
-app.get('/indicators', async (req, res) => {
-  if (req.query.ward) return proxyLiveEndpointToClient('/indicators-live', req, res, { cacheSeconds: 60 });
-  return res.next; // fallthrough to wrapper loop (do nothing here)
-});
-
-app.get('/treeloss-combined', async (req, res) => {
-  // support ?ward= and ?short=... forwarded to -live
-  if (req.query.ward) return proxyLiveEndpointToClient('/treeloss-combined-live', req, res, { cacheSeconds: 300 });
-  return res.next;
-});
-
-app.get('/wardsstatstree', async (req, res) => {
-  if (req.query.ward) return proxyLiveEndpointToClient('/wardsstatstree-live', req, res, { cacheSeconds: 1800 });
-  return res.next;
-});
-
-app.get('/soil-health', async (req, res) => {
-  if (req.query.ward) return proxyLiveEndpointToClient('/soil-health-live', req, res, { cacheSeconds: 300 });
-  return res.next;
-});
-
-app.get('/illegal-logging', async (req, res) => {
-  // illegal-logging-live returns a FeatureCollection; forwarding filtered (per-ward) version
-  if (req.query.ward) return proxyLiveEndpointToClient('/illegal-logging-live', req, res, { cacheSeconds: 300 });
-  return res.next;
-});
-
-app.get('/builtup-stats-dw', async (req, res) => {
-  if (req.query.ward) return proxyLiveEndpointToClient('/builtup-stats-dw-live', req, res, { cacheSeconds: 1800 });
-  return res.next;
-});
-
-app.get('/builtup-stats', async (req, res) => {
-  if (req.query.ward) return proxyLiveEndpointToClient('/builtup-stats-live', req, res, { cacheSeconds: 1800 });
-  return res.next;
-});
-
-app.get('/wards', async (req, res) => {
-  // /wards already computes NDVI, LST etc per ward in a features collection.
-  // When ?ward= is present, forward to live route and return a single-feature FeatureCollection
-  if (req.query.ward) return proxyLiveEndpointToClient('/wards-live', req, res, { cacheSeconds: 900 });
-  return res.next;
-});
-
-/* Note:
-   - The 'res.next' placeholder above is intentional: we do not want to duplicate
-     the wrapper logic. The wrapper loop (below) will run next and serve cached/precomputed responses
-     when no ?ward= is present. If the framework you're running does not support res.next,
-     we still rely on the fact we return early when req.query.ward is present. For calls
-     without ?ward we simply exit these handlers (no response), and the wrapper loop will match
-     the same path and handle serving precomputed results. If your Express setup requires an explicit next(),
-     replace `return res.next;` with `return next();` and accept (req, res, next) in the handler signature.
-*/
 
 // ----------------- Cache-first wrapper routes (original paths) -----------------
 // For each PRECOMP_ENDPOINTS entry (which now points at -live), create a wrapper
