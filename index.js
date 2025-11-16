@@ -827,6 +827,136 @@ app.get('/wards-live', async (req, res) => {
   }
 
 });
+// --- forest health radar (single JSON per ward) ---
+app.get('/forest-health-radar', async (req, res) => {
+  try {
+    const wardName = req.query.ward;
+    if (!wardName) return res.status(400).json({ error: 'Missing ?ward=' });
+    const geom = getWardGeometryByName(wardName);
+    if (!geom) return res.status(400).json({ error: 'Ward geometry not found' });
+
+    // pixel area
+    const pixelArea = ee.Image.pixelArea();
+
+    // Tree cover % (Dynamic World mean for last 12 months)
+    const now = ee.Date(Date.now());
+    const start = now.advance(-1, 'year');
+    const dwTrees = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').filterDate(start, now).select('trees');
+    const treesMean = ee.Image(ee.Algorithms.If(dwTrees.size().gt(0), dwTrees.mean(), ee.Image.constant(0))).clip(geom);
+    const treeFrac = await treesMean.reduceRegion({ reducer: ee.Reducer.mean(), geometry: geom, scale: 10, maxPixels: 1e13 }).getInfo();
+    const tree_pct = (treeFrac && treeFrac.trees) ? Number((treeFrac.trees * 100).toFixed(3)) : 0;
+
+    // Tree loss (last year, percent of baseline)
+    const hansen = ee.Image("UMD/hansen/global_forest_change_2024_v1_12");
+    const lossyear = hansen.select('lossyear');
+    const baseline = hansen.select('treecover2000').gt(0).multiply(pixelArea);
+    const baseline_m2 = (await baseline.reduceRegion({ reducer: ee.Reducer.sum(), geometry: geom, scale: 30, maxPixels: 1e13 }).getInfo()).treecover2000 || 0;
+    const latestYearVal = (await lossyear.reduceRegion({ reducer: ee.Reducer.max(), geometry: geom, scale: 30, maxPixels: 1e13 }).getInfo()).lossyear || 0;
+    // compute loss in last N years (example: last 1 year)
+    const currentYear = new Date().getFullYear();
+    const bandVal = currentYear - 2000; // approximate latest full-year band
+    const lossMask = lossyear.eq(bandVal).selfMask();
+    const lossM2 = (await lossMask.multiply(pixelArea).reduceRegion({ reducer: ee.Reducer.sum(), geometry: geom, scale: 30, maxPixels: 1e13 }).getInfo()).sum || 0;
+    const loss_pct = baseline_m2 > 0 ? (lossM2 / baseline_m2) * 100 : 0;
+
+    // Soil health proxy: NDVI anomaly (current vs 1yr ago mean)
+    const ndviNow = getNDVI(now.advance(-120, 'day'), now, geom);
+    const ndviPast = getNDVI(now.advance(-1, 'year').advance(-120, 'day'), now.advance(-1, 'year'), geom);
+    const ndviNowMean = (await ndviNow.reduceRegion({ reducer: ee.Reducer.mean(), geometry: geom, scale: 30, maxPixels: 1e13 }).getInfo()).NDVI || 0;
+    const ndviPastMean = (await ndviPast.reduceRegion({ reducer: ee.Reducer.mean(), geometry: geom, scale: 30, maxPixels: 1e13 }).getInfo()).NDVI || 0;
+    const ndvi_anom = ndviNowMean - ndviPastMean;
+
+    // Urban pressure: built-up percent (Dynamic World built mean *100)
+    const dwBuilt = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1').filterDate(start, now).select('built');
+    const builtMean = ee.Image(ee.Algorithms.If(dwBuilt.size().gt(0), dwBuilt.mean(), ee.Image.constant(0))).clip(geom);
+    const built_pct = (await builtMean.reduceRegion({ reducer: ee.Reducer.mean(), geometry: geom, scale: 10, maxPixels: 1e13 }).getInfo()).built || 0;
+
+    // Normalize & score (simple linear scalers — tweak to your preference)
+    // Scores 0..100 where higher = better for tree cover & soil, lower built_pct is better (so invert)
+    const score_tree = Math.min(100, Math.max(0, (tree_pct))); // already 0..100
+    const score_loss = Math.max(0, 100 - (loss_pct * 10)); // penalize loss: larger loss -> lower score
+    const score_soil = Math.min(100, Math.max(0, 50 + ndvi_anom * 100)); // simple mapping: >0 = improving
+    const score_urban = Math.max(0, 100 - (built_pct * 100)); // built_pct is 0..1 -> invert
+
+    const payload = {
+      ward: wardName,
+      scores: {
+        tree_cover_pct: tree_pct,
+        tree_loss_pct_year: Number(loss_pct.toFixed(4)),
+        ndvi_anomaly: Number(ndvi_anom.toFixed(4)),
+        built_mean: Number(built_pct),
+        radar: {
+          tree: Number(score_tree.toFixed(2)),
+          loss: Number(score_loss.toFixed(2)),
+          soil: Number(score_soil.toFixed(2)),
+          urban: Number(score_urban.toFixed(2))
+        }
+      }
+    };
+    res.setHeader('Cache-Control', 'public, max-age=900');
+    res.json(payload);
+  } catch (err) {
+    console.error('/forest-health-radar error', err);
+    res.status(500).json({ error: 'forest radar failed', details: String(err && err.message ? err.message : err) });
+  }
+});
+// --- fragmentation index per ward (core vs edge fractions) ---
+app.get('/fragmentation-live', async (req, res) => {
+  try {
+    const wardName = req.query.ward;
+    const geom = wardName ? getWardGeometryByName(wardName) : wards.geometry();
+
+    const ndviImg = getNDVI(ee.Date(Date.now()).advance(-120, 'day'), ee.Date(Date.now()), geom);
+    const treeMask = ndviImg.gt(0.35);
+
+    // compute distance from non-tree (edge detection)
+    const nonTree = treeMask.not().selfMask();
+    const dist = nonTree.fastDistanceTransform(30).sqrt().rename('dist'); // approximate
+    const core = treeMask.updateMask(dist.gt(100)); // pixels >100m from edge = core
+    const edge = treeMask.updateMask(dist.lte(100)).and(treeMask);
+
+    const pixelArea = ee.Image.pixelArea();
+    const coreArea = (await core.multiply(pixelArea).reduceRegion({ reducer: ee.Reducer.sum(), geometry: geom, scale: 30, maxPixels: 1e13 }).getInfo()).sum || 0;
+    const edgeArea = (await edge.multiply(pixelArea).reduceRegion({ reducer: ee.Reducer.sum(), geometry: geom, scale: 30, maxPixels: 1e13 }).getInfo()).sum || 0;
+    const total = coreArea + edgeArea;
+    const result = {
+      ward: wardName || 'city',
+      core_m2: coreArea,
+      edge_m2: edgeArea,
+      core_pct: total > 0 ? (coreArea / total) * 100 : 0,
+      edge_pct: total > 0 ? (edgeArea / total) * 100 : 0
+    };
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.json(result);
+  } catch (err) {
+    console.error('/fragmentation-live error', err);
+    res.status(500).json({ error: 'fragmentation failed', details: String(err && err.message ? err.message : err) });
+  }
+});
+// --- soil health heuristic (NDVI trend + bare soil) ---
+app.get('/soil-health-live', async (req, res) => {
+  try {
+    const wardName = req.query.ward;
+    const geom = wardName ? getWardGeometryByName(wardName) : wards.geometry();
+    const now = ee.Date(Date.now()), start = now.advance(-120, 'day');
+    const ndviNow = getNDVI(start, now, geom);
+    const ndviPast = getNDVI(start.advance(-1, 'year'), now.advance(-1, 'year'), geom);
+
+    const ndviNowMean = (await ndviNow.reduceRegion({ reducer: ee.Reducer.mean(), geometry: geom, scale: 30, maxPixels: 1e13 }).getInfo()).NDVI || 0;
+    const ndviPastMean = (await ndviPast.reduceRegion({ reducer: ee.Reducer.mean(), geometry: geom, scale: 30, maxPixels: 1e13 }).getInfo()).NDVI || 0;
+    // bare soil index using SWIR/NIR from S2 median
+    const s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED').filterDate(start, now).filterBounds(geom).median();
+    const bareIndex = s2.normalizedDifference(['B11','B8']).rename('BSI'); // simple proxy
+    const bareMean = (await bareIndex.reduceRegion({ reducer: ee.Reducer.mean(), geometry: geom, scale: 30, maxPixels: 1e13 }).getInfo()).BSI || 0;
+
+    const soilScore = Math.max(0, Math.min(100, 50 + (ndviNowMean - ndviPastMean) * 100 - bareMean * 20));
+    res.setHeader('Cache-Control', 'public, max-age=900');
+    res.json({ ward: wardName || 'city', ndvi_now: ndviNowMean, ndvi_past: ndviPastMean, bare_mean: bareMean, soil_score: Number(soilScore.toFixed(2)) });
+  } catch (err) {
+    console.error('/soil-health-live error', err);
+    res.status(500).json({ error: 'soil health failed', details: String(err && err.message ? err.message : err) });
+  }
+});
 
 app.get('/greencoverage-live', (req, res) => {
 
@@ -892,6 +1022,54 @@ app.get('/greencoverage-live', (req, res) => {
       });
     });
   });
+});
+
+// --- forest patches GeoJSON (for clickable markers) ---
+app.get('/forest-patches-live', async (req, res) => {
+  try {
+    const ward = req.query.ward ? getWardGeometryByName(req.query.ward) : wards.geometry();
+    const threshold = Number(req.query.threshold) || 0.35; // NDVI threshold
+    const start = req.query.date ? ee.Date(req.query.date) : ee.Date(Date.now());
+    const startWindow = start.advance(-120, 'day');
+
+    // Use Sentinel NDVI where available
+    const ndviImg = getNDVI(startWindow, start, ward);
+    const mask = ndviImg.gt(threshold);
+
+    // Vectorize patches (connected components -> reduce to polygons)
+    const patches = mask.selfMask()
+      .reduceToVectors({
+        geometry: ward,
+        scale: 30,
+        geometryType: 'polygon',
+        eightConnected: false,
+        labelProperty: 'patch_id',
+        maxPixels: 1e13
+      }).map(f => {
+        // compute area + mean NDVI inside each patch
+        const area = ee.Number(ee.Image.pixelArea().reduceRegion({
+          reducer: ee.Reducer.sum(),
+          geometry: f.geometry(),
+          scale: 30,
+          maxPixels: 1e13
+        }).get('area') || 0);
+        const meanNdvi = ee.Number(ndviImg.reduceRegion({
+          reducer: ee.Reducer.mean(),
+          geometry: f.geometry(),
+          scale: 30,
+          maxPixels: 1e13
+        }).get('NDVI') || 0);
+        return f.set({ area_m2: area, mean_ndvi: meanNdvi });
+      });
+
+    // Convert to GeoJSON (getInfo)
+    const info = await withRetry(patches, 3, 2000);
+    res.setHeader('Cache-Control', 'public, max-age=900');
+    res.json(info); // features GeoJSON
+  } catch (err) {
+    console.error('/forest-patches-live error', err);
+    res.status(500).json({ error: 'forest patches failed', details: String(err.message || err) });
+  }
 });
 
 app.get('/treecoverage', (req, res) => {
@@ -1781,6 +1959,42 @@ app.get('/most-deforested-live', async (req, res) => {
     return res.status(500).json({ error: 'Most deforested ward error', details: String(err) });
   }
 });
+// --- illegal logging candidates (Hansen change + NDVI drop) ---
+app.get('/illegal-logging-live', async (req, res) => {
+  try {
+    const wardName = req.query.ward;
+    const geom = wardName ? getWardGeometryByName(wardName) : wards.geometry();
+    const hansen = ee.Image("UMD/hansen/global_forest_change_2024_v1_12");
+    const loss = hansen.select('lossyear');
+    // detect recent losses (last 2 years)
+    const currentYear = new Date().getFullYear();
+    const recentBand = currentYear - 2000;
+    const recentLossMask = loss.gte(recentBand - 1).and(loss.lte(recentBand)).selfMask().clip(geom);
+    // optionally filter by NDVI drop
+    const now = ee.Date(Date.now());
+    const currNdvi = getNDVI(now.advance(-120, 'day'), now, geom);
+    const pastNdvi  = getNDVI(now.advance(-1, 'year').advance(-120, 'day'), now.advance(-1, 'year'), geom);
+    const ndviDrop = pastNdvi.subtract(currNdvi).gt(0.15); // large drop
+    const suspect = recentLossMask.updateMask(ndviDrop);
+
+    // vectorize small clearings
+    const patches = suspect.reduceToVectors({
+      geometry: geom,
+      scale: 30,
+      geometryType: 'centroid',
+      eightConnected: false,
+      labelProperty: 'l'
+    });
+
+    const info = await withRetry(patches, 3, 2000);
+    res.setHeader('Cache-Control', 'public, max-age=900');
+    res.json(info);
+  } catch (err) {
+    console.error('/illegal-logging-live error', err);
+    res.status(500).json({ error: 'illegal logging failed', details: String(err && err.message ? err.message : err) });
+  }
+});
+
 // GET /wardsstatstree
 // Returns per-ward tree stats (tree_m2, area_m2, tree_pct) for the latest Dynamic World year.
 // Paste this route below your existing /ward-trend route.
