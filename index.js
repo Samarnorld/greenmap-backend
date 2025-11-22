@@ -954,63 +954,127 @@ app.get('/greencoverage-live', (req, res) => {
 app.get('/ward-report', async (req, res) => {
   try {
     const ward = req.query.ward ? String(req.query.ward).trim() : null;
-    if (!ward) return res.status(400).json({ error: 'Missing ?ward= parameter' });
+    if (!ward) return res.status(400).json({ error: "Missing ?ward=" });
 
-    const year = req.query.year ? String(req.query.year).trim() : 'all';
-    const cacheKey = `/ward-report?ward=${encodeURIComponent(ward)}&year=${encodeURIComponent(year)}`;
+    const selfUrl = process.env.SELF_URL || `http://127.0.0.1:${PORT}`;
 
-    // TTL for ward reports: 24 hours (adjust if you want more/less)
-    const ttlSeconds = Number(process.env.WARD_REPORT_TTL_SECONDS) || (24 * 3600);
+    // Existing lightweight endpoints
+    const endpoints = {
+      indicators: `${selfUrl}/indicators-live?ward=${encodeURIComponent(ward)}`,
+      builtup_dw: `${selfUrl}/builtup-stats-dw-live?ward=${encodeURIComponent(ward)}`,
+      treeloss: `${selfUrl}/treeloss-stats-live?ward=${encodeURIComponent(ward)}`,
+      treecover: `${selfUrl}/wardsstatstree-live?ward=${encodeURIComponent(ward)}`,
+      trend: `${selfUrl}/ward-trend?ward=${encodeURIComponent(ward)}`,
+      sentinel_builtup: `${selfUrl}/builtup-stats-live?ward=${encodeURIComponent(ward)}`
+    };
 
-    const payload = await getOrComputeCache(cacheKey, ttlSeconds, async () => {
-      // self URL so server calls its own endpoints (useful in deployed env)
-      const selfUrl = process.env.SELF_URL || `http://127.0.0.1:${PORT}`;
+    const fetchJson = async (url) => {
+      try {
+        const r = await fetch(url);
+        if (!r.ok) return null;
+        return await r.json();
+      } catch {
+        return null;
+      }
+    };
 
-      // Lightweight internal endpoints (they should exist and be relatively fast/cacheable)
-      const endpoints = {
-        indicators: `${selfUrl}/indicators-live?ward=${encodeURIComponent(ward)}`,
-        builtup: `${selfUrl}/builtup-stats-dw-live?ward=${encodeURIComponent(ward)}${year !== 'all' ? `&year=${encodeURIComponent(year)}` : ''}`,
-        treeloss: `${selfUrl}/treeloss-stats-live?ward=${encodeURIComponent(ward)}${year !== 'all' ? `&year=${encodeURIComponent(year)}` : ''}`,
-        trend: `${selfUrl}/ward-trend?ward=${encodeURIComponent(ward)}`
-      };
+    const [
+      ind,
+      built_dw,
+      loss,
+      treecov,
+      trend,
+      built_s2
+    ] = await Promise.all([
+      fetchJson(endpoints.indicators),
+      fetchJson(endpoints.builtup_dw),
+      fetchJson(endpoints.treeloss),
+      fetchJson(endpoints.treecover),
+      fetchJson(endpoints.trend),
+      fetchJson(endpoints.sentinel_builtup)
+    ]);
 
-      // fetch all in parallel but ignore failures (null placeholders)
-      const fetchJsonSafe = async (u) => {
-        try {
-          const r = await fetch(u);
-          if (!r.ok) return null;
-          return await r.json();
-        } catch (err) { return null; }
-      };
+    // -------------- DERIVED METRICS ----------------
 
-      const [indicators, builtup, treeloss, trend] = await Promise.all([
-        fetchJsonSafe(endpoints.indicators),
-        fetchJsonSafe(endpoints.builtup),
-        fetchJsonSafe(endpoints.treeloss),
-        fetchJsonSafe(endpoints.trend)
-      ]);
+    // Built-up pressure
+    let builtup_pressure = null;
+    if (built_dw?.per_ward) {
+      const row = built_dw.per_ward.find(x => x.ward === ward);
+      if (row?.built_pct != null) builtup_pressure = Number(row.built_pct);
+    }
 
-      return {
-        ward,
-        year: year === 'all' ? null : Number(year),
-        updated: new Date().toISOString(),
-        indicators: indicators || null,
-        builtup: builtup || null,
-        treeloss: treeloss || null,
-        trend: trend || null
-      };
+    // Tree cover, gain & forest area
+    const tree_cover_pct = treecov?.tree_cover_pct ?? null;
+    const tree_gain_pct = treecov?.tree_gain_pct ?? null;
+    const forest_area_m2 = treecov?.forest_area_m2 ?? null;
+
+    // Tree loss
+    const tree_loss = loss?.tree_loss_pct_year ??
+                      loss?.tree_loss_m2 ??
+                      loss?.loss_pct ??
+                      null;
+
+    // UHI score
+    let uhi_score = null;
+    if (ind?.lst_median_30d != null && trend?.city_lst_mean != null) {
+      const diff = ind.lst_median_30d - trend.city_lst_mean;
+      const clamped = Math.max(-10, Math.min(10, diff));
+      uhi_score = Math.round(((clamped + 10) / 20) * 100);
+    }
+
+    // Soil health
+    let soil_health_score = null;
+    if (ind?.ndvi_median_30d != null && ind?.rain_30d != null) {
+      const ndvi = Math.max(0, ind.ndvi_median_30d);
+      const rain = Math.min(500, Math.max(0, ind.rain_30d));
+      soil_health_score = Math.round(((ndvi * 0.6) + (rain / 500 * 0.4)) * 100);
+    }
+
+    // Land degradation (inverse anomaly)
+    let land_degradation_index = null;
+    if (ind?.ndvi_anomaly != null) {
+      land_degradation_index = Math.round(
+        Math.abs(Math.min(0, ind.ndvi_anomaly)) * 100
+      );
+    }
+
+    // ----------------- FINAL RESPONSE -----------------
+    return res.json({
+      ward,
+      updated: new Date().toISOString(),
+
+      // Direct from indicators-live
+      ndvi: ind?.ndvi_median_30d ?? null,
+      ndvi_median: ind?.ndvi_median_30d ?? null,
+      lst: ind?.lst_median_30d ?? null,
+      rainfall: ind?.rain_30d ?? null,
+      ndvi_anomaly: ind?.ndvi_anomaly ?? null,
+
+      // Derived
+      builtup_pressure,
+      tree_cover_pct,
+      tree_gain_pct,
+      tree_loss,
+      forest_area_m2,
+      uhi_score,
+      soil_health_score,
+      land_degradation_index,
+
+      _sources: {
+        indicators: !!ind,
+        builtup_dw: !!built_dw,
+        treeloss: !!loss,
+        treecover: !!treecov,
+        trend: !!trend,
+        built_s2: !!built_s2
+      }
     });
 
-    // Set short browser cache header (server cached longer in getOrComputeCache)
-    res.setHeader('Cache-Control', `public, max-age=${Math.min(ttlSeconds, 3600)}`);
-    return res.json(payload);
-
   } catch (err) {
-    console.error('/ward-report error', err && err.stack ? err.stack : err);
-    return res.status(500).json({ error: 'Failed to build ward report', details: String(err && err.message ? err.message : err) });
+    console.error('/ward-report error', err);
+    return res.status(500).json({ error: 'ward-report failed', details: String(err) });
   }
 });
-
 
 
 app.get('/treecoverage', (req, res) => {
