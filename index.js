@@ -951,6 +951,65 @@ app.get('/greencoverage-live', (req, res) => {
     });
   });
 });
+app.get('/ward-report', async (req, res) => {
+  try {
+    const ward = req.query.ward ? String(req.query.ward).trim() : null;
+    if (!ward) return res.status(400).json({ error: 'Missing ?ward= parameter' });
+
+    const year = req.query.year ? String(req.query.year).trim() : 'all';
+    const cacheKey = `/ward-report?ward=${encodeURIComponent(ward)}&year=${encodeURIComponent(year)}`;
+
+    // TTL for ward reports: 24 hours (adjust if you want more/less)
+    const ttlSeconds = Number(process.env.WARD_REPORT_TTL_SECONDS) || (24 * 3600);
+
+    const payload = await getOrComputeCache(cacheKey, ttlSeconds, async () => {
+      // self URL so server calls its own endpoints (useful in deployed env)
+      const selfUrl = process.env.SELF_URL || `http://127.0.0.1:${PORT}`;
+
+      // Lightweight internal endpoints (they should exist and be relatively fast/cacheable)
+      const endpoints = {
+        indicators: `${selfUrl}/indicators-live?ward=${encodeURIComponent(ward)}`,
+        builtup: `${selfUrl}/builtup-stats-dw-live?ward=${encodeURIComponent(ward)}${year !== 'all' ? `&year=${encodeURIComponent(year)}` : ''}`,
+        treeloss: `${selfUrl}/treeloss-stats-live?ward=${encodeURIComponent(ward)}${year !== 'all' ? `&year=${encodeURIComponent(year)}` : ''}`,
+        trend: `${selfUrl}/ward-trend?ward=${encodeURIComponent(ward)}`
+      };
+
+      // fetch all in parallel but ignore failures (null placeholders)
+      const fetchJsonSafe = async (u) => {
+        try {
+          const r = await fetch(u);
+          if (!r.ok) return null;
+          return await r.json();
+        } catch (err) { return null; }
+      };
+
+      const [indicators, builtup, treeloss, trend] = await Promise.all([
+        fetchJsonSafe(endpoints.indicators),
+        fetchJsonSafe(endpoints.builtup),
+        fetchJsonSafe(endpoints.treeloss),
+        fetchJsonSafe(endpoints.trend)
+      ]);
+
+      return {
+        ward,
+        year: year === 'all' ? null : Number(year),
+        updated: new Date().toISOString(),
+        indicators: indicators || null,
+        builtup: builtup || null,
+        treeloss: treeloss || null,
+        trend: trend || null
+      };
+    });
+
+    // Set short browser cache header (server cached longer in getOrComputeCache)
+    res.setHeader('Cache-Control', `public, max-age=${Math.min(ttlSeconds, 3600)}`);
+    return res.json(payload);
+
+  } catch (err) {
+    console.error('/ward-report error', err && err.stack ? err.stack : err);
+    return res.status(500).json({ error: 'Failed to build ward report', details: String(err && err.message ? err.message : err) });
+  }
+});
 
 
 
